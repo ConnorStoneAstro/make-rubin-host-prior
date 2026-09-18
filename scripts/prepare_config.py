@@ -20,11 +20,13 @@ import argparse
 import json
 
 from rubin_host_prior.config import Config
+from rubin_host_prior import geometry
 from rubin_host_prior.data import (
     LogFluxTransform,
     PatchDataset,
     ShardSet,
     estimate_band_offsets,
+    context_advice,
     suggest_sigma_range,
 )
 
@@ -68,6 +70,21 @@ def main() -> None:
                       "band_offsets_nJy": config.transform.band_offsets,
                       "sigma_min": config.sde.sigma_min,
                       "sigma_max": config.sde.sigma_max}, indent=2))
+
+    # The correlation length, measured on the pooled log-space patches the model
+    # actually sees.  This is the authoritative version -- the one in the
+    # extraction summary is native-resolution flux and is contaminated by the PSF.
+    cl = dataset.correlation_length(args.n_stats)
+    margin = geometry.loss_margin(config.energy.n_layers, config.energy.kernel_size)
+    print(f"\ncorrelation length (pooled, log space, over {cl['n_patches']} patches)")
+    print(f"  profile: " + " ".join(
+        f"{v:.2f}" for v in cl["profile"][:10]))
+    print(f"  {cl['noise_fraction']:.0%} of the variance is the zero-lag noise "
+          f"delta (excluded from xi)")
+    print(f"  {context_advice(cl['xi'], margin)}")
+    if cl["truncated"]:
+        print("  WARNING: the patches never decorrelate within their own size, so "
+              "xi is a lower bound. Extract larger patches to measure it.")
     expected = 1.0 / args.k_sigma
     if not 0.5 * expected < stats["sky_scatter"] < 2.0 * expected:
         print(

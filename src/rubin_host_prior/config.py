@@ -78,8 +78,16 @@ class PatchConfig:
 
     native_size: int = 224  # pixels cut from the visit image
     nominal_crop: int = 192  # native pixels feeding one training image
-    out_size: int = 64  # nominal_crop / pool_factor
+    out_size: int = 64  # nominal_crop / pool_factor; the reference size
     pool_factor: int = 3
+    #: Extra training sizes.  Each batch is drawn at one size (a batch must be
+    #: shape-homogeneous), cycling over ``training_sizes``.  Larger patches
+    #: spend proportionally less of themselves on the cropped border, so mixing
+    #: sizes both augments the data and recovers loss signal.  Every size shares
+    #: the same weights and estimates the same size-independent bulk potential,
+    #: so this costs nothing in accuracy -- which is only true because the loss
+    #: is cropped; a full-field loss makes different sizes fight each other.
+    out_sizes: tuple[int, ...] = ()
 
     def __post_init__(self) -> None:
         if self.nominal_crop != self.out_size * self.pool_factor:
@@ -89,6 +97,31 @@ class PatchConfig:
             )
         if self.native_size < self.nominal_crop:
             raise ValueError("native_size must be >= nominal_crop")
+        for s in self.out_sizes:
+            if s * self.pool_factor > self.native_size:
+                raise ValueError(
+                    f"out_size {s} needs {s * self.pool_factor} native pixels "
+                    f"but native_size is {self.native_size}"
+                )
+
+    @property
+    def training_sizes(self) -> tuple[int, ...]:
+        """Every size the loader will emit, ``out_size`` first."""
+        return (self.out_size,) + tuple(
+            s for s in sorted(set(self.out_sizes)) if s != self.out_size
+        )
+
+    @property
+    def max_translate_native(self) -> int:
+        """Native-pixel translation room, fixed at the *reference* size.
+
+        Smaller training crops leave more room in the stamp, but letting them
+        wander that far would change the data distribution with size -- small
+        patches would mostly land on blank sky away from the host.  Capping the
+        offset at the reference size's room keeps every size looking at the same
+        neighbourhood.
+        """
+        return max(self.native_size - self.nominal_crop, 0)
 
 
 @dataclass
@@ -141,7 +174,7 @@ class Config:
             energy=EnergyConfig(**_tuples(d.get("energy", {}), ("channels",))),
             sde=SDEConfig(**d.get("sde", {})),
             transform=TransformConfig(**d.get("transform", {})),
-            patch=PatchConfig(**d.get("patch", {})),
+            patch=PatchConfig(**_tuples(d.get("patch", {}), ("out_sizes",))),
             augment=AugmentConfig(**d.get("augment", {})),
             train=TrainConfig(**d.get("train", {})),
         )

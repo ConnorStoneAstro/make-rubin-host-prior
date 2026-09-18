@@ -36,6 +36,7 @@ from typing import Iterable, Sequence
 import numpy as np
 
 from ..config import BANDS
+from ..data.diagnostics import AutocorrelationAccumulator
 from ..data.shards import ShardWriter
 from .quality import gate
 
@@ -412,6 +413,9 @@ def extract_patches(
     streaks = StreakCache(butler, enabled=use_difference_streak)
     records: list[dict] = []
     neighbour_rows: list[dict] = []
+    # Streaming, so xi is measured over every accepted patch rather than a
+    # subsample held in memory.
+    acf = AutocorrelationAccumulator(native_size)
     mask_plane_dict: dict[str, int] | None = None
     writer: ShardWriter | None = None
     n_accepted = 0
@@ -574,6 +578,7 @@ def extract_patches(
                         ),
                     },
                 )
+                acf.add(image)
                 for n in nb:
                     neighbour_rows.append({"patch_index": n_accepted, **n})
                 rec.update(status="accepted", patch_index=n_accepted)
@@ -584,11 +589,22 @@ def extract_patches(
 
     paths = writer.close() if writer is not None else []
     summary = _write_manifest(out_dir, records, neighbour_rows)
+    acf_result = acf.result()
     summary.update(
         n_accepted=n_accepted,
         n_shards=len(paths),
         shards=[str(p) for p in paths],
         n_hosts=len(hosts),
+        # Native-resolution, flux-space correlation length: provenance and a
+        # sanity check, NOT the number to act on.  At native resolution the
+        # small lags are dominated by the PSF, and the log transform changes the
+        # correlation structure anyway.  The number that decides how much
+        # context the model needs is measured on the pooled, log-space training
+        # representation -- scripts/prepare_config.py reports that one.
+        correlation_length_native_flux_px=acf_result["xi"],
+        correlation_length_noise_fraction=acf_result["noise_fraction"],
+        correlation_length_n_patches=acf_result["n_patches"],
+        correlation_profile_native_flux=acf_result["profile"],
     )
     (out_dir / "summary.json").write_text(json.dumps(summary, indent=2, default=str))
     return summary

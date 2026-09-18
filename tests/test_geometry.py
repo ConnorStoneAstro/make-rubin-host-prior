@@ -116,3 +116,28 @@ def test_energy_hessian_bandwidth_is_2r(tiny_model):
     far = (np.abs(yy - size // 2) > r2) | (np.abs(xx - size // 2) > r2)
     assert np.allclose(grad[far], 0.0, atol=1e-7)
     assert np.any(np.abs(grad[~far]) > 0)
+
+
+def test_report_states_the_crop_and_its_consequences():
+    """The crop is derived from the architecture, never configured, so the
+    report is the only thing that tells you what changing n_layers did."""
+    text = g.report((48, 64, 96), n_layers=8, kernel_size=3)
+    assert "2R = 16 px from every side" in text
+    assert "smallest usable patch = 4R + 1 = 33 px" in text
+    assert "N + 32 px" in text  # inference needs region + 4R
+    for size, interior, pct in ((48, 16, 11), (64, 32, 25), (96, 64, 44)):
+        assert f"loss on interior {interior}x{interior}" in text
+        assert f"({pct}% of pixels)" in text
+
+
+def test_report_tracks_the_hyperparameters():
+    """Changing layers or kernel size must change the reported crop."""
+    assert "2R = 6 px" in g.report(64, n_layers=3, kernel_size=3)
+    assert "2R = 16 px" in g.report(64, n_layers=8, kernel_size=3)
+    assert "2R = 32 px" in g.report(64, n_layers=8, kernel_size=5)
+
+
+def test_report_flags_a_size_that_is_too_small():
+    text = g.report((24, 64), n_layers=8)
+    assert "TOO SMALL" in text
+    assert "loss on interior 32x32" in text  # the workable one still reported

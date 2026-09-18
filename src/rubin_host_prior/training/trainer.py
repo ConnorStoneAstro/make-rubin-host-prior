@@ -23,6 +23,7 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 
+from .. import geometry
 from ..config import Config, TrainConfig
 from ..diffusion.loss import dsm_loss, dsm_loss_by_sigma
 from ..diffusion.sde import VESDE
@@ -62,6 +63,7 @@ def train(
     eval_batch: np.ndarray | None = None,
     eval_every: int = 0,
     on_log: Callable[[dict], None] | None = None,
+    verbose: bool = True,
 ) -> tuple[ConvEnergyNet, ConvEnergyNet]:
     """Train and return ``(model, ema_model)``.
 
@@ -76,7 +78,18 @@ def train(
     out.mkdir(parents=True, exist_ok=True)
     config.save(out / "config.json")
 
+    # The crop is a function of the architecture, never a configured number.
+    # Print it, so that changing n_layers or kernel_size announces what it did
+    # rather than silently changing how much of each patch is trained on.
     margin = model.loss_margin
+    sizes = config.patch.training_sizes
+    setup = geometry.report(sizes, model.n_layers, model.config.kernel_size)
+    if verbose:
+        print(setup)
+        if len(sizes) > 1:
+            print(f"  {len(sizes)} training sizes -> {len(sizes)} jit compilations "
+                  f"of the train step, cycled round-robin across batches")
+    _validate_geometry(sizes, model)
     optimizer = make_optimizer(cfg)
     params = eqx.filter(model, eqx.is_inexact_array)
     opt_state = optimizer.init(params)
@@ -110,7 +123,15 @@ def train(
         header = {
             "event": "start",
             "n_parameters": n_parameters(model),
+            "n_layers": model.n_layers,
+            "kernel_size": model.config.kernel_size,
+            "receptive_radius": model.receptive_radius,
             "loss_margin": margin,
+            "training_sizes": list(sizes),
+            "interior_sizes": [
+                geometry.interior_size(s, model.n_layers, model.config.kernel_size)
+                for s in sizes
+            ],
             "sigma_min": sde.sigma_min,
             "sigma_max": sde.sigma_max,
         }
@@ -162,6 +183,25 @@ def train(
 
     save_checkpoint(out / "final", cfg.steps, config, model, ema_model, opt_state)
     return model, ema_model
+
+
+def _validate_geometry(sizes, model: ConvEnergyNet) -> None:
+    """Reject configured sizes that leave no interior, before any training.
+
+    Checked up front rather than on the first batch of each size, so a mixed-size
+    run does not fail thousands of steps in when the smallest size first comes
+    round.
+    """
+    need = 2 * model.loss_margin + 1
+    bad = [s for s in sizes if s < need]
+    if bad:
+        raise ValueError(
+            f"patch size(s) {bad} leave no interior for the loss: a model with "
+            f"{model.n_layers} {model.config.kernel_size}x{model.config.kernel_size} "
+            f"layers crops {model.loss_margin} px per side, so it needs more than "
+            f"4R = {2 * model.loss_margin} px per side. Use larger patches or "
+            f"fewer layers."
+        )
 
 
 def _check_batch(batch: jnp.ndarray, model: ConvEnergyNet) -> None:

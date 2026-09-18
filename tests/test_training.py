@@ -1,5 +1,6 @@
 """Training loop, EMA, checkpoints, and config serialisation."""
 
+import dataclasses
 import json
 
 import equinox as eqx
@@ -24,7 +25,8 @@ from rubin_host_prior.training import (
 def _config(**train_kw):
     c = Config(
         energy=EnergyConfig(channels=(8, 12), embed_dim=16, n_fourier=8),
-        patch=PatchConfig(native_size=64, nominal_crop=48, out_size=16, pool_factor=3),
+        patch=PatchConfig(native_size=128, nominal_crop=48, out_size=16,
+                          pool_factor=3),
     )
     c.transform.band_offsets = {b: 20.0 for b in BANDS}
     c.train.steps = 12
@@ -179,12 +181,12 @@ def test_eval_logs_a_loss_curve_against_sigma(tmp_path):
 
 
 def test_too_small_patches_fail_immediately_with_a_useful_message(tmp_path):
-    """A model with 8 layers needs > 4R pixels; better to hear about it on step
-    1 than after a long run silently trains on nothing."""
+    """A model with 8 layers needs > 4R pixels.  Caught from the config before
+    a single batch is drawn, not on step 1 and not 10 000 steps in."""
     config = _config()
     config.energy = EnergyConfig(channels=(8,) * 8, embed_dim=16, n_fourier=8)
     model = ConvEnergyNet(config.energy, key=jax.random.key(0))
-    with pytest.raises(ValueError, match="at least"):
+    with pytest.raises(ValueError, match=r"leave no interior"):
         train(
             model, _batches(np.random.default_rng(3)), config,
             out_dir=tmp_path / "run",
@@ -278,3 +280,73 @@ def test_models_from_one_config_are_pytree_compatible():
         key=jax.random.key(1),
     )
     assert other.embed.fourier.freqs != a.embed.fourier.freqs
+
+
+# -- the derived loss crop, and variable patch sizes -----------------------
+
+
+def test_setup_note_is_printed_and_reports_the_derived_crop(tmp_path, capsys):
+    """Requested behaviour: training announces how much it is cropping, so that
+    tinkering with n_layers or kernel_size is never silent."""
+    config = _config()
+    config.energy = EnergyConfig(channels=(8,) * 3, embed_dim=16, n_fourier=8)
+    model = ConvEnergyNet(config.energy, key=jax.random.key(0))
+    train(model, _batches(np.random.default_rng(0)), config, out_dir=tmp_path / "r")
+    out = capsys.readouterr().out
+    assert "3 x 3x3 valid convolutions" in out
+    assert "loss crop = 2R = 6 px from every side" in out
+    assert "loss on interior 4x4" in out  # 16 px patches, margin 6
+    assert "N + 12 px" in out
+
+
+def test_setup_note_can_be_silenced(tmp_path, capsys):
+    config = _config()
+    model = ConvEnergyNet(config.energy, key=jax.random.key(0))
+    train(model, _batches(np.random.default_rng(0)), config,
+          out_dir=tmp_path / "r", verbose=False)
+    assert capsys.readouterr().out == ""
+
+
+def test_log_header_records_the_geometry(tmp_path):
+    config = _config()
+    config.patch = dataclasses.replace(config.patch, out_sizes=(16, 24))
+    model = ConvEnergyNet(config.energy, key=jax.random.key(0))
+    train(model, _varsize_batches(np.random.default_rng(0), (16, 24)), config,
+          out_dir=tmp_path / "r", verbose=False)
+    head = json.loads((tmp_path / "r" / "log.jsonl").read_text().splitlines()[0])
+    assert head["loss_margin"] == 4
+    assert head["receptive_radius"] == 2
+    assert head["n_layers"] == 2
+    assert head["training_sizes"] == [16, 24]
+    assert head["interior_sizes"] == [8, 16]
+
+
+def _varsize_batches(rng, sizes, batch=4):
+    k = 0
+    while True:
+        s = sizes[k % len(sizes)]
+        k += 1
+        yield rng.normal(size=(batch, 1, s, s)).astype(np.float32) * 0.5
+
+
+def test_variable_sizes_train_without_recompilation_errors(tmp_path):
+    """One jit compilation per distinct size; all sizes share the weights."""
+    config = _config(steps=12)
+    config.patch = dataclasses.replace(config.patch, out_sizes=(16, 20, 24))
+    model = ConvEnergyNet(config.energy, key=jax.random.key(0))
+    model, ema = train(model, _varsize_batches(np.random.default_rng(1), (16, 20, 24)),
+                       config, out_dir=tmp_path / "r", verbose=False)
+    assert n_parameters(ema) == n_parameters(model)
+
+
+def test_all_configured_sizes_are_validated_before_training_starts(tmp_path):
+    """A mixed-size run must not fail thousands of steps in, when the smallest
+    size first comes round."""
+    config = _config()
+    config.energy = EnergyConfig(channels=(8,) * 8, embed_dim=16, n_fourier=8)
+    config.patch = dataclasses.replace(config.patch, out_sizes=(16, 40))
+    # 40 is fine for 8 layers (needs > 32); 16 is not.
+    model = ConvEnergyNet(config.energy, key=jax.random.key(0))
+    with pytest.raises(ValueError, match=r"leave no interior"):
+        train(model, _varsize_batches(np.random.default_rng(2), (40,)), config,
+              out_dir=tmp_path / "r", verbose=False)

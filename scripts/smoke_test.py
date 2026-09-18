@@ -12,6 +12,7 @@ or the transform.
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import tempfile
 import time
 from pathlib import Path
@@ -19,13 +20,13 @@ from pathlib import Path
 import jax
 import numpy as np
 
-from rubin_host_prior import geometry
 from rubin_host_prior.config import Config, EnergyConfig
 from rubin_host_prior.data import (
     LogFluxTransform,
     PatchDataset,
     ShardSet,
     estimate_band_offsets,
+    context_advice,
     suggest_sigma_range,
 )
 from rubin_host_prior.data.synthetic import write_synthetic_shards
@@ -40,6 +41,8 @@ def main() -> None:
     p.add_argument("--n-patches", type=int, default=256)
     p.add_argument("--out-size", type=int, default=32)
     p.add_argument("--n-layers", type=int, default=4)
+    p.add_argument("--out-sizes", type=int, nargs="+", default=None,
+                   help="also train at these sizes, cycled round-robin")
     p.add_argument("--batch-size", type=int, default=16)
     p.add_argument("--workdir", default=None)
     args = p.parse_args()
@@ -63,6 +66,10 @@ def main() -> None:
     config.patch.pool_factor = 3
     config.patch.nominal_crop = args.out_size * 3
     config.patch.native_size = shards.native_size
+    if args.out_sizes:
+        config.patch = dataclasses.replace(
+            config.patch, out_sizes=tuple(args.out_sizes)
+        )
     config.energy = EnergyConfig(
         channels=tuple([16, 24, 32, 32][min(i, 3)] for i in range(args.n_layers))
     )
@@ -81,10 +88,13 @@ def main() -> None:
     print(f"    sky_scatter {stats['sky_scatter']:.3f} (expect "
           f"~{1 / config.transform.k_sigma:.2f}), clipped {stats['clipped_fraction']:.2e}")
     print(f"    sigma range [{config.sde.sigma_min:.4f}, {config.sde.sigma_max:.2f}]")
+    cl = dataset.correlation_length(128)
+    print(f"    {context_advice(cl['xi'], 2 * args.n_layers)}"
+          f"   ({cl['noise_fraction']:.0%} of variance is noise)")
 
     model = ConvEnergyNet(config.energy, key=jax.random.key(0))
-    print(f"[3] {geometry.describe(args.out_size, model.n_layers)}")
-    print(f"    {n_parameters(model):,} parameters")
+    print(f"[3] {n_parameters(model):,} parameters; "
+          f"training sizes {config.patch.training_sizes}")
 
     sde = VESDE.from_config(config.sde)
     # Averaged over many batches: a single batch's loss is dominated by its

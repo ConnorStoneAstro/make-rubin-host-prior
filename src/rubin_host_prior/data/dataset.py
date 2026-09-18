@@ -31,6 +31,7 @@ import numpy as np
 
 from ..config import Config
 from .augment import random_dihedral
+from .diagnostics import correlation_length
 from .pooling import pool_to_training_grid
 from .shards import ShardSet
 from .transform import LogFluxTransform
@@ -143,18 +144,21 @@ class PatchDataset:
         rng: np.random.Generator | None,
         translate: bool,
         scale_jitter: float,
+        out_size: int | None = None,
     ) -> np.ndarray:
         p = self.config.patch
+        out_size = p.out_size if out_size is None else out_size
         stamps = self._native_stamps(indices)
-        out = np.empty((len(indices), p.out_size, p.out_size), dtype=np.float32)
+        out = np.empty((len(indices), out_size, out_size), dtype=np.float32)
         for i in range(len(indices)):
             out[i] = pool_to_training_grid(
                 stamps[i],
-                out_size=p.out_size,
+                out_size=out_size,
                 pool_factor=p.pool_factor,
                 rng=rng,
                 translate=translate,
                 scale_jitter=scale_jitter,
+                max_translate=p.max_translate_native,
             )
         # Pool in flux, THEN take the log.  The other order computes a geometric
         # mean and biases every structured patch low.
@@ -165,17 +169,37 @@ class PatchDataset:
         indices: np.ndarray,
         rng: np.random.Generator | None = None,
         augment: bool = True,
+        out_size: int | None = None,
     ) -> np.ndarray:
         """``(B, 1, out_size, out_size)`` float32 in the log representation."""
         aug = self.config.augment
+        out_size = self.config.patch.out_size if out_size is None else out_size
         if self._pooled is not None:
             x = self._pooled[indices]
+            cached = x.shape[-1]
+            if out_size > cached:
+                raise ValueError(
+                    f"pooled cache holds {cached}px images; cannot serve "
+                    f"{out_size}px. Rebuild the cache or use the native loader."
+                )
+            if out_size < cached:
+                # A sub-crop of a pooled, transformed image is exactly the
+                # pooled transform of the corresponding native sub-region:
+                # pooling is local and the transform is pointwise.  So the
+                # cache serves every size at or below the one it was built at.
+                room = cached - out_size
+                if augment and aug.translate and rng is not None:
+                    y0, x0 = rng.integers(0, room + 1, size=2)
+                else:
+                    y0 = x0 = room // 2
+                x = x[:, y0 : y0 + out_size, x0 : x0 + out_size]
         else:
             x = self._pool_and_transform(
                 indices,
                 rng,
                 translate=augment and aug.translate,
                 scale_jitter=aug.scale_jitter if augment else 0.0,
+                out_size=out_size,
             )
         if augment and aug.dihedral:
             if rng is None:
@@ -184,17 +208,34 @@ class PatchDataset:
         return np.ascontiguousarray(x[:, None].astype(np.float32))
 
     def batches(
-        self, batch_size: int, seed: int = 0, shuffle: bool = True
+        self,
+        batch_size: int,
+        seed: int = 0,
+        shuffle: bool = True,
+        sizes: tuple[int, ...] | None = None,
     ) -> Iterator[np.ndarray]:
-        """Infinite stream of augmented batches, reshuffled every epoch."""
+        """Infinite stream of augmented batches, reshuffled every epoch.
+
+        A batch is shape-homogeneous (JAX needs that), so when several sizes are
+        configured they are cycled round-robin across batches -- deterministic,
+        equal coverage, and a predictable number of jit compilations (one per
+        distinct size).
+        """
         rng = np.random.default_rng(seed)
+        sizes = tuple(sizes) if sizes else self.config.patch.training_sizes
         n = len(self)
         if n < batch_size:
             raise ValueError(f"{n} patches is fewer than batch_size {batch_size}")
+        k = 0
         while True:
             order = rng.permutation(n) if shuffle else np.arange(n)
             for start in range(0, n - batch_size + 1, batch_size):
-                yield self.make_batch(order[start : start + batch_size], rng)
+                yield self.make_batch(
+                    order[start : start + batch_size],
+                    rng,
+                    out_size=sizes[k % len(sizes)],
+                )
+                k += 1
 
     def validation_batch(self, n: int, seed: int = 12345) -> np.ndarray:
         """Fixed, un-augmented, nominally pooled batch -- comparable across runs."""
@@ -230,6 +271,19 @@ class PatchDataset:
         return path
 
     # -- diagnostics ------------------------------------------------------
+
+    def correlation_length(self, n: int = 512, seed: int = 0) -> dict:
+        """Structural correlation length of the training representation, in
+        *pooled* pixels -- the units the loss crop is measured in.
+
+        This is the authoritative version of the number: it is measured on the
+        pooled, log-space patches the model actually sees, not on native flux.
+        Compare it against the model's ``loss_margin``; see ``data.diagnostics``.
+        """
+        rng = np.random.default_rng(seed)
+        idx = np.sort(rng.choice(len(self), size=min(n, len(self)), replace=False))
+        x = self.make_batch(idx, rng=rng, augment=False)[:, 0]
+        return correlation_length(x)
 
     def stats(self, n: int = 512, seed: int = 0) -> dict:
         """Summary of the log-space data. Read this before setting sigma_min/max."""

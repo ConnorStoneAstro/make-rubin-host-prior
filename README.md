@@ -53,6 +53,12 @@ selection function is biased — if bright, dense galaxy centres are being
 rejected, the training set is skewed against exactly the regime this project
 exists to model.
 
+It also carries `correlation_length_native_flux_px`, accumulated over every
+accepted patch as they are written (streaming, so it costs no memory). Treat that
+as provenance only: at native resolution the small lags are dominated by the PSF,
+and the log transform changes the correlation structure. The number to act on is
+the pooled, log-space one from step 2.
+
 ### 2. Derive the config from the data
 
 ```bash
@@ -67,6 +73,13 @@ worth reading:
   offsets are wrong and the bands are not on a common footing.
 - `clipped_fraction` should be ~1e-5 or below. Larger means `k_sigma` is too
   small, or the shards still contain over-subtraction the gate missed.
+
+It also reports the **correlation length** of the pooled log-space patches and
+compares it to the model's `2R` crop — this is the authoritative measurement, and
+the one that decides how much context your analysis needs. Note that ~60% of the
+pixel variance sits in the zero-lag noise delta; the estimator renormalises at
+lag 1 to exclude it, because a naive 1/e crossing on the raw profile returns
+ξ ≈ 1 regardless of galaxy size (measured: wrong by 4×).
 
 ### 3. Train
 
@@ -104,10 +117,10 @@ quantity:
 - **The head has no bias.** A constant added to the energy is invisible to the
   score: pure gauge.
 
-### Valid convolutions everywhere, and the `4R` geometry
+### Valid convolutions everywhere, and the `2R` crop
 
 No padding, so no border artefacts and no dependence on patch size — the model
-runs on any scene above `2R + 1` pixels, where `R = n_layers` for 3×3 kernels.
+runs on any scene above `4R + 1` pixels, where `R = n_layers` for 3×3 kernels.
 
 But the energy is a *sum* over the final feature map, and that does not weight
 input pixels equally. Energy cell `p` sees input pixels `[p, p+2R]`, so
@@ -120,28 +133,94 @@ contains all `2R+1` terms only for `2R ≤ i ≤ H−2R−1`. Outside that windo
 sum runs over a *subset* of kernel offsets, so a border pixel's score is a
 different linear functional of the weights than an interior pixel's — not merely
 smaller (kernel weights have either sign), but systematically different, and the
-network has no path to the missing terms. Consequences:
+network has no path to the missing terms.
 
-- The denoising loss is cropped to the interior `H − 4R` window.
-- **Sampling needs a padded canvas.** `sample_interior` generates `out_size + 4R`
-  and returns the middle.
-- **Inference on a region of interest of size `Rgn` needs `Rgn + 4R` pixels of
-  input.** With `L = 8`, that is 64 pixels of context.
+**Two questions follow, and they have different answers.** Conflating them is
+easy and wrong.
 
-`geometry.describe` prints the arithmetic for a given configuration:
+**1. Which pixels give clean training signal?** Exactly the ones more than `2R`
+from the edge. For a field whose precision is banded at `2R` — which is what
+this energy represents in the bulk — a window's marginal precision is
+`K_ww − K_wo K_oo⁻¹ K_ow`, and `K_wo` is nonzero only within `2R` of the edge. So
+the contamination has support *exactly* there and is identically zero beyond,
+not merely small. Measured in an exactly solvable Gaussian analogue:
+
+| distance from edge | 0 | 2 | 4 | **8 = 2R** | 16 |
+|---|---|---|---|---|---|
+| relative error in the training signal | 88% | 67% | 45% | **10⁻¹⁵** | 10⁻¹⁵ |
+
+`2R` is therefore not a safety margin — it is the precise boundary. The loss
+crop is **derived from `n_layers` and `kernel_size`, never configured**, and
+`train()` prints the arithmetic at startup so that changing either announces
+what it did:
 
 ```
->>> from rubin_host_prior import geometry
->>> geometry.describe(64, 8)
-'input 64x64 -> energy map 48x48 (R=8, margin=16); loss interior 32x32 (25% of pixels)'
+valid-convolution geometry (derived from the architecture, not configured)
+  8 x 3x3 valid convolutions  ->  receptive radius R = 1*8 = 8
+  loss crop = 2R = 16 px from every side   (beyond 2R the training signal is exactly unbiased)
+  smallest usable patch = 4R + 1 = 33 px
+    patch   64x64   -> energy map 48x48, loss on interior 32x32 (25% of pixels)
+    patch   96x96   -> energy map 80x80, loss on interior 64x64 (44% of pixels)
+  at inference: a trustworthy region of N px needs a canvas of N + 32 px
 ```
 
-25% of pixels is the price of 8 layers on a 64-pixel patch. `L = 6` gives 40×40
-(39%). Choose deliberately.
+**2. How much context does a scene need before its middle is trustworthy?**
+This is *not* set by `R`. It is set by the **correlation length** ξ of the
+images — how far apart two pixels must be before they stop being related, which
+here means roughly how big the galaxies are. The edge's influence spreads as far
+as pixels remain correlated. Measured in the same Gaussian analogue, in 2D:
 
-One further consequence of the summed energy: **energies are extensive in scene
-area**, so they are only comparable between scenes of equal size. That is what
-makes the model a translation-invariant prior over scenes of any size.
+| margin / ξ | error in the prior's width, at the centre |
+|---|---|
+| 0.5 | 45% |
+| 0.8 | 13% |
+| 1.1 | 4% |
+| 1.3 | 1.2% |
+
+So you want a margin of roughly **1.5–3 × ξ**. On synthetic patches ξ ≈ 6 pooled
+pixels, giving `2R/ξ ≈ 2.5` at `L = 8` — comfortable. **Measure it on real DP1
+data** (see below); if ξ comes back above ~15 pooled pixels, `2R = 16` is only
+~1 × ξ and you need more layers or a larger analysis margin.
+
+There is nothing ceremonious about the "padded canvas". It amounts to: *the edge
+of a generated scene is unreliable, so make the scene bigger than the part you
+care about.* `sample_interior` is a convenience that adds `2R` per side and
+returns the middle; you can equally generate whatever size you like and ignore
+the rim. For the eventual light-curve fit the same rule applies in plain terms:
+model a scene extending at least 2ξ beyond the region whose photometry you
+report.
+
+For the record, a **full-field** loss (no crop) was measured against this. It has
+an accuracy floor around 3% error in the prior's width that barely improves with
+patch size or data, it slightly contaminates the learned bulk statistics, and it
+conflicts with variable patch sizes (6× worse at the larger sizes). It is better
+than crop-plus-margin only when the margin is under ~1.5 × ξ, i.e. when the
+crop-trained model is being used outside the regime it was built for.
+
+### Variable patch sizes
+
+`PatchConfig.out_sizes` adds extra training sizes, cycled round-robin across
+batches (a batch must be shape-homogeneous, so one jit compilation per distinct
+size). This does three things:
+
+- **Recovers the signal the crop discards.** The fraction of a patch that reaches
+  the loss is `((H−4R)/H)²`: 25% at 64×64, 44% at 96×96, 56% at 128×128. Train on
+  larger and mixed sizes and the crop stops being expensive.
+- **Costs nothing in accuracy.** Every size estimates the same size-independent
+  bulk potential, so mixing them is free — verified as bit-identical to
+  single-size training in the Gaussian analogue. This is only true *because* the
+  loss is cropped; under a full-field loss the sizes make contradictory demands
+  on shared weights.
+- **Augments the data**, since each size takes a different random sub-crop.
+
+Translation room is capped at the reference size's room (`max_translate_native`).
+Without that cap a small crop would roam the whole stamp and land mostly on blank
+sky far from the host, silently changing the data distribution with patch size.
+
+The pooled cache serves any size at or below the one it was built at, by
+sub-cropping: a sub-crop of a pooled, transformed image is exactly the pooled
+transform of the corresponding native sub-region, because pooling is local and
+the transform is pointwise.
 
 ### σ conditioning: FiLM only, no spatial normalisation
 
@@ -330,6 +409,9 @@ and these specific items are flagged `WARN` in `rubin/extract.py`:
 - **Satellite trails rely on Rubin's own detection.** A Radon/Hough pass per
   (visit, detector) would catch the faint trails that escaped masking — which are
   precisely the ones that would teach the model to generate straight lines.
+- **Correlation length on real data is the open empirical question.** Everything
+  about how much context the model needs follows from it, and the synthetic
+  generator only crudely imitates the real host size distribution.
 - **`sigma_max` should dominate the data's own scale** or the `t = 1` marginal is
   not really Gaussian. `suggest_sigma_range` sets it from the 99th percentile of
   per-patch range; check it against `stats()` on the real data.
@@ -349,7 +431,8 @@ src/rubin_host_prior/
   diffusion/         sde.py (VE), loss.py (DSM + interior crop), sampler.py
   training/          trainer.py, ema.py, checkpoint.py
   data/              transform.py, pooling.py, augment.py, shards.py, dataset.py,
-                     synthetic.py (DP1-like fake data for offline testing)
+                     diagnostics.py (correlation length), synthetic.py (DP1-like
+                     fake data for offline testing)
   rubin/             quality.py (stack-free gate), extract.py (lazy LSST imports)
 scripts/             extract_dp1_patches.py, prepare_config.py, train.py,
                      sample.py, smoke_test.py

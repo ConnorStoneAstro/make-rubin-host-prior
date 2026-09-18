@@ -390,3 +390,205 @@ def test_suggest_sigma_range_covers_the_data(shard_dir):
     lo, hi = suggest_sigma_range(stats)
     assert 0 < lo < stats["sky_scatter"]
     assert hi >= stats["per_patch_range_p99"]
+
+
+# -- correlation length ----------------------------------------------------
+
+
+def _correlated_field(n, size, w, noise, seed=0):
+    """White noise smoothed by a Gaussian of width ``w``.
+
+    The autocovariance is then a Gaussian of width ``w*sqrt(2)``, so the 1/e
+    crossing sits at exactly ``2w`` -- a field with a known correlation length.
+    """
+    rng = np.random.default_rng(seed)
+    k = np.arange(size) - size // 2
+    g = np.exp(-0.5 * (k / w) ** 2)
+    g /= np.sqrt((g**2).sum())
+    F = np.fft.fft2(np.fft.ifftshift(np.outer(g, g)))
+    x = np.real(
+        np.fft.ifft2(np.fft.fft2(rng.normal(size=(n, size, size)), axes=(1, 2)) * F,
+                     axes=(1, 2))
+    )
+    x = x / x.std()
+    return x + noise * rng.normal(size=x.shape)
+
+
+@pytest.mark.parametrize("w", [1.5, 3.0, 5.0])
+def test_correlation_length_recovers_a_known_field(w):
+    from rubin_host_prior.data import correlation_length
+
+    r = correlation_length(_correlated_field(300, 96, w, 0.0))
+    assert r["xi"] == pytest.approx(2 * w, rel=0.12)
+
+
+def test_correlation_length_is_immune_to_uncorrelated_noise():
+    """The whole point of renormalising at lag 1.
+
+    Uncorrelated pixel noise is a delta at zero lag and nothing elsewhere, so it
+    must not move xi at all -- but a naive 1/e crossing on the raw profile is
+    dominated by it.
+    """
+    from rubin_host_prior.data import correlation_length
+
+    clean = correlation_length(_correlated_field(300, 96, 3.0, 0.0))
+    noisy = correlation_length(_correlated_field(300, 96, 3.0, 1.5))
+    assert noisy["xi"] == pytest.approx(clean["xi"], rel=0.05)
+    assert noisy["noise_fraction"] > 0.5
+    naive = correlation_length(_correlated_field(300, 96, 3.0, 1.5),
+                               exclude_noise=False)
+    assert naive["xi"] < 0.5 * clean["xi"], "naive estimate should be badly wrong"
+
+
+def test_correlation_length_uses_the_linear_not_circular_autocorrelation():
+    """A circular (unpadded) autocorrelation wraps structure round the edges and
+    biases xi low, which on this question is the dangerous direction."""
+    from rubin_host_prior.data import autocorrelation
+
+    x = _correlated_field(200, 64, 4.0, 0.0)
+    prof = autocorrelation(x)
+    assert prof[0] == pytest.approx(1.0)
+    assert np.all(np.diff(prof[1:12]) < 0)  # monotone decay, no wrap-around bump
+
+
+def test_streaming_accumulator_matches_the_batch_computation():
+    from rubin_host_prior.data.diagnostics import AutocorrelationAccumulator
+    from rubin_host_prior.data import correlation_length
+
+    x = _correlated_field(120, 64, 3.0, 1.0)
+    acc = AutocorrelationAccumulator(64)
+    for patch in x:
+        acc.add(patch)
+    np.testing.assert_allclose(acc.result()["profile"],
+                               correlation_length(x)["profile"], rtol=1e-10)
+    assert acc.result()["n_patches"] == 120
+
+
+def test_accumulator_skips_non_finite_patches():
+    from rubin_host_prior.data.diagnostics import AutocorrelationAccumulator
+
+    acc = AutocorrelationAccumulator(16)
+    bad = np.zeros((16, 16)); bad[0, 0] = np.nan
+    acc.add(bad)
+    acc.add(np.random.default_rng(0).normal(size=(16, 16)))
+    assert acc.result()["n_patches"] == 1
+
+
+def test_accumulator_rejects_the_wrong_shape():
+    from rubin_host_prior.data.diagnostics import AutocorrelationAccumulator
+
+    with pytest.raises(ValueError, match="expected"):
+        AutocorrelationAccumulator(16).add(np.zeros((8, 8)))
+
+
+def test_context_advice_brackets_the_regimes():
+    from rubin_host_prior.data import context_advice
+
+    assert "comfortable" in context_advice(xi=6.0, loss_margin=16)
+    assert "marginal" in context_advice(xi=16.0, loss_margin=16)
+    assert "TOO SMALL" in context_advice(xi=30.0, loss_margin=16)
+
+
+def test_dataset_reports_correlation_length_in_pooled_pixels(shard_dir):
+    _, _, ds = _dataset(shard_dir)
+    cl = ds.correlation_length(32)
+    assert 0 < cl["xi"] < ds.config.patch.out_size
+    assert 0.0 <= cl["noise_fraction"] <= 1.0
+
+
+# -- variable patch sizes --------------------------------------------------
+
+
+def test_training_sizes_are_deduplicated_with_the_reference_first():
+    pc = PatchConfig(native_size=224, nominal_crop=192, out_size=64, pool_factor=3,
+                     out_sizes=(48, 64, 32, 48))
+    assert pc.training_sizes == (64, 32, 48)
+
+
+def test_config_rejects_sizes_the_stamp_cannot_supply():
+    with pytest.raises(ValueError, match="needs 288 native pixels"):
+        PatchConfig(native_size=224, nominal_crop=192, out_size=64, pool_factor=3,
+                    out_sizes=(96,))
+
+
+def _varsize_dataset(shard_dir, out_sizes):
+    ss = ShardSet.from_dir(shard_dir)
+    config = Config(patch=PatchConfig(native_size=ss.native_size, nominal_crop=96,
+                                      out_size=32, pool_factor=3,
+                                      out_sizes=out_sizes))
+    config.transform.band_offsets = estimate_band_offsets(
+        ss.load("variance"), ss.meta["band_idx"], 3, config.transform.k_sigma
+    )
+    return ss, config, PatchDataset.from_shards(
+        ss, config, LogFluxTransform.from_config(config.transform)
+    )
+
+
+def test_batches_cycle_sizes_round_robin(shard_dir):
+    _, _, ds = _varsize_dataset(shard_dir, (16, 24, 32))
+    it = ds.batches(4, seed=0)
+    sizes = [next(it).shape[-1] for _ in range(9)]
+    assert sizes == [32, 16, 24] * 3, sizes
+
+
+def test_every_size_is_a_valid_pooled_image(shard_dir):
+    _, _, ds = _varsize_dataset(shard_dir, (16, 24, 32))
+    for s in (16, 24, 32):
+        b = ds.make_batch(np.arange(4), rng=np.random.default_rng(0), out_size=s)
+        assert b.shape == (4, 1, s, s)
+        assert np.all(np.isfinite(b))
+
+
+def test_validation_batch_stays_at_the_reference_size(shard_dir):
+    """Otherwise validation losses are not comparable across runs or steps."""
+    _, config, ds = _varsize_dataset(shard_dir, (16, 24, 32))
+    assert ds.validation_batch(4).shape[-1] == config.patch.out_size
+
+
+def test_pooled_cache_serves_smaller_sizes_by_sub_cropping(shard_dir, tmp_path):
+    """A sub-crop of a pooled, transformed image equals the pooled transform of
+    the corresponding native sub-region -- pooling is local, the transform is
+    pointwise -- so the cache covers every size at or below its own."""
+    ss, config, ds = _varsize_dataset(shard_dir, (16, 24, 32))
+    cached = PatchDataset.from_pooled_cache(
+        ds.build_pooled_cache(tmp_path / "c.h5"), config, ds.transform
+    )
+    for s in (16, 24, 32):
+        assert cached.make_batch(np.arange(4), augment=False,
+                                 out_size=s).shape == (4, 1, s, s)
+    with pytest.raises(ValueError, match="cannot serve"):
+        cached.make_batch(np.arange(4), augment=False, out_size=48)
+
+
+def test_pooled_cache_sub_crop_matches_the_native_path(shard_dir, tmp_path):
+    ss, config, ds = _varsize_dataset(shard_dir, (16,))
+    cached = PatchDataset.from_pooled_cache(
+        ds.build_pooled_cache(tmp_path / "c2.h5"), config, ds.transform
+    )
+    idx = np.arange(4)
+    from_cache = cached.make_batch(idx, augment=False, out_size=16)
+    full = ds.make_batch(idx, rng=None, augment=False, out_size=32)
+    o = (32 - 16) // 2
+    np.testing.assert_allclose(from_cache[:, 0], full[:, 0, o:o + 16, o:o + 16],
+                               rtol=1e-6)
+
+
+def test_small_crops_do_not_wander_off_the_host(shard_dir):
+    """Translation room is capped at the reference size's room.
+
+    Without the cap a 16 px crop would roam the whole 112 px stamp and land
+    mostly on blank sky, so the data distribution would silently change with
+    patch size -- which is not what varying the size is for.
+    """
+    from rubin_host_prior.data.pooling import pool_to_training_grid
+
+    a = np.arange(224 * 224, dtype=np.float64).reshape(224, 224)
+    corners = set()
+    rng = np.random.default_rng(0)
+    for _ in range(80):
+        out = pool_to_training_grid(a, 16, 3, rng=rng, translate=True,
+                                    max_translate=16)
+        corners.add(int(out[0, 0] // 224))
+    assert max(corners) - min(corners) <= 2 * 16
+    centre = (224 - 48) // 2
+    assert abs((max(corners) + min(corners)) / 2 - centre) <= 2

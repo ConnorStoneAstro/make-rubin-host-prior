@@ -76,14 +76,46 @@ def min_input_for_region(region_size: int, n_layers: int, kernel_size: int = 3) 
     return region_size + 2 * loss_margin(n_layers, kernel_size)
 
 
-def describe(input_size: int, n_layers: int, kernel_size: int = 3) -> str:
-    """One-line summary, for logs and for sanity-checking a config."""
-    r = receptive_radius(n_layers, kernel_size)
-    e = energy_size(input_size, n_layers, kernel_size)
-    interior = interior_size(input_size, n_layers, kernel_size)
-    frac = (interior / input_size) ** 2 if interior > 0 else 0.0
-    return (
-        f"input {input_size}x{input_size} -> energy map {e}x{e} "
-        f"(R={r}, margin={2 * r}); loss interior {interior}x{interior} "
-        f"({100 * frac:.0f}% of pixels)"
+def report(
+    input_sizes: int | tuple[int, ...],
+    n_layers: int,
+    kernel_size: int = 3,
+) -> str:
+    """Multi-line setup summary, printed before training starts.
+
+    The crop is never a free parameter -- it is fixed by ``n_layers`` and
+    ``kernel_size`` -- so this is what tells you what changing those did.
+    """
+    if isinstance(input_sizes, int):
+        input_sizes = (input_sizes,)
+    r = layer_radius(kernel_size)
+    R = receptive_radius(n_layers, kernel_size)
+    margin = loss_margin(n_layers, kernel_size)
+    lines = [
+        "valid-convolution geometry (derived from the architecture, not configured)",
+        f"  {n_layers} x {kernel_size}x{kernel_size} valid convolutions"
+        f"  ->  receptive radius R = {r}*{n_layers} = {R}",
+        f"  loss crop = 2R = {margin} px from every side"
+        f"   (beyond 2R the training signal is exactly unbiased)",
+        f"  smallest usable patch = 4R + 1 = {4 * R + 1} px",
+    ]
+    for size in sorted(input_sizes):
+        interior = interior_size(size, n_layers, kernel_size)
+        if interior <= 0:
+            lines.append(
+                f"    patch {size}x{size}: TOO SMALL -- needs more than 4R = "
+                f"{margin * 2} px per side"
+            )
+            continue
+        e = energy_size(size, n_layers, kernel_size)
+        frac = (interior / size) ** 2
+        lines.append(
+            f"    patch {size:>4}x{size:<4} -> energy map {e}x{e},"
+            f" loss on interior {interior}x{interior}"
+            f" ({100 * frac:.0f}% of pixels)"
+        )
+    lines.append(
+        f"  at inference: a trustworthy region of N px needs a canvas of "
+        f"N + {2 * margin} px"
     )
+    return "\n".join(lines)

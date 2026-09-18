@@ -17,9 +17,9 @@ import logging
 
 import jax
 
-from rubin_host_prior import geometry
 from rubin_host_prior.config import Config
-from rubin_host_prior.data import LogFluxTransform, PatchDataset, ShardSet
+from rubin_host_prior.data import (LogFluxTransform, PatchDataset, ShardSet,
+                                   context_advice)
 from rubin_host_prior.diffusion import VESDE
 from rubin_host_prior.nn import ConvEnergyNet, n_parameters
 from rubin_host_prior.training import train
@@ -36,6 +36,10 @@ def main() -> None:
     p.add_argument("--lr", type=float, default=None)
     p.add_argument("--n-layers", type=int, default=None,
                    help="override the layer count, keeping the widths pattern")
+    p.add_argument("--out-sizes", type=int, nargs="+", default=None,
+                   help="train on several patch sizes, cycled round-robin across "
+                        "batches; larger patches spend less of themselves on the "
+                        "cropped border")
     p.add_argument("--eval-every", type=int, default=2000)
     p.add_argument("--eval-size", type=int, default=32)
     p.add_argument("--max-in-memory-gb", type=float, default=16.0)
@@ -65,6 +69,11 @@ def main() -> None:
             ),
         )
 
+    if args.out_sizes:
+        config.patch = dataclasses.replace(
+            config.patch, out_sizes=tuple(args.out_sizes)
+        )
+
     transform = LogFluxTransform.from_config(config.transform)
     if args.pooled_cache:
         dataset = PatchDataset.from_pooled_cache(
@@ -77,11 +86,14 @@ def main() -> None:
         )
 
     model = ConvEnergyNet(config.energy, key=jax.random.key(config.train.seed))
-    print(geometry.describe(config.patch.out_size, model.n_layers,
-                            config.energy.kernel_size))
     print(f"{n_parameters(model):,} parameters | {len(dataset):,} patches "
           f"| loader mode {dataset.mode}")
     print(json.dumps(dataset.stats(min(256, len(dataset))), indent=2))
+    cl = dataset.correlation_length(min(256, len(dataset)))
+    print(context_advice(cl["xi"], model.loss_margin))
+    print()
+    # train() prints the full valid-convolution geometry, including exactly how
+    # much of each patch the loss crop discards.
 
     train(
         model,

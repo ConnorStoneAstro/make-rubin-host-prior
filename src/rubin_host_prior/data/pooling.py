@@ -89,6 +89,7 @@ def pool_to_training_grid(
     rng: np.random.Generator | None = None,
     translate: bool = False,
     scale_jitter: float = 0.0,
+    max_translate: int | None = None,
 ) -> np.ndarray:
     """Native stamp(s) -> ``out_size`` training image(s).
 
@@ -97,6 +98,10 @@ def pool_to_training_grid(
     and an area resample follows; ``delta`` is clipped to whatever the native
     stamp can actually supply, so a too-small ``native_size`` quietly reduces the
     jitter range rather than erroring.
+
+    ``max_translate`` caps how far the crop may wander from the stamp centre,
+    in native pixels per side.  Without it a small crop would roam over the whole
+    stamp; with it every training size looks at the same neighbourhood.
     """
     h, w = native.shape[-2:]
     if h != w:
@@ -118,6 +123,12 @@ def pool_to_training_grid(
         )
 
     room = h - size
+    if max_translate is not None:
+        # Cap the offset rather than letting it use the whole stamp.  A small
+        # crop leaves a lot of room, and using all of it would make small
+        # patches mostly blank sky far from the host -- i.e. a different data
+        # distribution at every size, which is not what varying the size is for.
+        room = min(room, 2 * max(max_translate, 0))
     if translate and room > 0:
         if rng is None:
             raise ValueError("translate requires an rng")
@@ -125,6 +136,9 @@ def pool_to_training_grid(
         x0 = int(rng.integers(0, room + 1))
     else:
         y0 = x0 = room // 2
+    centre_shift = (h - size - room) // 2
+    y0 += centre_shift
+    x0 += centre_shift
 
     patch = crop(native, size, y0, x0)
     if size == nominal:
