@@ -33,7 +33,15 @@ def main() -> None:
         help="visit_image is closest to the data you will eventually analyse; "
         "deep_coadd is cleaner but has correlated noise from warping",
     )
-    p.add_argument("--native-size", type=int, default=224)
+    p.add_argument(
+        "--native-size",
+        type=int,
+        default=416,
+        help="native pixels per stamp. This is what caps the training patch "
+        "size: out_size <= native_size // pool_factor. 416 targets 128 px "
+        "patches (56%% of each clears the loss crop) with slack left for "
+        "translation augmentation",
+    )
     p.add_argument("--psf-size", type=int, default=41)
     p.add_argument("--n-hosts", type=int, default=2000)
     p.add_argument("--max-images-per-host", type=int, default=20)

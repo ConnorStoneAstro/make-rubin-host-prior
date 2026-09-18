@@ -360,7 +360,7 @@ def extract_patches(
     dec: float = ECDFS[1],
     bands: Sequence[str] = BANDS,
     dataset_type: str = "visit_image",
-    native_size: int = 224,
+    native_size: int = 416,
     psf_size: int = 41,
     n_hosts: int | None = 2000,
     max_images_per_host: int = 20,

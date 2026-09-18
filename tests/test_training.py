@@ -9,7 +9,8 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
-from rubin_host_prior.config import BANDS, Config, EnergyConfig, PatchConfig
+from rubin_host_prior.config import (BANDS, AugmentConfig, Config, EnergyConfig,
+                                     PatchConfig)
 from rubin_host_prior.diffusion import VESDE, mean_dsm_loss
 from rubin_host_prior.nn import ConvEnergyNet, n_parameters
 from rubin_host_prior.training import (
@@ -396,3 +397,27 @@ def test_report_marks_patches_that_are_mostly_margin():
     text = geo.report((40, 64), n_layers=8)
     assert "mostly margin" in text.split("patch   40")[1].split("\n")[0]
     assert "mostly margin" not in text.split("patch   64")[1].split("\n")[0]
+
+
+def test_defaults_leave_room_for_translation():
+    """Regression: native_size = out_size * pool_factor exactly (e.g. 384 for a
+    128 px patch) silently disables the translation augmentation, because the
+    crop then fills the whole stamp.  The defaults must not be in that state."""
+    c = Config()
+    assert c.patch.out_size == 128
+    assert c.patch.max_translate_native > 0
+    assert c.check_sizes() == []
+
+
+def test_zero_translation_room_is_reported():
+    c = Config(patch=PatchConfig(native_size=384, nominal_crop=384, out_size=128,
+                                 pool_factor=3))
+    assert c.patch.max_translate_native == 0
+    assert any("no room" in w for w in c.check_sizes())
+
+
+def test_no_warning_when_translation_is_switched_off():
+    c = Config(patch=PatchConfig(native_size=384, nominal_crop=384, out_size=128,
+                                 pool_factor=3),
+               augment=AugmentConfig(translate=False))
+    assert c.check_sizes() == []

@@ -206,27 +206,37 @@ size). This does three things:
 - **Recovers the signal the crop discards.** The fraction of a patch that reaches
   the loss is `((H−4R)/H)²`. Since the score is computed on every pixel and the
   crop throws the border away, that fraction is also the per-step compute
-  efficiency. **Bigger patches need bigger extracted stamps**, and this is the
-  main thing that should drive `--native-size`:
+  efficiency. **Bigger patches need bigger extracted stamps**, and this is what
+  should drive `--native-size`:
 
-  | training size | interior | % of pixels used | native stamp needed | GB per 50k patches |
-  |---|---|---|---|---|
-  | 64×64 | 32×32 | 25% | 192 | — |
-  | 74×74 | 42×42 | 32% | 222 | 15.7 (at `native_size=224`) |
-  | 96×96 | 64×64 | 44% | 288 | 24.5 (at `native_size=288`) |
-  | 128×128 | 96×96 | 56% | 384 | 37.7 (at `native_size=384`) |
+  | `native_size` | max training size | interior at that size | KB/patch | GB per 50k | translation room |
+  |---|---|---|---|---|---|
+  | 224 | 74 | 25% (at 64px) | 331 | 15.8 | 32 px |
+  | 288 | 96 | 44% | 519 | 24.7 | **0 px** |
+  | 384 | 128 | 56% | 789 | 37.6 | **0 px** |
+  | **416** (default) | 138 | **56%** (at 128px) | 931 | 44.4 | 32 px |
 
-  With the default `native_size=224` and `L=8` the usable range is only **33–74**,
-  so variable sizes buy relatively little; 288 or 384 px stamps are what make the
-  feature worth having. Larger stamps are more efficient in both directions —
-  per stored byte the training signal goes 5.4 → 8.0 → 11.7 loss pixels/KB —
-  because the fixed `2R` border tax is amortised over more area. The costs are
-  extraction time (butler reads scale with area) and slightly more rejections
-  near detector edges.
+  The default targets **128 px training patches**, where 56% of each patch clears
+  the crop against 25% at 64 px. `native_size` is 416 rather than the 384 that
+  128 px strictly needs, because 384 is exactly 3×128 and would leave no room to
+  translate the crop — silently disabling an augmentation that is otherwise free
+  and exact. `Config.check_sizes()` warns if you land in that state.
 
-  `Config.usable_size_range()` reports the bounds, and `Config.check_sizes()`
-  warns about sizes that are below the model's minimum or that spend most of
-  themselves on the margin. `prepare_config.py` prints both.
+  Larger stamps are more efficient in both directions: per stored byte the
+  training signal roughly doubles from 224 to 416, because the fixed `2R` border
+  tax is amortised over more area. The costs are extraction time (butler reads
+  scale with area) and slightly more rejections near detector edges.
+
+  `Config.usable_size_range()` reports the bounds — `(33, 138)` for the defaults —
+  and `Config.check_sizes()` warns about sizes below the model's minimum or that
+  spend most of themselves on the margin. `prepare_config.py` and `train()` print
+  both.
+
+  A reasonable mix is `--out-sizes 64 96 128`. Step cost scales with
+  `batch × H²`, so a 128 px patch costs 4× a 64 px one; `train()` prints the
+  score-pixel count per step, and halving the batch is the first thing to try if
+  device memory is tight.
+
 - **Costs nothing in accuracy.** Every size estimates the same size-independent
   bulk potential, so mixing them is free — verified as bit-identical to
   single-size training in the Gaussian analogue. This is only true *because* the
@@ -324,8 +334,8 @@ slightly correlated. **That is a real change to the noise properties, so
   untouched. On by default.
 - **Translation** — integer *native*-pixel shifts of the crop. One native pixel is
   1/3 of an output pixel, so this is sub-output-pixel positional augmentation with
-  **no interpolation at all**. On by default. This is why `native_size` (224)
-  exceeds `nominal_crop` (192).
+  **no interpolation at all**. On by default. This is why `native_size` (416)
+  exceeds `nominal_crop` (384).
 - **Scale jitter** — interpolates, so off by default. `AugmentConfig.scale_jitter`
   turns it on.
 

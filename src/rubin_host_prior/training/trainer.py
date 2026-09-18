@@ -89,6 +89,14 @@ def train(
         if len(sizes) > 1:
             print(f"  {len(sizes)} training sizes -> {len(sizes)} jit compilations "
                   f"of the train step, cycled round-robin across batches")
+        # Step cost scales with batch x H^2, so this is the number to watch when
+        # a bigger patch size starts exhausting device memory.
+        biggest = max(sizes)
+        print(f"  batch {cfg.batch_size} x {biggest}x{biggest} = "
+              f"{cfg.batch_size * biggest ** 2:,} score pixels per step "
+              f"(cost scales with this; halve the batch if memory is tight)")
+        for warning in config.check_sizes():
+            print(f"  WARNING: {warning}")
     _validate_geometry(sizes, model)
     optimizer = make_optimizer(cfg)
     params = eqx.filter(model, eqx.is_inexact_array)

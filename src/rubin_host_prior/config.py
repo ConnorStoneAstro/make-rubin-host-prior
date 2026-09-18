@@ -74,11 +74,19 @@ class PatchConfig:
     ``native_size`` is deliberately larger than ``nominal_crop`` so that scale
     jitter can go in both directions and so that integer translations in native
     pixels (which are exact -- no interpolation) give sub-pooled-pixel jitter.
+
+    The defaults target 128 px training patches, where 56% of each patch clears
+    the ``2R`` loss crop (against 25% at 64 px).  ``native_size`` is 416 rather
+    than the 384 that 128 px strictly needs: 384 would be exactly 3 x 128,
+    leaving no room at all to translate the crop and silently disabling an
+    augmentation that is otherwise free and exact.  32 native pixels of slack is
+    +/- 5.3 pooled pixels, far more than the +/- 1 pooled pixel needed to cover
+    every sub-pixel phase.
     """
 
-    native_size: int = 224  # pixels cut from the visit image
-    nominal_crop: int = 192  # native pixels feeding one training image
-    out_size: int = 64  # nominal_crop / pool_factor; the reference size
+    native_size: int = 416  # pixels cut from the visit image
+    nominal_crop: int = 384  # native pixels feeding one training image
+    out_size: int = 128  # nominal_crop / pool_factor; the reference size
     pool_factor: int = 3
     #: Extra training sizes.  Each batch is drawn at one size (a batch must be
     #: shape-homogeneous), cycling over ``training_sizes``.  Larger patches
@@ -204,6 +212,13 @@ class Config:
                 if frac < 0.10:
                     out.append(f"size {s} spends {100 * (1 - frac):.0f}% of itself "
                                f"on the cropped margin -- little signal per step")
+        if self.augment.translate and self.patch.max_translate_native == 0:
+            out.append(
+                f"translation augmentation has no room: native_size "
+                f"({self.patch.native_size}) equals out_size * pool_factor. "
+                f"Enlarge native_size or reduce out_size -- translation is exact "
+                f"and free, so losing it silently is a waste."
+            )
         return out
 
     def to_dict(self) -> dict[str, Any]:
