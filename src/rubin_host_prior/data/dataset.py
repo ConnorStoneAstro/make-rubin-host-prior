@@ -138,7 +138,7 @@ class PatchDataset:
             return self._native[indices]
         return self.shards.gather(indices, "image")
 
-    def _pool_and_transform(
+    def _pool(
         self,
         indices: np.ndarray,
         rng: np.random.Generator | None,
@@ -146,6 +146,7 @@ class PatchDataset:
         scale_jitter: float,
         out_size: int | None = None,
     ) -> np.ndarray:
+        """Pooled flux in nJy, before the log transform."""
         p = self.config.patch
         out_size = p.out_size if out_size is None else out_size
         stamps = self._native_stamps(indices)
@@ -160,6 +161,17 @@ class PatchDataset:
                 scale_jitter=scale_jitter,
                 max_translate=p.max_translate_native,
             )
+        return out
+
+    def _pool_and_transform(
+        self,
+        indices: np.ndarray,
+        rng: np.random.Generator | None,
+        translate: bool,
+        scale_jitter: float,
+        out_size: int | None = None,
+    ) -> np.ndarray:
+        out = self._pool(indices, rng, translate, scale_jitter, out_size)
         # Pool in flux, THEN take the log.  The other order computes a geometric
         # mean and biases every structured patch low.
         return self.transform.forward(out, self.band_idx[indices])
@@ -271,6 +283,51 @@ class PatchDataset:
         return path
 
     # -- diagnostics ------------------------------------------------------
+
+    def flux_headroom(self, n: int = 512, seed: int = 0) -> dict:
+        """How far negative the pooled flux goes, in units of pooled sky noise.
+
+        This is what sets ``k_sigma``.  The transform's offset
+        ``b_band = k_sigma * sigma_pooled`` is a hard bound on representable
+        flux -- the model spans ``(-b_band, +inf)`` and nothing below -- and the
+        clip at ``floor_ratio`` bites at ``-0.9 * k_sigma`` sigma.  So
+        ``k_sigma`` must exceed the deepest negative excursion you intend to
+        keep, and if you are keeping background-subtraction artefacts (dark
+        haloes, dark edges) rather than gating them out, that is deeper than the
+        noise alone would suggest.
+
+        Note the asymmetry that makes this bind: pooling divides the *noise* by
+        ``pool_factor`` but leaves a smooth negative offset untouched, so in
+        pooled-sigma units an over-subtracted region is ``pool_factor`` times
+        deeper than it was natively.
+        """
+        if self._pooled is not None:
+            raise ValueError(
+                "flux_headroom needs native stamps; the pooled cache stores the "
+                "already-transformed, already-clipped representation. Build the "
+                "dataset from shards instead."
+            )
+        rng = np.random.default_rng(seed)
+        idx = np.sort(rng.choice(len(self), size=min(n, len(self)), replace=False))
+        flux = self._pool(idx, rng=None, translate=False, scale_jitter=0.0)
+        sigma_pooled = (
+            np.asarray(self.shards.meta["sky_noise"])[idx] / self.config.patch.pool_factor
+        )
+        good = np.isfinite(sigma_pooled) & (sigma_pooled > 0)
+        if not np.any(good):
+            return {"n": 0}
+        worst = flux[good].min(axis=(1, 2)) / sigma_pooled[good]
+        pcts = {str(q): float(np.percentile(worst, q)) for q in (0.1, 1, 5, 50)}
+        # The clip sits at -0.9 * k_sigma, so covering a depth D needs
+        # k_sigma > D / 0.9.
+        needed = float(abs(np.percentile(worst, 0.1)) / 0.9)
+        return {
+            "n": int(good.sum()),
+            "min_flux_sigma_percentiles": pcts,
+            "deepest": float(worst.min()),
+            "k_sigma_current": float(self.config.transform.k_sigma),
+            "k_sigma_needed": needed,
+        }
 
     def correlation_length(self, n: int = 512, seed: int = 0) -> dict:
         """Structural correlation length of the training representation, in

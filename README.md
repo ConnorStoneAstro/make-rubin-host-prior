@@ -288,32 +288,70 @@ decades of score magnitude. Set `sigma_scaling="none"` for the unmodified energy
 ### The log-space transform
 
 ```
-x = log1p(f / b_band) / c          f = b_band · expm1(c · x)
+forward:   x = log1p( max(f / b_band, r) ) / c   =   log( 1 + max(f/b_band, r) ) / c
+inverse:   f = b_band · expm1( c · x )           =   b_band · ( e^{c·x} − 1 )
 ```
 
-`b_band` is a per-band soft offset in nJy, nominally `k_sigma ×` the *pooled* sky
-noise of that band. Three properties follow:
+with `r = floor_ratio = −0.9` and `c = log_scale = 1`. `b_band = k_sigma ×
+σ_pooled` is a per-band offset in nJy.
 
-- **No hard floor, no point mass.** DP1 `visit_image` pixels are
-  background-subtracted, so roughly half of all sky pixels are negative.
+**The `+1` inside `log1p` is the boost**, and it is what carries negative pixels
+through the logarithm. DP1 images are background-subtracted, so roughly half of
+all sky pixels are negative; dividing by `b_band` rescales them but leaves them
+negative. Adding `b_band` is what makes the argument positive. In flux units the
+transform is `log((f + b)/b)`.
+
+Three properties follow:
+
+- **No hard floor in the ordinary regime, and no point mass.**
   `log(max(f, floor))` would pile 40–50% of every patch onto one value;
-  `log1p(f/b)` is smooth and strictly monotonic through zero.
+  `log1p(f/b)` is smooth and strictly monotonic through zero instead.
 - **Band-agnostic.** Dividing by `b_band` puts every band's sky level at `x ≈ 0`
-  with scatter `≈ 1/k_sigma`, so u-band and y-band patches land in the same place
-  and one prior covers all six. There is no band label anywhere in the model.
+  with scatter `≈ 1/k_sigma`, so u-band and y-band patches land in the same
+  place and one prior covers all six. There is no band label anywhere in the
+  model. `PatchDataset.stats()["sky_scatter"]` should come out near `1/k_sigma`;
+  if it does not, the offsets are wrong.
 - **Linear where it matters, logarithmic where it must be.** Near the noise floor
   `x ≈ f/(b·c)`, a pure rescaling, so additive Gaussian pixel noise stays
   additive and Gaussian. In the bright regime it is logarithmic, which tames the
   ~10⁴ dynamic range of a galaxy core.
 
-The clip at `floor_ratio = -0.9` is a numerical guard for artefacts, not a
-modelling choice: at `k_sigma = 5` a legitimate sky pixel reaches it only at 9.5σ
-(~4×10⁻⁶ of pixels in practice). `PatchDataset.stats()` reports how often it
-fires.
+#### `k_sigma` is a modelling choice, not a numerical guard
+
+`inverse` is `b·expm1(c·x)` and `expm1 → −1`, so the model can represent flux in
+**`(−b_band, +∞)` and nothing below**. `k_sigma` is therefore a hard bound on how
+negative a pixel the prior can express. The clip at `floor_ratio` bites slightly
+earlier, at `−0.9·k_sigma` σ.
+
+This binds harder than it looks, because **pooling does not treat noise and
+smooth offsets alike**: 3×3 averaging divides the *noise* by 3, while a smooth
+background offset does not average down at all. An over-subtracted region `D`
+sigma deep natively is `3D` sigma deep in the pooled data the model sees.
+
+Fraction of pixels driven onto the floor, by halo depth and `k_sigma`:
+
+| dark halo depth | pooled depth | `k=5` | `k=10` | `k=15` |
+|---|---|---|---|---|
+| 0 (clean sky) | 0σ | 3×10⁻⁶ | ~0 | ~0 |
+| 1.0σ native | 3σ | **6.7×10⁻²** | 1×10⁻⁹ | ~0 |
+| 2.0σ native | 6σ | **0.93** | 1×10⁻³ | ~0 |
+| 3.0σ native | 9σ | **1.0** | 0.50 | 3×10⁻⁶ |
+
+Measured end to end on synthetic shards carrying a 1.5σ halo: `k_sigma=5` clips
+8.4% of pixels and inflates `sky_scatter` from 0.2 to 0.65; `k_sigma=10` clips
+none. **The default is therefore `k_sigma = 10`**, and raising it costs almost
+nothing — the dynamic range of the representation barely changes, since that is
+set by the physical S/N rather than by `k`.
+
+`PatchDataset.flux_headroom()` measures what your data actually needs — the
+distribution of the most-negative pooled pixel in units of pooled sky noise, and
+the implied minimum `k_sigma`. `prepare_config.py` prints it and warns if
+`k_sigma` is too small. **Run it before training**, especially if you are keeping
+background-subtraction artefacts rather than gating them out.
 
 A forward model in log space needs no Jacobian: generate the model scene in `x`,
-map to flux with `transform.inverse`, and compare to the data. `transform.jacobian`
-exists if you ever want a density in flux units.
+map to flux with `transform.inverse`, and compare to the data.
+`transform.jacobian` exists if you ever want a density in flux units.
 
 ### Pooling in flux, then log — not the other way round
 
@@ -375,6 +413,14 @@ matter:
   blind to positive sources by construction.
 - **One-sided.** A *depressed* floor is over-subtraction; a *raised* one is
   starlight. Gating on the magnitude would discard the brightest hosts.
+
+**By default it records but does not reject** (`max_depression=None`). The data
+is taken as-is, background-subtraction artefacts included, and the prior is
+allowed to learn them — the right call when the artefacts are a property of the
+current processing that a later release will improve, since you retrain rather
+than filter. Pass `--max-depression 0.3` to reject instead. Note the interaction:
+keeping depressed regions is exactly what forces a larger `k_sigma`, because
+those pixels have to remain representable.
 
 Tested against bright galaxies, faint galaxies, edge galaxies, galaxies filling
 the whole stamp (all accepted) and 6σ bowls, 1σ bowls, gradients and uniform

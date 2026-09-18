@@ -592,3 +592,116 @@ def test_small_crops_do_not_wander_off_the_host(shard_dir):
     assert max(corners) - min(corners) <= 2 * 16
     centre = (224 - 48) // 2
     assert abs((max(corners) + min(corners)) / 2 - centre) <= 2
+
+
+# -- the exact transform, and negative-flux headroom ------------------------
+
+
+def test_forward_is_exactly_log_of_one_plus_f_over_b():
+    """Pin the formula:  x = log(1 + max(f/b, r)) / c,  f = b*(exp(c*x) - 1).
+
+    The boost that carries negative sky pixels through the logarithm is the
+    ``+1`` inside ``log1p`` -- i.e. ``+b`` in flux units.  Dividing by ``b`` does
+    not do it: that rescales negatives but leaves them negative.
+    """
+    t = _transform(log_scale=2.0, floor_ratio=-0.9)
+    b = t.offsets[0]
+    f = np.array([[-0.5 * b, 0.0, b, 37.0 * b]])
+    expected = np.log(1.0 + f / b) / 2.0
+    np.testing.assert_allclose(t.forward(f, np.array([0])), expected, rtol=1e-12)
+    # and the division alone would leave every negative pixel negative
+    assert np.all((f / b)[f < 0] < 0)
+
+
+def test_representable_flux_range_is_bounded_below_by_minus_b():
+    """``inverse`` is b*expm1(c*x) and expm1 -> -1, so the model spans
+    ``(-b, +inf)``.  ``b`` is therefore a hard bound on negative flux, not just a
+    numerical guard -- which is what makes ``k_sigma`` a modelling choice."""
+    t = _transform()
+    b = t.offsets[0]
+    # Far below the floor, expm1 underflows to exactly -1 and the flux saturates
+    # at -b.  That is the right behaviour: bounded, finite, no NaN -- a sampler
+    # that wanders to very negative x gets "as dark as representable", not a
+    # numerical blow-up.  forward() never produces x below x_floor anyway.
+    assert t.inverse(np.array([[-50.0]]), np.array([0]))[0, 0] == pytest.approx(-b)
+    everywhere = t.inverse(np.linspace(-60, 5, 400)[None], np.array([0]))
+    assert np.all(np.isfinite(everywhere))
+    assert np.all(everywhere >= -b)
+    # Strictly above -b across the range the transform actually produces.
+    realistic = t.inverse(np.linspace(t.x_floor, 8, 400)[None], np.array([0]))
+    assert np.all(realistic > -b)
+
+
+def test_floor_bites_at_minus_zero_point_nine_k_sigma():
+    t = _transform(k_sigma=10.0)
+    b = t.offsets[0]
+    assert t.forward(np.array([[-0.9 * b]]), np.array([0]))[0, 0] == pytest.approx(
+        t.x_floor
+    )
+    assert t.forward(np.array([[-0.89 * b]]), np.array([0]))[0, 0] > t.x_floor
+
+
+@pytest.fixture(scope="module")
+def dark_halo_shards(tmp_path_factory):
+    """Shards carrying a 1.5-sigma background over-subtraction, kept rather than
+    gated out -- the regime that decides k_sigma."""
+    d = tmp_path_factory.mktemp("halo")
+    write_synthetic_shards(d, n_patches=48, native_size=112, patches_per_shard=48,
+                           dark_halo_sigma=1.5, seed=3)
+    return d
+
+
+def _halo_dataset(shard_dir, k_sigma):
+    ss = ShardSet.from_dir(shard_dir)
+    config = Config(patch=PatchConfig(native_size=ss.native_size, nominal_crop=96,
+                                      out_size=32, pool_factor=3))
+    config.transform.k_sigma = k_sigma
+    config.transform.band_offsets = estimate_band_offsets(
+        ss.load("variance"), ss.meta["band_idx"], 3, k_sigma
+    )
+    return PatchDataset.from_shards(
+        ss, config, LogFluxTransform.from_config(config.transform)
+    )
+
+
+def test_pooling_makes_a_smooth_offset_deeper_than_the_noise(dark_halo_shards):
+    """Pooling divides the noise by pool_factor but leaves a smooth offset
+    untouched, so in pooled-sigma units an over-subtracted region is
+    pool_factor times deeper than it was natively.  This is why k_sigma has to
+    be larger than the noise alone would suggest."""
+    ds = _halo_dataset(dark_halo_shards, 10.0)
+    head = ds.flux_headroom(48)
+    # a 1.5 sigma native halo is ~4.5 sigma pooled, plus noise and the bowl's core
+    assert head["deepest"] < -4.0
+    assert head["k_sigma_needed"] > 5.0
+
+
+def test_too_small_k_sigma_clips_the_dark_halo(dark_halo_shards):
+    small = _halo_dataset(dark_halo_shards, 5.0).stats(48)
+    large = _halo_dataset(dark_halo_shards, 15.0).stats(48)
+    assert small["clipped_fraction"] > 0.01, "k_sigma=5 should clip a 1.5sig halo"
+    assert large["clipped_fraction"] == 0.0
+
+
+def test_sky_scatter_tracks_one_over_k_sigma(shard_dir):
+    """On clean patches the log-space sky scatter should be ~1/k_sigma, which is
+    the check that the band offsets are right."""
+    for k in (5.0, 10.0):
+        ss = ShardSet.from_dir(shard_dir)
+        config = Config(patch=PatchConfig(native_size=ss.native_size,
+                                          nominal_crop=96, out_size=32,
+                                          pool_factor=3))
+        config.transform.k_sigma = k
+        config.transform.band_offsets = estimate_band_offsets(
+            ss.load("variance"), ss.meta["band_idx"], 3, k)
+        ds = PatchDataset.from_shards(
+            ss, config, LogFluxTransform.from_config(config.transform))
+        assert ds.stats(48)["sky_scatter"] == pytest.approx(1.0 / k, rel=0.4)
+
+
+def test_flux_headroom_needs_native_stamps(shard_dir, tmp_path):
+    ss, config, ds = _dataset(shard_dir)
+    cached = PatchDataset.from_pooled_cache(
+        ds.build_pooled_cache(tmp_path / "h.h5"), config, ds.transform)
+    with pytest.raises(ValueError, match="needs native stamps"):
+        cached.flux_headroom(8)

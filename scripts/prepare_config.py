@@ -36,7 +36,10 @@ def main() -> None:
     p.add_argument("--shards", required=True, help="directory of *.h5 shards")
     p.add_argument("--out", required=True, help="config JSON to write")
     p.add_argument("--base-config", default=None, help="config to start from")
-    p.add_argument("--k-sigma", type=float, default=5.0)
+    p.add_argument("--k-sigma", type=float, default=10.0,
+                   help="b_band = k_sigma * pooled sky noise. Hard bound on "
+                        "representable negative flux; raise it if the "
+                        "headroom report says so")
     p.add_argument("--pool-factor", type=int, default=3)
     p.add_argument("--out-size", type=int, default=64)
     p.add_argument("--n-stats", type=int, default=512)
@@ -74,6 +77,19 @@ def main() -> None:
     # The correlation length, measured on the pooled log-space patches the model
     # actually sees.  This is the authoritative version -- the one in the
     # extraction summary is native-resolution flux and is contaminated by the PSF.
+    head = dataset.flux_headroom(args.n_stats)
+    print(f"\nnegative-flux headroom (pooled, in units of pooled sky noise)")
+    print(f"  deepest pixel over {head['n']} patches: {head['deepest']:.1f} sigma")
+    print(f"  per-patch minimum, percentiles: " + ", ".join(
+        f"{q}%={v:.1f}" for q, v in head["min_flux_sigma_percentiles"].items()))
+    print(f"  k_sigma is {head['k_sigma_current']:.1f}; the data needs at least "
+          f"{head['k_sigma_needed']:.1f}")
+    if head["k_sigma_needed"] > head["k_sigma_current"]:
+        print(f"  WARNING: raise --k-sigma to at least "
+              f"{head['k_sigma_needed']:.0f} and re-run. b_band = k_sigma * "
+              f"sigma_pooled is a hard bound on representable flux; below it the "
+              f"transform clips and the model cannot express those pixels at all.")
+
     lo, hi = config.usable_size_range()
     print(f"\nusable training sizes with {config.energy.n_layers} layers and "
           f"{config.patch.native_size} px stamps: {lo} .. {hi}")

@@ -52,9 +52,11 @@ def main() -> None:
     p.add_argument(
         "--max-depression",
         type=float,
-        default=0.3,
-        help="reject if the block sky floor is this far below zero, in sky-noise "
-        "units; the single most important gate for this project",
+        default=None,
+        help="reject patches whose block sky floor sits this far below zero, in "
+        "sky-noise units. Default: do not reject, only record -- the data is "
+        "taken as-is and the prior learns the background-subtraction artefacts. "
+        "Set e.g. 0.3 to filter them instead",
     )
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--verbose", "-v", action="count", default=0)

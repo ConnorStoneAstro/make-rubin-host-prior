@@ -9,7 +9,13 @@ reason for this choice:
 * **No hard floor, no point mass.**  DP1 ``visit_image`` pixels are
   background-subtracted, so about half of all sky pixels are negative.
   ``log(max(f, floor))`` would pile 40-50% of every patch onto a single value;
-  ``log1p(f / b)`` is smooth and strictly monotonic through zero instead.
+  ``log1p(f / b)`` is smooth and strictly monotonic through zero instead.  The
+  ``+1`` inside ``log1p`` is ``+b`` in flux units -- that is what carries the
+  negative pixels through, not the division by ``b``, which leaves negatives
+  negative.
+* **It bounds what the model can represent.**  ``inverse`` spans ``(-b, +inf)``,
+  so ``b`` must exceed the deepest negative excursion in the data.  See
+  ``TransformConfig`` for why pooling makes that bound tighter than it looks.
 * **Band-agnostic.**  Dividing by ``b_band`` before the log puts every band's sky
   level at ``x ~ 0`` with scatter ``~ 1 / k_sigma``, so u-band and y-band patches
   land in the same place and one prior can cover all six.
@@ -112,7 +118,7 @@ def estimate_band_offsets(
     variance: np.ndarray,
     band_index: np.ndarray,
     pool_factor: int,
-    k_sigma: float = 5.0,
+    k_sigma: float = 10.0,
     bands: tuple[str, ...] = BANDS,
 ) -> dict[str, float]:
     """``b_band = k_sigma * median pooled sky noise`` per band, in nJy.

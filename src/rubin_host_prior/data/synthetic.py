@@ -61,8 +61,17 @@ def synthetic_patch(
     psf_size: int = 25,
     sky_noise: float = 12.0,
     psf_sigma: float | None = None,
+    dark_halo_sigma: float = 0.0,
 ) -> dict:
-    """One background-subtracted patch in nJy, with its variance, mask and PSF."""
+    """One background-subtracted patch in nJy, with its variance, mask and PSF.
+
+    ``dark_halo_sigma`` adds a smooth negative bowl of that depth, in units of
+    the *native* sky noise, imitating DP1 background over-subtraction around a
+    bright source.  Worth exercising because it is the regime that sets
+    ``k_sigma``: a smooth offset does not average down under pooling while the
+    noise does, so a bowl ``D`` sigma deep natively is ``D * pool_factor`` sigma
+    deep in the pooled data the model sees.
+    """
     psf_sigma = psf_sigma if psf_sigma is not None else float(rng.uniform(1.4, 2.4))
     psf = _gaussian_psf(psf_size, psf_sigma)
     truth = np.zeros((size, size))
@@ -98,6 +107,10 @@ def synthetic_patch(
 
     image = _convolve(truth, psf)
     variance = sky_noise**2 + np.maximum(image, 0.0)  # sky + shot noise
+    if dark_halo_sigma:
+        yy, xx = np.mgrid[0:size, 0:size].astype(np.float64)
+        rr = ((xx - cx) ** 2 + (yy - cy) ** 2) / (size / 2.0) ** 2
+        image = image - dark_halo_sigma * sky_noise * np.exp(-rr)
     image = image + rng.normal(0.0, np.sqrt(variance))
     mask = np.zeros((size, size), dtype=np.uint32)
     mask[image > 5 * sky_noise] |= 1 << MASK_PLANES["DETECTED"]
@@ -118,6 +131,7 @@ def write_synthetic_shards(
     psf_size: int = 25,
     patches_per_shard: int = 128,
     sky_noise_by_band: dict[str, float] | None = None,
+    dark_halo_sigma: float = 0.0,
     seed: int = 0,
 ) -> list[Path]:
     """Write shards that look like the real thing to the loader."""
@@ -140,7 +154,8 @@ def write_synthetic_shards(
             band_idx = int(rng.integers(len(BANDS)))
             band = BANDS[band_idx]
             p = synthetic_patch(
-                rng, size=native_size, psf_size=psf_size, sky_noise=noise[band]
+                rng, size=native_size, psf_size=psf_size, sky_noise=noise[band],
+                dark_halo_sigma=dark_halo_sigma,
             )
             w.add(
                 p["image"],

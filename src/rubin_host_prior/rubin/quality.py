@@ -180,7 +180,7 @@ def gate(
     zero_tol: tuple[str, ...] = ZERO_TOL,
     frac_tol: dict[str, float] | None = None,
     inner_frac_tol: dict[str, float] | None = None,
-    max_depression: float = 0.3,
+    max_depression: float | None = None,
 ) -> tuple[list[str], dict[str, float]]:
     """Return ``(rejection_reasons, diagnostics)``.  Empty reasons means accept.
 
@@ -235,12 +235,23 @@ def gate(
     if np.isfinite(sky_noise) and sky_noise > 0 and np.all(np.isfinite(image)):
         bg = background_floor(image, sky_noise, mask, plane_dict)
         diag.update(bg)
-        # One-sided on purpose.  A depressed sky floor is over-subtraction; a
-        # raised one is starlight.  Gating on the magnitude would discard the
-        # brightest hosts, which is the opposite of what is wanted.  If the
-        # floor could not be measured (NaN) the patch is not rejected on this
-        # test -- the diagnostic is still recorded.
-        if np.isfinite(bg["min_block"]) and bg["min_block"] < -max_depression:
+        # ``max_depression=None`` (the default) measures the sky floor and
+        # records it without rejecting anything: the data is taken as-is,
+        # background-subtraction artefacts included, and the prior is allowed to
+        # learn them.  That is the right default when the artefacts are a
+        # property of the current processing that a later data release will
+        # improve -- you retrain rather than filter.
+        #
+        # Set a number to reject on it.  One-sided on purpose: a depressed sky
+        # floor is over-subtraction, a raised one is starlight, and gating on
+        # the magnitude would discard the brightest hosts.  Note that keeping
+        # depressed regions raises the ``k_sigma`` the log transform needs --
+        # see ``PatchDataset.flux_headroom``.
+        if (
+            max_depression is not None
+            and np.isfinite(bg["min_block"])
+            and bg["min_block"] < -max_depression
+        ):
             reasons.append(
                 f"background_depression:{bg['min_block']:.2f}<-{max_depression}"
             )

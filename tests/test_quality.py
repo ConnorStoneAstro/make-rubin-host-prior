@@ -106,25 +106,54 @@ def test_real_scenes_are_accepted(label, extra):
     assert reasons == [], f"{label} was rejected: {reasons}"
 
 
-@pytest.mark.parametrize(
-    "label,extra",
-    [
-        ("dark halo, 6 sigma bowl", -6 * SKY * (1 - R2)),
-        ("dark halo, 1 sigma bowl", -1.0 * SKY * (1 - R2)),
-        ("dark edge gradient", -3 * SKY * (_X / SIZE)),
-        ("uniform over-subtraction", -1.0 * SKY),
-    ],
-)
-def test_over_subtraction_is_rejected(label, extra):
-    """These have no mask plane in DP1 at all and must be caught from the pixels.
+OVER_SUBTRACTION = [
+    ("dark halo, 6 sigma bowl", -6 * SKY * (1 - R2)),
+    ("dark halo, 1 sigma bowl", -1.0 * SKY * (1 - R2)),
+    ("dark edge gradient", -3 * SKY * (_X / SIZE)),
+    ("uniform over-subtraction", -1.0 * SKY),
+]
 
-    They deposit a smooth negative bowl into the low-surface-brightness regime,
-    so a prior trained on them learns that galaxies sit in negative bowls.
+
+@pytest.mark.parametrize("label,extra", OVER_SUBTRACTION)
+def test_over_subtraction_is_measured_but_kept_by_default(label, extra):
+    """Default is to take the data as-is.
+
+    These artefacts have no mask plane in DP1 at all, and they matter: a smooth
+    negative bowl sits in exactly the low-surface-brightness regime this project
+    models. But they are a property of the current processing that a later data
+    release will improve, so the default records them and lets the prior learn
+    them rather than filtering them out. The diagnostic is still written for
+    every patch, so the decision can be revisited from the manifest without
+    re-reading pixels.
     """
-    reasons, _ = _gate(_scene(extra))
+    reasons, diag = _gate(_scene(extra))
+    assert reasons == [], f"{label} should be kept by default; got {reasons}"
+    assert diag["min_block"] < -0.3, f"{label} should still be measured as depressed"
+
+
+@pytest.mark.parametrize("label,extra", OVER_SUBTRACTION)
+def test_over_subtraction_is_rejected_when_asked(label, extra):
+    reasons, _ = _gate(_scene(extra), max_depression=0.3)
     assert any("background_depression" in r for r in reasons), (
-        f"{label} was accepted; reasons={reasons}"
+        f"{label} was accepted with max_depression=0.3; reasons={reasons}"
     )
+
+
+def test_keeping_over_subtraction_is_what_forces_a_larger_k_sigma():
+    """The two decisions are coupled.
+
+    Pooling divides the noise by pool_factor but leaves a smooth offset
+    untouched, so a depressed region is pool_factor times deeper relative to the
+    noise after pooling -- and the log transform can only represent flux above
+    -k_sigma * sigma_pooled. Keeping these patches therefore raises the k_sigma
+    the transform needs.
+    """
+    _, diag = _gate(_scene(-1.0 * SKY * (1 - R2)))
+    depth_native = abs(diag["min_block"])
+    depth_pooled = 3 * depth_native  # pool_factor = 3
+    assert depth_pooled > 2.0
+    # the clip sits at -0.9 * k_sigma, so this depth needs:
+    assert depth_pooled / 0.9 > 3.0
 
 
 def test_blank_sky_noise_floor_leaves_headroom():
