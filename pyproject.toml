@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=64", "setuptools_scm>=8"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "rubin-host-prior"
+version = "0.1.0"
+description = "Fully convolutional energy-based diffusion prior on Rubin host-galaxy scenes"
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.10"
+dependencies = [
+    "jax>=0.4.30",
+    "equinox>=0.11",
+    "optax>=0.2",
+    "numpy>=1.24",
+    "h5py>=3.8",
+]
+
+[project.optional-dependencies]
+# The extraction side needs the LSST stack, which is not pip-installable.
+# On NERSC these come from the stack environment; listed here for documentation only.
+extract = ["pandas", "pyarrow", "astropy"]
+dev = ["pytest", "matplotlib"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+filterwarnings = ["ignore::DeprecationWarning"]

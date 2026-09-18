@@ -1,0 +1,182 @@
+"""Minimal training loop for the energy-based score model.
+
+Deliberately small: one jitted step, an EMA copy, JSONL logging, periodic
+checkpoints.  Nothing clever, so that a tweak to the loss or the schedule is a
+three-line change rather than an archaeology exercise.
+
+One cost worth knowing about: the score is already a gradient of the network, so
+the loss gradient is a second derivative.  Every step is a
+gradient-of-a-gradient, roughly 2-3x the cost of a conventional score network of
+the same size.  That is the price of an exactly conservative score.
+"""
+
+from __future__ import annotations
+
+import json
+import time
+from pathlib import Path
+from typing import Callable, Iterator
+
+import equinox as eqx
+import jax
+import jax.numpy as jnp
+import numpy as np
+import optax
+
+from ..config import Config, TrainConfig
+from ..diffusion.loss import dsm_loss, dsm_loss_by_sigma
+from ..diffusion.sde import VESDE
+from ..nn.energy import ConvEnergyNet, n_parameters
+from .checkpoint import save_checkpoint
+from .ema import ema_decay_at, ema_update
+
+
+def make_optimizer(cfg: TrainConfig) -> optax.GradientTransformation:
+    if cfg.cosine_decay:
+        schedule = optax.warmup_cosine_decay_schedule(
+            init_value=0.0,
+            peak_value=cfg.learning_rate,
+            warmup_steps=max(cfg.warmup_steps, 1),
+            decay_steps=cfg.steps,
+            end_value=cfg.learning_rate * 0.05,
+        )
+    else:
+        schedule = optax.linear_schedule(
+            init_value=0.0,
+            end_value=cfg.learning_rate,
+            transition_steps=max(cfg.warmup_steps, 1),
+        )
+    chain = []
+    if cfg.grad_clip > 0:
+        chain.append(optax.clip_by_global_norm(cfg.grad_clip))
+    chain.append(optax.adamw(schedule, weight_decay=cfg.weight_decay))
+    return optax.chain(*chain)
+
+
+def train(
+    model: ConvEnergyNet,
+    batches: Iterator[np.ndarray],
+    config: Config,
+    out_dir: str | Path,
+    sde: VESDE | None = None,
+    eval_batch: np.ndarray | None = None,
+    eval_every: int = 0,
+    on_log: Callable[[dict], None] | None = None,
+) -> tuple[ConvEnergyNet, ConvEnergyNet]:
+    """Train and return ``(model, ema_model)``.
+
+    ``batches`` is any iterator of ``(B, C, H, W)`` arrays already in the log-space
+    training representation.  ``H`` must exceed ``4R`` or the loss has no interior
+    (see ``geometry``); this is checked once, up front, rather than producing a
+    confusing error 10 000 steps in.
+    """
+    sde = sde or VESDE.from_config(config.sde)
+    cfg = config.train
+    out = Path(out_dir)
+    out.mkdir(parents=True, exist_ok=True)
+    config.save(out / "config.json")
+
+    margin = model.loss_margin
+    optimizer = make_optimizer(cfg)
+    params = eqx.filter(model, eqx.is_inexact_array)
+    opt_state = optimizer.init(params)
+    ema_model = model
+
+    @eqx.filter_jit
+    def step_fn(model, ema_model, opt_state, batch, key, decay):
+        loss, grads = eqx.filter_value_and_grad(dsm_loss)(
+            model, batch, key, sde, margin
+        )
+        updates, opt_state = optimizer.update(
+            grads, opt_state, eqx.filter(model, eqx.is_inexact_array)
+        )
+        model = eqx.apply_updates(model, updates)
+        ema_model = ema_update(ema_model, model, decay)
+        return model, ema_model, opt_state, loss
+
+    @eqx.filter_jit
+    def eval_fn(model, batch, key, sigmas):
+        # One fixed sigma per example, spanning the schedule: a loss curve
+        # against sigma shows *where* the model is underfit, which the scalar
+        # training loss hides entirely.
+        return dsm_loss_by_sigma(model, batch, sigmas, key, sde, margin)
+
+    key = jax.random.key(cfg.seed)
+    log_path = out / "log.jsonl"
+    running = None
+    t0 = time.time()
+
+    with log_path.open("a") as log_file:
+        header = {
+            "event": "start",
+            "n_parameters": n_parameters(model),
+            "loss_margin": margin,
+            "sigma_min": sde.sigma_min,
+            "sigma_max": sde.sigma_max,
+        }
+        log_file.write(json.dumps(header) + "\n")
+        log_file.flush()
+
+        for step in range(1, cfg.steps + 1):
+            batch = jnp.asarray(next(batches))
+            if step == 1:
+                _check_batch(batch, model)
+            key, k_step = jax.random.split(key)
+            decay = ema_decay_at(step - 1, cfg.ema_decay)
+            model, ema_model, opt_state, loss = step_fn(
+                model, ema_model, opt_state, batch, k_step, decay
+            )
+
+            loss = float(loss)
+            running = loss if running is None else 0.98 * running + 0.02 * loss
+            if step % cfg.log_every == 0 or step == 1:
+                record = {
+                    "step": step,
+                    "loss": loss,
+                    "loss_ema": running,
+                    "seconds": time.time() - t0,
+                }
+                log_file.write(json.dumps(record) + "\n")
+                log_file.flush()
+                if on_log is not None:
+                    on_log(record)
+
+            if eval_every and eval_batch is not None and step % eval_every == 0:
+                key, k_eval = jax.random.split(key)
+                n = eval_batch.shape[0]
+                sigmas = sde.sigma(jnp.linspace(0.0, 1.0, n))
+                per = eval_fn(ema_model, jnp.asarray(eval_batch), k_eval, sigmas)
+                record = {
+                    "step": step,
+                    "event": "eval",
+                    "sigma": [float(s) for s in sigmas],
+                    "loss_by_sigma": [float(v) for v in per],
+                }
+                log_file.write(json.dumps(record) + "\n")
+                log_file.flush()
+                if on_log is not None:
+                    on_log(record)
+
+            if cfg.ckpt_every and step % cfg.ckpt_every == 0:
+                save_checkpoint(out / "latest", step, config, model, ema_model, opt_state)
+
+    save_checkpoint(out / "final", cfg.steps, config, model, ema_model, opt_state)
+    return model, ema_model
+
+
+def _check_batch(batch: jnp.ndarray, model: ConvEnergyNet) -> None:
+    if batch.ndim != 4:
+        raise ValueError(f"expected (B, C, H, W) batches, got shape {batch.shape}")
+    if batch.shape[1] != model.config.in_channels:
+        raise ValueError(
+            f"batch has {batch.shape[1]} channels, model expects "
+            f"{model.config.in_channels}"
+        )
+    h, w = batch.shape[-2:]
+    need = 2 * model.loss_margin + 1
+    if min(h, w) < need:
+        raise ValueError(
+            f"patches are {h}x{w} but a model with {model.n_layers} layers needs "
+            f"at least {need} pixels per side to leave any interior for the loss; "
+            f"use larger patches or fewer layers"
+        )
