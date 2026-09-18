@@ -42,9 +42,8 @@ def cache_key(config: Config, transform: LogFluxTransform, shards: ShardSet) -> 
     payload = {
         "patch": asdict(config.patch),
         "transform": {
-            "offsets": list(transform.offsets),
+            "softening": list(transform.softening),
             "log_scale": transform.log_scale,
-            "floor_ratio": transform.floor_ratio,
             "bands": list(transform.bands),
         },
         "shards": [p.name for p in shards.paths],
@@ -284,51 +283,6 @@ class PatchDataset:
 
     # -- diagnostics ------------------------------------------------------
 
-    def flux_headroom(self, n: int = 512, seed: int = 0) -> dict:
-        """How far negative the pooled flux goes, in units of pooled sky noise.
-
-        This is what sets ``k_sigma``.  The transform's offset
-        ``b_band = k_sigma * sigma_pooled`` is a hard bound on representable
-        flux -- the model spans ``(-b_band, +inf)`` and nothing below -- and the
-        clip at ``floor_ratio`` bites at ``-0.9 * k_sigma`` sigma.  So
-        ``k_sigma`` must exceed the deepest negative excursion you intend to
-        keep, and if you are keeping background-subtraction artefacts (dark
-        haloes, dark edges) rather than gating them out, that is deeper than the
-        noise alone would suggest.
-
-        Note the asymmetry that makes this bind: pooling divides the *noise* by
-        ``pool_factor`` but leaves a smooth negative offset untouched, so in
-        pooled-sigma units an over-subtracted region is ``pool_factor`` times
-        deeper than it was natively.
-        """
-        if self._pooled is not None:
-            raise ValueError(
-                "flux_headroom needs native stamps; the pooled cache stores the "
-                "already-transformed, already-clipped representation. Build the "
-                "dataset from shards instead."
-            )
-        rng = np.random.default_rng(seed)
-        idx = np.sort(rng.choice(len(self), size=min(n, len(self)), replace=False))
-        flux = self._pool(idx, rng=None, translate=False, scale_jitter=0.0)
-        sigma_pooled = (
-            np.asarray(self.shards.meta["sky_noise"])[idx] / self.config.patch.pool_factor
-        )
-        good = np.isfinite(sigma_pooled) & (sigma_pooled > 0)
-        if not np.any(good):
-            return {"n": 0}
-        worst = flux[good].min(axis=(1, 2)) / sigma_pooled[good]
-        pcts = {str(q): float(np.percentile(worst, q)) for q in (0.1, 1, 5, 50)}
-        # The clip sits at -0.9 * k_sigma, so covering a depth D needs
-        # k_sigma > D / 0.9.
-        needed = float(abs(np.percentile(worst, 0.1)) / 0.9)
-        return {
-            "n": int(good.sum()),
-            "min_flux_sigma_percentiles": pcts,
-            "deepest": float(worst.min()),
-            "k_sigma_current": float(self.config.transform.k_sigma),
-            "k_sigma_needed": needed,
-        }
-
     def correlation_length(self, n: int = 512, seed: int = 0) -> dict:
         """Structural correlation length of the training representation, in
         *pooled* pixels -- the units the loss crop is measured in.
@@ -348,6 +302,18 @@ class PatchDataset:
         idx = np.sort(rng.choice(len(self), size=min(n, len(self)), replace=False))
         x = self.make_batch(idx, rng=rng, augment=False)[:, 0]
         p16, p84 = np.percentile(x, [16, 84])
+        deepest_sigma = np.nan
+        if self._pooled is None:
+            flux = self._pool(idx, rng=None, translate=False, scale_jitter=0.0)
+            sigma_pooled = (
+                np.asarray(self.shards.meta["sky_noise"])[idx]
+                / self.config.patch.pool_factor
+            )
+            good = np.isfinite(sigma_pooled) & (sigma_pooled > 0)
+            if np.any(good):
+                deepest_sigma = float(
+                    (flux[good].min(axis=(1, 2)) / sigma_pooled[good]).min()
+                )
         return {
             "n": int(len(idx)),
             "mean": float(x.mean()),
@@ -359,8 +325,9 @@ class PatchDataset:
             "min": float(x.min()),
             "max": float(x.max()),
             # Most pixels in a patch are sky, so the 16-84 half-width measures
-            # the sky scatter in log space.  It should come out near
-            # 1 / k_sigma; if it does not, the band offsets are wrong.
+            # the sky scatter in log space.  Compare against
+            # transform.expected_sky_scatter(softening_sigma); a large
+            # disagreement means the per-band softening scales are wrong.
             "sky_scatter": float(0.5 * (p84 - p16)),
             # Per-patch spread is what sigma_max has to cover: the reverse
             # process starts from N(0, sigma_max^2) and must be able to reach
@@ -368,13 +335,17 @@ class PatchDataset:
             "per_patch_range_p99": float(
                 np.percentile(x.max(axis=(1, 2)) - x.min(axis=(1, 2)), 99)
             ),
-            # Measured on x, not on the inverted flux: expm1(log1p(.)) is only
-            # accurate to ~1e-8, so a comparison against floor_ratio downstream
-            # of the round trip misses the pixels that were actually clipped.
-            "clipped_fraction": float(
-                np.mean(x <= self.transform.x_floor + 1e-6)
+            # Skew of the log-space values.  The softening is nonlinear across
+            # the noise range, so sky pixels are left-skewed; that is expected,
+            # not a fault, and it grows as softening_sigma falls.
+            "skew": float(
+                np.mean(((x - x.mean()) / max(x.std(), 1e-12)) ** 3)
             ),
-            "x_floor": self.transform.x_floor,
+            # How far negative the measured flux goes, in pooled sky noise.
+            # Informational only: softplus has no floor, so however deep this
+            # goes the pixel is representable.
+            "deepest_flux_sigma": deepest_sigma,
+            "sky_level": self.transform.sky_level,
         }
 
 
@@ -383,9 +354,9 @@ def suggest_sigma_range(stats: dict, sky_scatter_hint: float | None = None) -> t
 
     ``sigma_max`` must dominate the data's own scale or the ``t = 1`` marginal is
     not really Gaussian and sampling starts from the wrong distribution.
-    ``sigma_min`` should sit comfortably below the sky scatter in log space
-    (``~ 1 / k_sigma``), since below that the score is dominated by the noise the
-    data already contains and there is nothing left to learn.
+    ``sigma_min`` should sit comfortably below the sky scatter in log space,
+    since below that the score is dominated by the noise the data already
+    contains and there is nothing left to learn.
     """
     sigma_max = float(max(2.0 * stats["std"], stats["per_patch_range_p99"]))
     floor = sky_scatter_hint

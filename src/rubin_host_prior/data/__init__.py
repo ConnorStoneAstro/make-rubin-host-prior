@@ -3,7 +3,8 @@ from .dataset import PatchDataset, cache_key, suggest_sigma_range
 from .diagnostics import autocorrelation, context_advice, correlation_length
 from .pooling import area_resample, block_mean, center_crop, pool_to_training_grid
 from .shards import META_DTYPES, ShardSet, ShardWriter
-from .transform import LogFluxTransform, estimate_band_offsets
+from .transform import (LogFluxTransform, estimate_band_softening,
+                        expected_sky_scatter, log_softplus)
 
 __all__ = [
     "META_DTYPES",
@@ -20,7 +21,9 @@ __all__ = [
     "context_advice",
     "correlation_length",
     "dihedral",
-    "estimate_band_offsets",
+    "log_softplus",
+    "estimate_band_softening",
+    "expected_sky_scatter",
     "pool_to_training_grid",
     "random_dihedral",
     "suggest_sigma_range",

@@ -25,7 +25,8 @@ from rubin_host_prior.data import (
     LogFluxTransform,
     PatchDataset,
     ShardSet,
-    estimate_band_offsets,
+    estimate_band_softening,
+    expected_sky_scatter,
     context_advice,
     suggest_sigma_range,
 )
@@ -77,16 +78,18 @@ def main() -> None:
     config.train.batch_size = args.batch_size
     config.train.log_every = max(args.steps // 10, 1)
     config.train.ckpt_every = 0
-    config.transform.band_offsets = estimate_band_offsets(
-        shards.load("variance"), shards.meta["band_idx"], 3, config.transform.k_sigma
+    config.transform.band_softening = estimate_band_softening(
+        shards.load("variance"), shards.meta["band_idx"], 3,
+        config.transform.softening_sigma,
     )
     transform = LogFluxTransform.from_config(config.transform)
     dataset = PatchDataset.from_shards(shards, config, transform)
     stats = dataset.stats(128)
     config.sde.sigma_min, config.sde.sigma_max = suggest_sigma_range(stats)
-    print(f"[2] offsets {({k: round(v, 1) for k, v in config.transform.band_offsets.items()})}")
-    print(f"    sky_scatter {stats['sky_scatter']:.3f} (expect "
-          f"~{1 / config.transform.k_sigma:.2f}), clipped {stats['clipped_fraction']:.2e}")
+    print(f"[2] softening {({k: round(v, 1) for k, v in config.transform.band_softening.items()})}")
+    print(f"    sky_scatter {stats['sky_scatter']:.3f} (expect ~"
+          f"{expected_sky_scatter(config.transform.softening_sigma):.2f}), "
+          f"deepest {stats['deepest_flux_sigma']:.1f} sigma")
     print(f"    sigma range [{config.sde.sigma_min:.4f}, {config.sde.sigma_max:.2f}]")
     cl = dataset.correlation_length(128)
     print(f"    {context_advice(cl['xi'], 2 * args.n_layers)}"

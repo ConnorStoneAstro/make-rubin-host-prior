@@ -67,10 +67,11 @@ def synthetic_patch(
 
     ``dark_halo_sigma`` adds a smooth negative bowl of that depth, in units of
     the *native* sky noise, imitating DP1 background over-subtraction around a
-    bright source.  Worth exercising because it is the regime that sets
-    ``k_sigma``: a smooth offset does not average down under pooling while the
-    noise does, so a bowl ``D`` sigma deep natively is ``D * pool_factor`` sigma
-    deep in the pooled data the model sees.
+    bright source.  Worth exercising because it is the deep-negative regime: a
+    smooth offset does not average down under pooling while the noise does, so a
+    bowl ``D`` sigma deep natively is ``D * pool_factor`` sigma deep in the
+    pooled data.  The softplus transform carries it through without a floor,
+    mapping it to a correspondingly negative ``x``.
     """
     psf_sigma = psf_sigma if psf_sigma is not None else float(rng.uniform(1.4, 2.4))
     psf = _gaussian_psf(psf_size, psf_sigma)

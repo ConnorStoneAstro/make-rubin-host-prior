@@ -244,9 +244,9 @@ def gate(
         #
         # Set a number to reject on it.  One-sided on purpose: a depressed sky
         # floor is over-subtraction, a raised one is starlight, and gating on
-        # the magnitude would discard the brightest hosts.  Note that keeping
-        # depressed regions raises the ``k_sigma`` the log transform needs --
-        # see ``PatchDataset.flux_headroom``.
+        # the magnitude would discard the brightest hosts.  Keeping depressed
+        # regions costs nothing in the log transform: softplus softening has
+        # no floor, so however negative a pixel goes it stays representable.
         if (
             max_depression is not None
             and np.isfinite(bg["min_block"])

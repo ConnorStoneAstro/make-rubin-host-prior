@@ -69,10 +69,12 @@ The per-band offsets and the σ range are not free hyperparameters; they follow
 from the noise level and dynamic range. This measures them and prints two checks
 worth reading:
 
-- `sky_scatter` should come out near `1 / k_sigma` (0.2 by default). If not, the
-  offsets are wrong and the bands are not on a common footing.
-- `clipped_fraction` should be ~1e-5 or below. Larger means `k_sigma` is too
-  small, or the shards still contain over-subtraction the gate missed.
+- `sky_scatter` should match `expected_sky_scatter(softening_sigma)`
+  (= `0.721 / softening_sigma`). If not, the per-band softening scales are wrong
+  and the bands are not on a common footing.
+- the sky pedestal (`0.693 × softening_sigma`, in σ) should stay under 1, and the
+  flux above which the exponential model map is accurate should sit below
+  anything you care about photometrically.
 
 It also reports the **correlation length** of the pooled log-space patches and
 compares it to the model's `2R` crop — this is the authoritative measurement, and
@@ -288,70 +290,56 @@ decades of score magnitude. Set `sigma_scaling="none"` for the unmodified energy
 ### The log-space transform
 
 ```
-forward:   x = log1p( max(f / b_band, r) ) / c   =   log( 1 + max(f/b_band, r) ) / c
-inverse:   f = b_band · expm1( c · x )           =   b_band · ( e^{c·x} − 1 )
+forward (data):   x = log( softplus(f / s_band) ) / c       softplus(u) = log(1 + e^u)
+model map:        f = s_band · exp(c · x)                   strictly positive
 ```
 
-with `r = floor_ratio = −0.9` and `c = log_scale = 1`. `b_band = k_sigma ×
-σ_pooled` is a per-band offset in nJy.
+`s_band = softening_sigma × σ_pooled` is a per-band *softening* scale in nJy.
 
-**The `+1` inside `log1p` is the boost**, and it is what carries negative pixels
-through the logarithm. DP1 images are background-subtracted, so roughly half of
-all sky pixels are negative; dividing by `b_band` rescales them but leaves them
-negative. Adding `b_band` is what makes the argument positive. In flux units the
-transform is `log((f + b)/b)`.
+**These two are deliberately not inverses, and that is the point.** A source
+cannot emit negative flux, so the prior's reachable domain in flux space must be
+strictly positive — hence the plain exponential, which maps all of ℝ to `(0, ∞)`.
+Measured flux, by contrast, *is* negative wherever noise dips below the
+subtracted sky, and the right thing to do with those pixels is carry them
+smoothly toward zero rather than represent them faithfully.
 
-Three properties follow:
+`s·exp(c·forward(f))` equals `softplus_s(f)` exactly, so the entire discrepancy
+between the data and what the model can express is the softening and nothing
+else. Three consequences:
 
-- **No hard floor in the ordinary regime, and no point mass.**
-  `log(max(f, floor))` would pile 40–50% of every patch onto one value;
-  `log1p(f/b)` is smooth and strictly monotonic through zero instead.
-- **Band-agnostic.** Dividing by `b_band` puts every band's sky level at `x ≈ 0`
-  with scatter `≈ 1/k_sigma`, so u-band and y-band patches land in the same
-  place and one prior covers all six. There is no band label anywhere in the
-  model. `PatchDataset.stats()["sky_scatter"]` should come out near `1/k_sigma`;
-  if it does not, the offsets are wrong.
-- **Linear where it matters, logarithmic where it must be.** Near the noise floor
-  `x ≈ f/(b·c)`, a pure rescaling, so additive Gaussian pixel noise stays
-  additive and Gaussian. In the bright regime it is logarithmic, which tames the
-  ~10⁴ dynamic range of a galaxy core.
+- **Bright flux passes through untouched.** `softplus(u) → u` exponentially
+  fast: within 1.6% at `f = 3s`, 0.1% at `5s`, exact in double precision by
+  `10s`. Anything detected is represented far inside its own photometric error.
+- **Negative flux vanishes smoothly.** `softplus(u) → e^u`, so `x → f/s`: the
+  negative tail is *linear* in flux, which keeps Gaussian pixel noise Gaussian
+  instead of compressing it. (A `√(f²+4s²)` style softening fails here — it goes
+  as `−log|f|` and distorts the noise.)
+- **There is no floor anywhere.** `softplus` is strictly positive on all of ℝ, so
+  no clipping, no point mass, no NaN, and **no bound on how negative an input
+  pixel may be**. Background over-subtraction of any depth is representable.
 
-#### `k_sigma` is a modelling choice, not a numerical guard
+The cost is a pedestal: the model's sky sits at `softplus(0)·s = 0.693·s` rather
+than zero. That is why `softening_sigma` defaults to **1.0** — it keeps the
+pedestal at 0.69σ, below the noise it replaces, while making the exponential map
+accurate to 0.1% above 5σ. Raising it buys a tighter, less skewed noise
+distribution in `x` at the price of a pedestal climbing above the noise and a
+proportionately higher flux threshold for accuracy.
 
-`inverse` is `b·expm1(c·x)` and `expm1 → −1`, so the model can represent flux in
-**`(−b_band, +∞)` and nothing below**. `k_sigma` is therefore a hard bound on how
-negative a pixel the prior can express. The clip at `floor_ratio` bites slightly
-earlier, at `−0.9·k_sigma` σ.
+An **ELU-style softening was considered and rejected**: `ELU(u) + 1` leaves a
+permanent `+s` offset on positive flux — still 3.3% high at `f = 30s` — whereas
+softplus converges to the identity exponentially.
 
-This binds harder than it looks, because **pooling does not treat noise and
-smooth offsets alike**: 3×3 averaging divides the *noise* by 3, while a smooth
-background offset does not average down at all. An over-subtracted region `D`
-sigma deep natively is `3D` sigma deep in the pooled data the model sees.
+`inverse_exact` undoes `forward` exactly (to ~10⁻¹⁵), including negative flux,
+for round-trip checks. `inverse` is what a forward model calls.
 
-Fraction of pixels driven onto the floor, by halo depth and `k_sigma`:
+A forward model in log space needs no Jacobian: generate the scene in `x`, map to
+flux with `inverse`, compare to the data. `jacobian` is simply `c·f` if you ever
+want a density in flux units.
 
-| dark halo depth | pooled depth | `k=5` | `k=10` | `k=15` |
-|---|---|---|---|---|
-| 0 (clean sky) | 0σ | 3×10⁻⁶ | ~0 | ~0 |
-| 1.0σ native | 3σ | **6.7×10⁻²** | 1×10⁻⁹ | ~0 |
-| 2.0σ native | 6σ | **0.93** | 1×10⁻³ | ~0 |
-| 3.0σ native | 9σ | **1.0** | 0.50 | 3×10⁻⁶ |
-
-Measured end to end on synthetic shards carrying a 1.5σ halo: `k_sigma=5` clips
-8.4% of pixels and inflates `sky_scatter` from 0.2 to 0.65; `k_sigma=10` clips
-none. **The default is therefore `k_sigma = 10`**, and raising it costs almost
-nothing — the dynamic range of the representation barely changes, since that is
-set by the physical S/N rather than by `k`.
-
-`PatchDataset.flux_headroom()` measures what your data actually needs — the
-distribution of the most-negative pooled pixel in units of pooled sky noise, and
-the implied minimum `k_sigma`. `prepare_config.py` prints it and warns if
-`k_sigma` is too small. **Run it before training**, especially if you are keeping
-background-subtraction artefacts rather than gating them out.
-
-A forward model in log space needs no Jacobian: generate the model scene in `x`,
-map to flux with `transform.inverse`, and compare to the data.
-`transform.jacobian` exists if you ever want a density in flux units.
+Check `stats()["sky_scatter"]` against `expected_sky_scatter(softening_sigma)`
+(= `0.721 / (softening_sigma · c)`); a large disagreement means the per-band
+softening scales are wrong, which would put the bands on different footings and
+break the single band-agnostic prior. `prepare_config.py` does this for you.
 
 ### Pooling in flux, then log — not the other way round
 
@@ -418,9 +406,9 @@ matter:
 is taken as-is, background-subtraction artefacts included, and the prior is
 allowed to learn them — the right call when the artefacts are a property of the
 current processing that a later release will improve, since you retrain rather
-than filter. Pass `--max-depression 0.3` to reject instead. Note the interaction:
-keeping depressed regions is exactly what forces a larger `k_sigma`, because
-those pixels have to remain representable.
+than filter. Pass `--max-depression 0.3` to reject instead. Keeping them costs
+nothing in the transform: softplus softening has no floor, so however deep a
+region goes it stays representable.
 
 Tested against bright galaxies, faint galaxies, edge galaxies, galaxies filling
 the whole stamp (all accepted) and 6σ bowls, 1σ bowls, gradients and uniform
@@ -473,7 +461,7 @@ and these specific items are flagged `WARN` in `rubin/extract.py`:
 
 - **Visit images vs coadds.** `--dataset-type` accepts both. Visit images are
   closest to the data you will eventually analyse and, being unwarped, have
-  near-independent pixel noise — which matters, since `estimate_band_offsets`
+  near-independent pixel noise — which matters, since `estimate_band_softening`
   assumes pooling divides the noise by `pool_factor`. On a coadd, warping
   correlates neighbouring pixels and pooling reduces noise by less, so that
   estimate would be optimistic. The cosmic-ray question is empirical: extract a

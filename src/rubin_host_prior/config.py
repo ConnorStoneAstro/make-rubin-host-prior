@@ -48,38 +48,25 @@ class SDEConfig:
 
 @dataclass
 class TransformConfig:
-    """Flux -> log-space pixel transform.
+    """Flux -> log-space transform.
 
-        x = log1p(f / b_band) / c          f = b_band * expm1(c * x)
+        x = log(softplus(f / s_band)) / c        f = s_band * exp(c * x)
 
-    ``b_band`` is a per-band offset in nJy, ``k_sigma`` times the pooled sky
-    noise of that band.  It does two jobs.
+    The model map is a plain exponential, so the prior's reachable domain in
+    flux space is strictly positive -- a source cannot emit negative flux.  The
+    data transform is therefore deliberately not its exact inverse: measured
+    flux goes negative wherever noise takes it below the subtracted sky, and
+    those pixels are smoothly carried towards zero instead.
 
-    The ``+1`` inside ``log1p`` *is* ``+b_band`` in flux units -- that is the
-    boost that carries the roughly half of all sky pixels that are negative
-    (DP1 images are background-subtracted) through the logarithm.  Dividing by
-    ``b_band`` alone would not: it rescales negatives but leaves them negative.
-
-    It is also a **hard bound on representable flux**.  ``inverse`` is
-    ``b * expm1(c * x)``, and ``expm1 -> -1`` as ``x -> -inf``, so the model can
-    express flux in ``(-b_band, +inf)`` and nothing below.  ``k_sigma`` must
-    therefore exceed the deepest negative excursion you intend to keep.
-
-    That bound is tighter than it looks, because pooling does not treat noise
-    and smooth offsets alike: ``pool_factor**2`` averaging divides the *noise* by
-    ``pool_factor``, while a smooth background offset does not average down at
-    all.  An over-subtracted region ``D`` sigma deep natively is ``D *
-    pool_factor`` sigma deep once pooled.  With ``pool_factor = 3``, a 1-sigma
-    dark halo is 3 sigma after pooling, which at ``k_sigma = 5`` would drive 6.7%
-    of its pixels onto the floor.  Hence the default of 10.
-
-    Use ``PatchDataset.flux_headroom()`` to measure what the real data needs.
+    ``s_band = softening_sigma * pooled sky noise`` sets where the softening
+    turns over.  See ``data.transform`` for the full rationale; in brief, 1.0
+    keeps the sky pedestal (``0.693 * s``) below the noise it replaces while
+    making ``inverse`` accurate to 0.1% above 5 sigma.
     """
 
-    band_offsets: dict[str, float] = field(default_factory=dict)  # nJy, per band
+    band_softening: dict[str, float] = field(default_factory=dict)  # nJy, per band
     log_scale: float = 1.0  # "c" above
-    k_sigma: float = 10.0  # b_band = k_sigma * pooled sky noise
-    floor_ratio: float = -0.9  # clip f / b_band at this; -0.9 -> x_min = log(0.1)/c
+    softening_sigma: float = 1.0  # s_band = softening_sigma * pooled sky noise
 
 
 @dataclass

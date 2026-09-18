@@ -12,7 +12,7 @@ from rubin_host_prior.data import (
     block_mean,
     cache_key,
     dihedral,
-    estimate_band_offsets,
+    estimate_band_softening,
     pool_to_training_grid,
     random_dihedral,
     suggest_sigma_range,
@@ -22,118 +22,183 @@ from rubin_host_prior.data.synthetic import write_synthetic_shards
 
 
 # -- transform -------------------------------------------------------------
+#
+#   forward:  x = log(softplus(f / s)) / c
+#   model:    f = s * exp(c * x)                  strictly positive
+#
+# The two are deliberately not inverses. A source cannot emit negative flux, so
+# the prior's reachable domain in flux space must be positive; measured flux is
+# negative wherever noise dips below the subtracted sky, and those pixels are
+# carried smoothly towards zero instead of being represented faithfully.
 
 
-def _transform(offsets=None, **kw):
-    offsets = offsets or {b: 20.0 for b in BANDS}
+def _transform(softening=None, **kw):
+    softening = softening or {b: 4.0 for b in BANDS}
     return LogFluxTransform.from_config(
-        TransformConfig(band_offsets=offsets, **kw)
+        TransformConfig(band_softening=softening, **kw)
     )
 
 
-def test_forward_inverse_round_trip():
+def test_model_map_is_exactly_the_softened_flux():
+    """``s*exp(c*forward(f)) == softplus_s(f)``, so the entire discrepancy
+    between data and model is the softening and nothing else."""
     t = _transform()
-    flux = np.array([[-15.0, 0.0, 1.0, 1e2, 1e4, 1e6]], dtype=np.float64)
-    band = np.array([2])
+    s = t.softening[0]
+    f = np.array([[-40.0, -4.0, 0.0, 4.0, 40.0, 4e5]])
+    u = f / s
+    softened = s * (np.maximum(u, 0.0) + np.log1p(np.exp(-np.abs(u))))
     np.testing.assert_allclose(
-        t.inverse(t.forward(flux, band), band), flux, rtol=1e-10, atol=1e-8
+        t.inverse(t.forward(f, np.array([0])), np.array([0])), softened, rtol=1e-10
     )
 
 
-def test_zero_flux_maps_to_zero():
-    """The offset makes x = 0 the (background-subtracted) sky level exactly."""
+def test_model_map_is_strictly_positive():
+    """The property the whole design exists for: a scene drawn from the prior
+    can never contain negative flux, however negative x wanders."""
     t = _transform()
-    assert t.forward(np.zeros((1, 3)), np.array([0]))[0, 0] == pytest.approx(0.0)
+    x = np.linspace(-500, 30, 2000)[None]
+    f = t.inverse(x, np.array([0]))
+    assert np.all(np.isfinite(f))
+    assert np.all(f >= 0.0)
+    assert np.all(f[x > -700] > 0.0)
 
 
-def test_transform_is_linear_in_the_noise_regime():
-    """Near the sky level the transform is a pure rescaling, so additive
-    Gaussian pixel noise stays additive and Gaussian.
-
-    ``log1p(u) = u - u^2/2 + ...``, so the departure from linearity is ~u/2 in
-    relative terms.  At 1 sky noise (u = 1/k_sigma = 0.2) that is already 10%,
-    which is why the sky scatter in log space is checked separately against
-    1/k_sigma rather than assumed exact.
-    """
+def test_exact_inverse_round_trips_including_negative_flux():
     t = _transform()
-    b = t.offsets[0]
-    for u, rtol in ((1e-3, 1e-3), (1e-2, 1e-2)):
-        small = np.array([[-u * b, 0.0, u * b]])
-        x = t.forward(small, np.array([0]))
-        np.testing.assert_allclose(x, small / (b * t.log_scale), rtol=rtol)
+    f = np.array([[-1e4, -200.0, -20.0, -4.0, -0.4, 0.0, 0.4, 4.0, 4e5, 4e9]])
+    back = t.inverse_exact(t.forward(f, np.array([0])), np.array([0]))
+    np.testing.assert_allclose(back, f, rtol=1e-12, atol=1e-12)
 
 
-def test_transform_is_logarithmic_in_the_bright_regime():
+def test_bright_flux_passes_through_untouched():
+    """``softplus(u) -> u`` exponentially, so anything detected is represented
+    far inside its own photometric error."""
     t = _transform()
-    b = t.offsets[0]
-    bright = np.array([[1e3 * b, 1e4 * b]])
-    x = t.forward(bright, np.array([0]))
-    assert x[0, 1] - x[0, 0] == pytest.approx(np.log(10.0), rel=1e-3)
+    s = t.softening[0]
+    for mult, tol in ((3.0, 0.02), (5.0, 0.002), (10.0, 1e-4), (50.0, 1e-12)):
+        f = np.array([[mult * s]])
+        recovered = t.inverse(t.forward(f, np.array([0])), np.array([0]))
+        assert abs(recovered.item() / f.item() - 1.0) < tol, mult
 
 
-def test_negative_pixels_are_not_a_point_mass():
-    """Half of all sky pixels are negative; log(max(f, floor)) would pile them
-    onto one value. log1p(f/b) must map them to distinct, finite values."""
+def test_accurate_above_solves_the_right_equation():
     t = _transform()
-    b = t.offsets[0]
-    neg = np.linspace(-0.8 * b, -0.01 * b, 50).reshape(1, -1)
-    x = t.forward(neg, np.array([0]))
+    for tol in (0.05, 0.01, 0.001):
+        u = t.accurate_above(tol)
+        assert np.log1p(np.exp(-u)) / u == pytest.approx(tol, rel=0.01)
+    assert t.accurate_above(0.01) == pytest.approx(3.37, rel=0.02)
+
+
+def test_negative_flux_vanishes_smoothly_with_no_floor():
+    """No clipping, no point mass, no bound: however deep a pixel goes it stays
+    representable. This is what lets background over-subtraction be kept."""
+    t = _transform()
+    s = t.softening[0]
+    f = -np.logspace(-2, 4, 400)[None] * s
+    x = t.forward(f, np.array([0]))
     assert np.all(np.isfinite(x))
-    assert np.all(np.diff(x[0]) > 0)
-    assert len(np.unique(x)) == x.size
+    assert len(np.unique(x)) == x.size  # strictly monotone, no pile-up
+    recovered = t.inverse(x, np.array([0]))
+    assert np.all(recovered >= 0)
+    assert np.all(np.diff(recovered[0][::-1]) >= 0)  # decreasing towards zero
 
 
-def test_floor_clips_only_extreme_negatives():
-    t = _transform(k_sigma=5.0)
-    b = t.offsets[0]
-    flux = np.array([[-0.5 * b, -0.9 * b, -5.0 * b]])
-    x = t.forward(flux, np.array([0]))
-    assert x[0, 0] > t.x_floor
-    assert x[0, 1] == pytest.approx(t.x_floor)
-    assert x[0, 2] == pytest.approx(t.x_floor)  # clipped, not NaN
-
-
-def test_clipped_fraction_is_reported():
+def test_x_is_linear_in_flux_for_deep_negatives():
+    """``softplus(u) -> e^u`` so ``x -> f/s``: the negative tail is linear, which
+    keeps Gaussian noise Gaussian rather than compressing it."""
     t = _transform()
-    flux = np.concatenate([np.zeros(99), [-10 * t.offsets[0]]]).reshape(1, -1)
-    _, frac = t.forward(flux, np.array([0]), return_clipped_fraction=True)
-    assert frac == pytest.approx(0.01)
+    s = t.softening[0]
+    f = np.array([[-10.0 * s, -20.0 * s, -30.0 * s]])
+    x = t.forward(f, np.array([0]))
+    np.testing.assert_allclose(x, f / s, rtol=1e-3)
 
 
-def test_per_band_offsets_put_all_bands_on_a_common_footing():
-    """The point of a per-band offset: the same flux-in-units-of-sky-noise maps
-    to the same x in every band, so one prior can cover all six."""
-    offsets = {"u": 47.0, "g": 18.0, "r": 20.0, "i": 27.0, "z": 40.0, "y": 67.0}
-    t = _transform(offsets)
+def test_sky_pedestal_is_log_two_times_the_softening():
+    """The price of strict positivity: zero measured flux maps to 0.693*s."""
+    t = _transform()
+    s = t.softening[0]
+    at_zero = t.inverse(t.forward(np.zeros((1, 1)), np.array([0])), np.array([0]))
+    assert at_zero.item() == pytest.approx(np.log(2.0) * s)
+    assert t.sky_pedestal == pytest.approx(np.log(2.0))
+    assert t.sky_level == pytest.approx(np.log(np.log(2.0)))
+
+
+def test_softening_puts_all_bands_on_a_common_footing():
+    """The same flux in units of that band's sky noise maps to the same x, which
+    is what makes one band-agnostic prior reasonable."""
+    soft = {"u": 9.3, "g": 3.7, "r": 4.0, "i": 5.3, "z": 8.0, "y": 13.3}
+    t = _transform(soft)
     xs = [
-        float(t.forward(np.array([[3.0 * offsets[b]]]), np.array([i]))[0, 0])
+        float(t.forward(np.array([[3.0 * soft[b]]]), np.array([i]))[0, 0])
         for i, b in enumerate(BANDS)
     ]
     assert np.allclose(xs, xs[0])
 
 
-def test_missing_band_offset_is_an_error():
-    with pytest.raises(ValueError, match="no offset for band"):
-        LogFluxTransform.from_config(TransformConfig(band_offsets={"r": 20.0}))
+def test_expected_sky_scatter_matches_a_simulation():
+    from rubin_host_prior.data import expected_sky_scatter
+
+    rng = np.random.default_rng(0)
+    for ss in (0.5, 1.0, 4.0):
+        t = _transform({b: ss * 1.0 for b in BANDS})  # sigma_pooled = 1
+        x = t.forward(rng.normal(0.0, 1.0, (1, 200_000)), np.array([0]))
+        assert float(x.std()) == pytest.approx(expected_sky_scatter(ss), rel=0.15)
 
 
-def test_jacobian_matches_finite_differences():
-    t = _transform()
-    x = np.array([[0.3, 1.5]])
+def test_missing_band_softening_is_an_error():
+    with pytest.raises(ValueError, match="no softening scale for band"):
+        LogFluxTransform.from_config(TransformConfig(band_softening={"r": 4.0}))
+
+
+def test_jacobian_is_c_times_flux_and_matches_finite_differences():
+    t = _transform(log_scale=1.7)
+    x = np.array([[-1.0, 0.3, 2.5]])
     band = np.array([1])
+    np.testing.assert_allclose(
+        t.jacobian(x, band), 1.7 * t.inverse(x, band), rtol=1e-12
+    )
     h = 1e-6
     numeric = (t.inverse(x + h, band) - t.inverse(x - h, band)) / (2 * h)
     np.testing.assert_allclose(t.jacobian(x, band), numeric, rtol=1e-5)
 
 
-def test_estimate_band_offsets_scales_with_pool_factor():
+def test_log_scale_rescales_x_only():
+    a, b = _transform(log_scale=1.0), _transform(log_scale=2.0)
+    f = np.array([[-8.0, 0.0, 17.0]])
+    np.testing.assert_allclose(
+        b.forward(f, np.array([0])), a.forward(f, np.array([0])) / 2.0, rtol=1e-12
+    )
+
+
+def test_transform_never_produces_nan_or_inf():
+    t = _transform()
+    f = np.concatenate(
+        [-np.logspace(-6, 12, 500), [0.0], np.logspace(-6, 12, 500)]
+    )[None]
+    x = t.forward(f, np.array([0]))
+    assert np.all(np.isfinite(x))
+    assert np.all(np.isfinite(t.inverse(x, np.array([0]))))
+
+
+def test_log_softplus_is_stable_where_the_naive_form_is_not():
+    from rubin_host_prior.data import log_softplus
+
+    u = np.array([-800.0, -100.0, -25.0, -1.0, 0.0, 1.0, 100.0, 800.0])
+    got = log_softplus(u)
+    assert np.all(np.isfinite(got))
+    np.testing.assert_allclose(got[:3], u[:3], rtol=1e-9)   # -> u for u << 0
+    np.testing.assert_allclose(got[-2:], np.log(u[-2:]), rtol=1e-9)  # -> log(u)
+    assert got[4] == pytest.approx(np.log(np.log(2.0)))
+
+
+def test_estimate_band_softening_scales_with_pool_factor():
     """Averaging P^2 independent pixels divides the noise by P."""
     var = np.full((12, 8, 8), 144.0, dtype=np.float32)  # sky noise 12 nJy
     band = np.arange(12) % 6
-    off = estimate_band_offsets(var, band, pool_factor=3, k_sigma=5.0)
-    assert set(off) == set(BANDS)
-    for v in off.values():
-        assert v == pytest.approx(5.0 * 12.0 / 3.0)
+    soft = estimate_band_softening(var, band, pool_factor=3, softening_sigma=1.0)
+    assert set(soft) == set(BANDS)
+    for v in soft.values():
+        assert v == pytest.approx(12.0 / 3.0)
 
 
 # -- pooling ---------------------------------------------------------------
@@ -312,8 +377,9 @@ def _dataset(shard_dir, out_size=32):
             pool_factor=3,
         )
     )
-    config.transform.band_offsets = estimate_band_offsets(
-        ss.load("variance"), ss.meta["band_idx"], 3, config.transform.k_sigma
+    config.transform.band_softening = estimate_band_softening(
+        ss.load("variance"), ss.meta["band_idx"], 3,
+        config.transform.softening_sigma
     )
     return ss, config, PatchDataset.from_shards(
         ss, config, LogFluxTransform.from_config(config.transform)
@@ -326,18 +392,6 @@ def test_dataset_batches_have_the_right_shape_and_dtype(shard_dir):
     assert batch.shape == (8, 1, 32, 32)
     assert batch.dtype == np.float32
     assert np.all(np.isfinite(batch))
-
-
-def test_sky_scatter_matches_one_over_k_sigma(shard_dir):
-    """The headline check that the offsets are right: after the transform, the
-    sky should scatter by ~1/k_sigma in log space in every band."""
-    _, config, ds = _dataset(shard_dir)
-    stats = ds.stats(48)
-    assert stats["sky_scatter"] == pytest.approx(
-        1.0 / config.transform.k_sigma, rel=0.35
-    )
-    assert stats["clipped_fraction"] < 1e-3
-
 
 def test_validation_batch_is_deterministic_and_unaugmented(shard_dir):
     _, _, ds = _dataset(shard_dir)
@@ -366,7 +420,7 @@ def test_cache_key_changes_with_the_transform(shard_dir, tmp_path):
     ss, config, ds = _dataset(shard_dir)
     path = ds.build_pooled_cache(tmp_path / "cache.h5")
     other = Config(patch=config.patch, transform=TransformConfig(
-        band_offsets={b: 999.0 for b in BANDS}
+        band_softening={b: 999.0 for b in BANDS}
     ))
     stale = cache_key(other, LogFluxTransform.from_config(other.transform), ss)
     with pytest.raises(ValueError, match="rebuild it"):
@@ -377,7 +431,7 @@ def test_dataset_refuses_shards_smaller_than_the_config(shard_dir):
     ss = ShardSet.from_dir(shard_dir)
     config = Config(patch=PatchConfig(native_size=512, nominal_crop=192,
                                       out_size=64, pool_factor=3))
-    config.transform.band_offsets = {b: 20.0 for b in BANDS}
+    config.transform.band_softening = {b: 20.0 for b in BANDS}
     with pytest.raises(ValueError, match="shards hold"):
         PatchDataset.from_shards(
             ss, config, LogFluxTransform.from_config(config.transform)
@@ -516,8 +570,9 @@ def _varsize_dataset(shard_dir, out_sizes):
     config = Config(patch=PatchConfig(native_size=ss.native_size, nominal_crop=96,
                                       out_size=32, pool_factor=3,
                                       out_sizes=out_sizes))
-    config.transform.band_offsets = estimate_band_offsets(
-        ss.load("variance"), ss.meta["band_idx"], 3, config.transform.k_sigma
+    config.transform.band_softening = estimate_band_softening(
+        ss.load("variance"), ss.meta["band_idx"], 3,
+        config.transform.softening_sigma
     )
     return ss, config, PatchDataset.from_shards(
         ss, config, LogFluxTransform.from_config(config.transform)
@@ -594,114 +649,336 @@ def test_small_crops_do_not_wander_off_the_host(shard_dir):
     assert abs((max(corners) + min(corners)) / 2 - centre) <= 2
 
 
-# -- the exact transform, and negative-flux headroom ------------------------
-
-
-def test_forward_is_exactly_log_of_one_plus_f_over_b():
-    """Pin the formula:  x = log(1 + max(f/b, r)) / c,  f = b*(exp(c*x) - 1).
-
-    The boost that carries negative sky pixels through the logarithm is the
-    ``+1`` inside ``log1p`` -- i.e. ``+b`` in flux units.  Dividing by ``b`` does
-    not do it: that rescales negatives but leaves them negative.
-    """
-    t = _transform(log_scale=2.0, floor_ratio=-0.9)
-    b = t.offsets[0]
-    f = np.array([[-0.5 * b, 0.0, b, 37.0 * b]])
-    expected = np.log(1.0 + f / b) / 2.0
-    np.testing.assert_allclose(t.forward(f, np.array([0])), expected, rtol=1e-12)
-    # and the division alone would leave every negative pixel negative
-    assert np.all((f / b)[f < 0] < 0)
-
-
-def test_representable_flux_range_is_bounded_below_by_minus_b():
-    """``inverse`` is b*expm1(c*x) and expm1 -> -1, so the model spans
-    ``(-b, +inf)``.  ``b`` is therefore a hard bound on negative flux, not just a
-    numerical guard -- which is what makes ``k_sigma`` a modelling choice."""
-    t = _transform()
-    b = t.offsets[0]
-    # Far below the floor, expm1 underflows to exactly -1 and the flux saturates
-    # at -b.  That is the right behaviour: bounded, finite, no NaN -- a sampler
-    # that wanders to very negative x gets "as dark as representable", not a
-    # numerical blow-up.  forward() never produces x below x_floor anyway.
-    assert t.inverse(np.array([[-50.0]]), np.array([0]))[0, 0] == pytest.approx(-b)
-    everywhere = t.inverse(np.linspace(-60, 5, 400)[None], np.array([0]))
-    assert np.all(np.isfinite(everywhere))
-    assert np.all(everywhere >= -b)
-    # Strictly above -b across the range the transform actually produces.
-    realistic = t.inverse(np.linspace(t.x_floor, 8, 400)[None], np.array([0]))
-    assert np.all(realistic > -b)
-
-
-def test_floor_bites_at_minus_zero_point_nine_k_sigma():
-    t = _transform(k_sigma=10.0)
-    b = t.offsets[0]
-    assert t.forward(np.array([[-0.9 * b]]), np.array([0]))[0, 0] == pytest.approx(
-        t.x_floor
-    )
-    assert t.forward(np.array([[-0.89 * b]]), np.array([0]))[0, 0] > t.x_floor
+# -- deep negatives survive the transform ----------------------------------
 
 
 @pytest.fixture(scope="module")
 def dark_halo_shards(tmp_path_factory):
     """Shards carrying a 1.5-sigma background over-subtraction, kept rather than
-    gated out -- the regime that decides k_sigma."""
+    gated out. Pooling divides the noise by pool_factor but leaves a smooth
+    offset untouched, so this is ~4.5 sigma deep in the pooled data."""
     d = tmp_path_factory.mktemp("halo")
     write_synthetic_shards(d, n_patches=48, native_size=112, patches_per_shard=48,
                            dark_halo_sigma=1.5, seed=3)
     return d
 
 
-def _halo_dataset(shard_dir, k_sigma):
+def _halo_dataset(shard_dir, softening_sigma):
     ss = ShardSet.from_dir(shard_dir)
     config = Config(patch=PatchConfig(native_size=ss.native_size, nominal_crop=96,
                                       out_size=32, pool_factor=3))
-    config.transform.k_sigma = k_sigma
-    config.transform.band_offsets = estimate_band_offsets(
-        ss.load("variance"), ss.meta["band_idx"], 3, k_sigma
+    config.transform.softening_sigma = softening_sigma
+    config.transform.band_softening = estimate_band_softening(
+        ss.load("variance"), ss.meta["band_idx"], 3, softening_sigma
     )
     return PatchDataset.from_shards(
         ss, config, LogFluxTransform.from_config(config.transform)
     )
 
 
-def test_pooling_makes_a_smooth_offset_deeper_than_the_noise(dark_halo_shards):
-    """Pooling divides the noise by pool_factor but leaves a smooth offset
-    untouched, so in pooled-sigma units an over-subtracted region is
-    pool_factor times deeper than it was natively.  This is why k_sigma has to
-    be larger than the noise alone would suggest."""
-    ds = _halo_dataset(dark_halo_shards, 10.0)
-    head = ds.flux_headroom(48)
-    # a 1.5 sigma native halo is ~4.5 sigma pooled, plus noise and the bowl's core
-    assert head["deepest"] < -4.0
-    assert head["k_sigma_needed"] > 5.0
+@pytest.mark.parametrize("softening_sigma", [0.5, 1.0, 4.0])
+def test_over_subtracted_regions_are_representable_at_any_softening(
+    dark_halo_shards, softening_sigma
+):
+    """The old log1p transform had a hard wall at -b and needed its offset sized
+    to the deepest artefact. Softplus has no wall, so this holds at every scale."""
+    ds = _halo_dataset(dark_halo_shards, softening_sigma)
+    x = ds.make_batch(np.arange(16), rng=None, augment=False)
+    assert np.all(np.isfinite(x))
+    assert len(np.unique(x)) > 0.9 * x.size, "no pile-up at a floor"
+    f = ds.transform.inverse(x[:, 0], ds.band_idx[:16])
+    assert np.all(f >= 0)
 
 
-def test_too_small_k_sigma_clips_the_dark_halo(dark_halo_shards):
-    small = _halo_dataset(dark_halo_shards, 5.0).stats(48)
-    large = _halo_dataset(dark_halo_shards, 15.0).stats(48)
-    assert small["clipped_fraction"] > 0.01, "k_sigma=5 should clip a 1.5sig halo"
-    assert large["clipped_fraction"] == 0.0
+def test_deep_negatives_are_reported_but_not_clipped(dark_halo_shards):
+    stats = _halo_dataset(dark_halo_shards, 1.0).stats(48)
+    assert stats["deepest_flux_sigma"] < -3.0, "the halo should show up"
+    assert np.isfinite(stats["skew"])
 
 
-def test_sky_scatter_tracks_one_over_k_sigma(shard_dir):
-    """On clean patches the log-space sky scatter should be ~1/k_sigma, which is
-    the check that the band offsets are right."""
-    for k in (5.0, 10.0):
+def test_sky_scatter_matches_the_prediction(shard_dir):
+    """The check that the per-band softening scales are right: the log-space sky
+    scatter should match 0.721 / (softening_sigma * log_scale)."""
+    from rubin_host_prior.data import expected_sky_scatter
+
+    for ss_val in (1.0, 4.0):
         ss = ShardSet.from_dir(shard_dir)
         config = Config(patch=PatchConfig(native_size=ss.native_size,
                                           nominal_crop=96, out_size=32,
                                           pool_factor=3))
-        config.transform.k_sigma = k
-        config.transform.band_offsets = estimate_band_offsets(
-            ss.load("variance"), ss.meta["band_idx"], 3, k)
+        config.transform.softening_sigma = ss_val
+        config.transform.band_softening = estimate_band_softening(
+            ss.load("variance"), ss.meta["band_idx"], 3, ss_val)
         ds = PatchDataset.from_shards(
             ss, config, LogFluxTransform.from_config(config.transform))
-        assert ds.stats(48)["sky_scatter"] == pytest.approx(1.0 / k, rel=0.4)
+        assert ds.stats(48)["sky_scatter"] == pytest.approx(
+            expected_sky_scatter(ss_val), rel=0.5)
 
 
-def test_flux_headroom_needs_native_stamps(shard_dir, tmp_path):
-    ss, config, ds = _dataset(shard_dir)
+# -- correlation length ----------------------------------------------------
+
+
+def _correlated_field(n, size, w, noise, seed=0):
+    """White noise smoothed by a Gaussian of width ``w``.
+
+    The autocovariance is then a Gaussian of width ``w*sqrt(2)``, so the 1/e
+    crossing sits at exactly ``2w`` -- a field with a known correlation length.
+    """
+    rng = np.random.default_rng(seed)
+    k = np.arange(size) - size // 2
+    g = np.exp(-0.5 * (k / w) ** 2)
+    g /= np.sqrt((g**2).sum())
+    F = np.fft.fft2(np.fft.ifftshift(np.outer(g, g)))
+    x = np.real(
+        np.fft.ifft2(np.fft.fft2(rng.normal(size=(n, size, size)), axes=(1, 2)) * F,
+                     axes=(1, 2))
+    )
+    x = x / x.std()
+    return x + noise * rng.normal(size=x.shape)
+
+
+@pytest.mark.parametrize("w", [1.5, 3.0, 5.0])
+def test_correlation_length_recovers_a_known_field(w):
+    from rubin_host_prior.data import correlation_length
+
+    r = correlation_length(_correlated_field(300, 96, w, 0.0))
+    assert r["xi"] == pytest.approx(2 * w, rel=0.12)
+
+
+def test_correlation_length_is_immune_to_uncorrelated_noise():
+    """The whole point of renormalising at lag 1.
+
+    Uncorrelated pixel noise is a delta at zero lag and nothing elsewhere, so it
+    must not move xi at all -- but a naive 1/e crossing on the raw profile is
+    dominated by it.
+    """
+    from rubin_host_prior.data import correlation_length
+
+    clean = correlation_length(_correlated_field(300, 96, 3.0, 0.0))
+    noisy = correlation_length(_correlated_field(300, 96, 3.0, 1.5))
+    assert noisy["xi"] == pytest.approx(clean["xi"], rel=0.05)
+    assert noisy["noise_fraction"] > 0.5
+    naive = correlation_length(_correlated_field(300, 96, 3.0, 1.5),
+                               exclude_noise=False)
+    assert naive["xi"] < 0.5 * clean["xi"], "naive estimate should be badly wrong"
+
+
+def test_correlation_length_uses_the_linear_not_circular_autocorrelation():
+    """A circular (unpadded) autocorrelation wraps structure round the edges and
+    biases xi low, which on this question is the dangerous direction."""
+    from rubin_host_prior.data import autocorrelation
+
+    x = _correlated_field(200, 64, 4.0, 0.0)
+    prof = autocorrelation(x)
+    assert prof[0] == pytest.approx(1.0)
+    assert np.all(np.diff(prof[1:12]) < 0)  # monotone decay, no wrap-around bump
+
+
+def test_streaming_accumulator_matches_the_batch_computation():
+    from rubin_host_prior.data.diagnostics import AutocorrelationAccumulator
+    from rubin_host_prior.data import correlation_length
+
+    x = _correlated_field(120, 64, 3.0, 1.0)
+    acc = AutocorrelationAccumulator(64)
+    for patch in x:
+        acc.add(patch)
+    np.testing.assert_allclose(acc.result()["profile"],
+                               correlation_length(x)["profile"], rtol=1e-10)
+    assert acc.result()["n_patches"] == 120
+
+
+def test_accumulator_skips_non_finite_patches():
+    from rubin_host_prior.data.diagnostics import AutocorrelationAccumulator
+
+    acc = AutocorrelationAccumulator(16)
+    bad = np.zeros((16, 16)); bad[0, 0] = np.nan
+    acc.add(bad)
+    acc.add(np.random.default_rng(0).normal(size=(16, 16)))
+    assert acc.result()["n_patches"] == 1
+
+
+def test_accumulator_rejects_the_wrong_shape():
+    from rubin_host_prior.data.diagnostics import AutocorrelationAccumulator
+
+    with pytest.raises(ValueError, match="expected"):
+        AutocorrelationAccumulator(16).add(np.zeros((8, 8)))
+
+
+def test_context_advice_brackets_the_regimes():
+    from rubin_host_prior.data import context_advice
+
+    assert "comfortable" in context_advice(xi=6.0, loss_margin=16)
+    assert "marginal" in context_advice(xi=16.0, loss_margin=16)
+    assert "TOO SMALL" in context_advice(xi=30.0, loss_margin=16)
+
+
+def test_dataset_reports_correlation_length_in_pooled_pixels(shard_dir):
+    _, _, ds = _dataset(shard_dir)
+    cl = ds.correlation_length(32)
+    assert 0 < cl["xi"] < ds.config.patch.out_size
+    assert 0.0 <= cl["noise_fraction"] <= 1.0
+
+
+# -- variable patch sizes --------------------------------------------------
+
+
+def test_training_sizes_are_deduplicated_with_the_reference_first():
+    pc = PatchConfig(native_size=224, nominal_crop=192, out_size=64, pool_factor=3,
+                     out_sizes=(48, 64, 32, 48))
+    assert pc.training_sizes == (64, 32, 48)
+
+
+def test_config_rejects_sizes_the_stamp_cannot_supply():
+    with pytest.raises(ValueError, match="needs 288 native pixels"):
+        PatchConfig(native_size=224, nominal_crop=192, out_size=64, pool_factor=3,
+                    out_sizes=(96,))
+
+
+def _varsize_dataset(shard_dir, out_sizes):
+    ss = ShardSet.from_dir(shard_dir)
+    config = Config(patch=PatchConfig(native_size=ss.native_size, nominal_crop=96,
+                                      out_size=32, pool_factor=3,
+                                      out_sizes=out_sizes))
+    config.transform.band_softening = estimate_band_softening(
+        ss.load("variance"), ss.meta["band_idx"], 3,
+        config.transform.softening_sigma
+    )
+    return ss, config, PatchDataset.from_shards(
+        ss, config, LogFluxTransform.from_config(config.transform)
+    )
+
+
+def test_batches_cycle_sizes_round_robin(shard_dir):
+    _, _, ds = _varsize_dataset(shard_dir, (16, 24, 32))
+    it = ds.batches(4, seed=0)
+    sizes = [next(it).shape[-1] for _ in range(9)]
+    assert sizes == [32, 16, 24] * 3, sizes
+
+
+def test_every_size_is_a_valid_pooled_image(shard_dir):
+    _, _, ds = _varsize_dataset(shard_dir, (16, 24, 32))
+    for s in (16, 24, 32):
+        b = ds.make_batch(np.arange(4), rng=np.random.default_rng(0), out_size=s)
+        assert b.shape == (4, 1, s, s)
+        assert np.all(np.isfinite(b))
+
+
+def test_validation_batch_stays_at_the_reference_size(shard_dir):
+    """Otherwise validation losses are not comparable across runs or steps."""
+    _, config, ds = _varsize_dataset(shard_dir, (16, 24, 32))
+    assert ds.validation_batch(4).shape[-1] == config.patch.out_size
+
+
+def test_pooled_cache_serves_smaller_sizes_by_sub_cropping(shard_dir, tmp_path):
+    """A sub-crop of a pooled, transformed image equals the pooled transform of
+    the corresponding native sub-region -- pooling is local, the transform is
+    pointwise -- so the cache covers every size at or below its own."""
+    ss, config, ds = _varsize_dataset(shard_dir, (16, 24, 32))
     cached = PatchDataset.from_pooled_cache(
-        ds.build_pooled_cache(tmp_path / "h.h5"), config, ds.transform)
-    with pytest.raises(ValueError, match="needs native stamps"):
-        cached.flux_headroom(8)
+        ds.build_pooled_cache(tmp_path / "c.h5"), config, ds.transform
+    )
+    for s in (16, 24, 32):
+        assert cached.make_batch(np.arange(4), augment=False,
+                                 out_size=s).shape == (4, 1, s, s)
+    with pytest.raises(ValueError, match="cannot serve"):
+        cached.make_batch(np.arange(4), augment=False, out_size=48)
+
+
+def test_pooled_cache_sub_crop_matches_the_native_path(shard_dir, tmp_path):
+    ss, config, ds = _varsize_dataset(shard_dir, (16,))
+    cached = PatchDataset.from_pooled_cache(
+        ds.build_pooled_cache(tmp_path / "c2.h5"), config, ds.transform
+    )
+    idx = np.arange(4)
+    from_cache = cached.make_batch(idx, augment=False, out_size=16)
+    full = ds.make_batch(idx, rng=None, augment=False, out_size=32)
+    o = (32 - 16) // 2
+    np.testing.assert_allclose(from_cache[:, 0], full[:, 0, o:o + 16, o:o + 16],
+                               rtol=1e-6)
+
+
+def test_small_crops_do_not_wander_off_the_host(shard_dir):
+    """Translation room is capped at the reference size's room.
+
+    Without the cap a 16 px crop would roam the whole 112 px stamp and land
+    mostly on blank sky, so the data distribution would silently change with
+    patch size -- which is not what varying the size is for.
+    """
+    from rubin_host_prior.data.pooling import pool_to_training_grid
+
+    a = np.arange(224 * 224, dtype=np.float64).reshape(224, 224)
+    corners = set()
+    rng = np.random.default_rng(0)
+    for _ in range(80):
+        out = pool_to_training_grid(a, 16, 3, rng=rng, translate=True,
+                                    max_translate=16)
+        corners.add(int(out[0, 0] // 224))
+    assert max(corners) - min(corners) <= 2 * 16
+    centre = (224 - 48) // 2
+    assert abs((max(corners) + min(corners)) / 2 - centre) <= 2
+
+
+# -- deep negatives survive the transform ----------------------------------
+
+
+@pytest.fixture(scope="module")
+def dark_halo_shards(tmp_path_factory):
+    """Shards carrying a 1.5-sigma background over-subtraction, kept rather than
+    gated out. Pooling divides the noise by pool_factor but leaves a smooth
+    offset untouched, so this is ~4.5 sigma deep in the pooled data."""
+    d = tmp_path_factory.mktemp("halo")
+    write_synthetic_shards(d, n_patches=48, native_size=112, patches_per_shard=48,
+                           dark_halo_sigma=1.5, seed=3)
+    return d
+
+
+def _halo_dataset(shard_dir, softening_sigma):
+    ss = ShardSet.from_dir(shard_dir)
+    config = Config(patch=PatchConfig(native_size=ss.native_size, nominal_crop=96,
+                                      out_size=32, pool_factor=3))
+    config.transform.softening_sigma = softening_sigma
+    config.transform.band_softening = estimate_band_softening(
+        ss.load("variance"), ss.meta["band_idx"], 3, softening_sigma
+    )
+    return PatchDataset.from_shards(
+        ss, config, LogFluxTransform.from_config(config.transform)
+    )
+
+
+@pytest.mark.parametrize("softening_sigma", [0.5, 1.0, 4.0])
+def test_over_subtracted_regions_are_representable_at_any_softening(
+    dark_halo_shards, softening_sigma
+):
+    """The old log1p transform had a hard wall at -b and needed its offset sized
+    to the deepest artefact. Softplus has no wall, so this holds at every scale."""
+    ds = _halo_dataset(dark_halo_shards, softening_sigma)
+    x = ds.make_batch(np.arange(16), rng=None, augment=False)
+    assert np.all(np.isfinite(x))
+    assert len(np.unique(x)) > 0.9 * x.size, "no pile-up at a floor"
+    f = ds.transform.inverse(x[:, 0], ds.band_idx[:16])
+    assert np.all(f >= 0)
+
+
+def test_deep_negatives_are_reported_but_not_clipped(dark_halo_shards):
+    stats = _halo_dataset(dark_halo_shards, 1.0).stats(48)
+    assert stats["deepest_flux_sigma"] < -3.0, "the halo should show up"
+    assert np.isfinite(stats["skew"])
+
+
+def test_sky_scatter_matches_the_prediction(shard_dir):
+    """The check that the per-band softening scales are right: the log-space sky
+    scatter should match 0.721 / (softening_sigma * log_scale)."""
+    from rubin_host_prior.data import expected_sky_scatter
+
+    for ss_val in (1.0, 4.0):
+        ss = ShardSet.from_dir(shard_dir)
+        config = Config(patch=PatchConfig(native_size=ss.native_size,
+                                          nominal_crop=96, out_size=32,
+                                          pool_factor=3))
+        config.transform.softening_sigma = ss_val
+        config.transform.band_softening = estimate_band_softening(
+            ss.load("variance"), ss.meta["band_idx"], 3, ss_val)
+        ds = PatchDataset.from_shards(
+            ss, config, LogFluxTransform.from_config(config.transform))
+        assert ds.stats(48)["sky_scatter"] == pytest.approx(
+            expected_sky_scatter(ss_val), rel=0.5)

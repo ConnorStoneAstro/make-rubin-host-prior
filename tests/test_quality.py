@@ -139,21 +139,16 @@ def test_over_subtraction_is_rejected_when_asked(label, extra):
     )
 
 
-def test_keeping_over_subtraction_is_what_forces_a_larger_k_sigma():
-    """The two decisions are coupled.
-
-    Pooling divides the noise by pool_factor but leaves a smooth offset
+def test_depth_of_over_subtraction_is_recorded_for_later_use():
+    """Pooling divides the noise by pool_factor but leaves a smooth offset
     untouched, so a depressed region is pool_factor times deeper relative to the
-    noise after pooling -- and the log transform can only represent flux above
-    -k_sigma * sigma_pooled. Keeping these patches therefore raises the k_sigma
-    the transform needs.
+    noise once pooled.  The log transform carries it through regardless --
+    softplus softening has no floor -- but the depth is worth recording so the
+    decision to keep these patches can be revisited from the manifest.
     """
     _, diag = _gate(_scene(-1.0 * SKY * (1 - R2)))
-    depth_native = abs(diag["min_block"])
-    depth_pooled = 3 * depth_native  # pool_factor = 3
-    assert depth_pooled > 2.0
-    # the clip sits at -0.9 * k_sigma, so this depth needs:
-    assert depth_pooled / 0.9 > 3.0
+    assert diag["min_block"] < -0.5
+    assert 3 * abs(diag["min_block"]) > 2.0  # pool_factor = 3
 
 
 def test_blank_sky_noise_floor_leaves_headroom():

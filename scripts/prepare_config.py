@@ -7,11 +7,12 @@ The offsets and the sigma range are not free hyperparameters -- they follow from
 the data's noise level and dynamic range.  This script measures both, writes a
 config, and prints the diagnostics you should look at before training:
 
-* ``sky_scatter`` should come out near ``1 / k_sigma``.  If it does not, the
-  offsets are wrong and the bands will not be on a common footing.
-* ``clipped_fraction`` should be ~1e-5 or smaller.  Larger means either
-  ``k_sigma`` is too small or the shards contain over-subtraction artefacts the
-  gate missed.
+* ``sky_scatter`` should match ``expected_sky_scatter(softening_sigma)``.  If it
+  does not, the per-band softening scales are wrong and the bands will not be on
+  a common footing, which breaks the single band-agnostic prior.
+* the sky pedestal should stay below one sigma, and the flux above which the
+  exponential model map is accurate should sit below anything you care about
+  photometrically.
 """
 
 from __future__ import annotations
@@ -25,7 +26,8 @@ from rubin_host_prior.data import (
     LogFluxTransform,
     PatchDataset,
     ShardSet,
-    estimate_band_offsets,
+    estimate_band_softening,
+    expected_sky_scatter,
     context_advice,
     suggest_sigma_range,
 )
@@ -36,10 +38,10 @@ def main() -> None:
     p.add_argument("--shards", required=True, help="directory of *.h5 shards")
     p.add_argument("--out", required=True, help="config JSON to write")
     p.add_argument("--base-config", default=None, help="config to start from")
-    p.add_argument("--k-sigma", type=float, default=10.0,
-                   help="b_band = k_sigma * pooled sky noise. Hard bound on "
-                        "representable negative flux; raise it if the "
-                        "headroom report says so")
+    p.add_argument("--softening-sigma", type=float, default=1.0,
+                   help="softplus scale in units of pooled sky noise. Sets both "
+                        "the sky pedestal (0.693x this, in sigma) and the flux "
+                        "above which the exponential model map is accurate")
     p.add_argument("--pool-factor", type=int, default=3)
     p.add_argument("--out-size", type=int, default=64)
     p.add_argument("--n-stats", type=int, default=512)
@@ -52,12 +54,12 @@ def main() -> None:
     config.patch.out_size = args.out_size
     config.patch.nominal_crop = args.out_size * args.pool_factor
     config.patch.native_size = max(shards.native_size, config.patch.nominal_crop)
-    config.transform.k_sigma = args.k_sigma
-    config.transform.band_offsets = estimate_band_offsets(
+    config.transform.softening_sigma = args.softening_sigma
+    config.transform.band_softening = estimate_band_softening(
         shards.load("variance"),
         shards.meta["band_idx"],
         pool_factor=args.pool_factor,
-        k_sigma=args.k_sigma,
+        softening_sigma=args.softening_sigma,
         bands=shards.bands,
     )
 
@@ -70,25 +72,31 @@ def main() -> None:
     config.save(args.out)
 
     print(json.dumps({"n_patches": len(shards), "stats": stats,
-                      "band_offsets_nJy": config.transform.band_offsets,
+                      "band_softening_nJy": config.transform.band_softening,
                       "sigma_min": config.sde.sigma_min,
                       "sigma_max": config.sde.sigma_max}, indent=2))
 
     # The correlation length, measured on the pooled log-space patches the model
     # actually sees.  This is the authoritative version -- the one in the
     # extraction summary is native-resolution flux and is contaminated by the PSF.
-    head = dataset.flux_headroom(args.n_stats)
-    print(f"\nnegative-flux headroom (pooled, in units of pooled sky noise)")
-    print(f"  deepest pixel over {head['n']} patches: {head['deepest']:.1f} sigma")
-    print(f"  per-patch minimum, percentiles: " + ", ".join(
-        f"{q}%={v:.1f}" for q, v in head["min_flux_sigma_percentiles"].items()))
-    print(f"  k_sigma is {head['k_sigma_current']:.1f}; the data needs at least "
-          f"{head['k_sigma_needed']:.1f}")
-    if head["k_sigma_needed"] > head["k_sigma_current"]:
-        print(f"  WARNING: raise --k-sigma to at least "
-              f"{head['k_sigma_needed']:.0f} and re-run. b_band = k_sigma * "
-              f"sigma_pooled is a hard bound on representable flux; below it the "
-              f"transform clips and the model cannot express those pixels at all.")
+    t = LogFluxTransform.from_config(config.transform, shards.bands)
+    ss = config.transform.softening_sigma
+    print(f"\nlog transform:  x = log(softplus(f/s))/c,  model map f = s*exp(c*x)")
+    print(f"  softening s = {ss:.2f} x pooled sky noise")
+    print(f"  model sky pedestal: {t.sky_pedestal * ss:.2f} sigma"
+          f"{'  (below the noise, good)' if t.sky_pedestal * ss < 1 else '  (ABOVE the noise)'}")
+    print(f"  exponential map accurate within 1% above "
+          f"{t.accurate_above(0.01) * ss:.1f} sigma, 0.1% above "
+          f"{t.accurate_above(0.001) * ss:.1f} sigma")
+    print(f"  deepest measured pixel: {stats['deepest_flux_sigma']:.1f} sigma "
+          f"-> representable (softplus has no floor)")
+    predicted = expected_sky_scatter(ss, config.transform.log_scale)
+    print(f"  sky scatter in x: {stats['sky_scatter']:.3f} measured vs "
+          f"{predicted:.3f} predicted")
+    if not 0.5 * predicted < stats["sky_scatter"] < 2.0 * predicted:
+        print("  WARNING: measured sky scatter is far from prediction -- the "
+              "per-band softening scales are probably wrong, which would put the "
+              "bands on different footings.")
 
     lo, hi = config.usable_size_range()
     print(f"\nusable training sizes with {config.energy.n_layers} layers and "
@@ -107,18 +115,6 @@ def main() -> None:
     if cl["truncated"]:
         print("  WARNING: the patches never decorrelate within their own size, so "
               "xi is a lower bound. Extract larger patches to measure it.")
-    expected = 1.0 / args.k_sigma
-    if not 0.5 * expected < stats["sky_scatter"] < 2.0 * expected:
-        print(
-            f"\nWARNING: sky_scatter {stats['sky_scatter']:.3f} is far from the "
-            f"expected 1/k_sigma = {expected:.3f}. The band offsets are probably "
-            f"wrong -- check the variance planes in the shards."
-        )
-    if stats["clipped_fraction"] > 1e-4:
-        print(
-            f"\nWARNING: {stats['clipped_fraction']:.2%} of pixels hit the log "
-            f"floor. Raise k_sigma or tighten the artefact gate."
-        )
     if args.pooled_cache:
         path = dataset.build_pooled_cache(args.pooled_cache)
         print(f"\npooled cache: {path}")
