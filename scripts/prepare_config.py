@@ -74,6 +74,12 @@ def main() -> None:
     # The correlation length, measured on the pooled log-space patches the model
     # actually sees.  This is the authoritative version -- the one in the
     # extraction summary is native-resolution flux and is contaminated by the PSF.
+    lo, hi = config.usable_size_range()
+    print(f"\nusable training sizes with {config.energy.n_layers} layers and "
+          f"{config.patch.native_size} px stamps: {lo} .. {hi}")
+    for w in config.check_sizes():
+        print(f"  WARNING: {w}")
+
     cl = dataset.correlation_length(args.n_stats)
     margin = geometry.loss_margin(config.energy.n_layers, config.energy.kernel_size)
     print(f"\ncorrelation length (pooled, log space, over {cl['n_patches']} patches)")

@@ -162,6 +162,50 @@ class Config:
     augment: AugmentConfig = field(default_factory=AugmentConfig)
     train: TrainConfig = field(default_factory=TrainConfig)
 
+    def usable_size_range(self) -> tuple[int, int]:
+        """``(smallest, largest)`` training size this config can actually serve.
+
+        The lower bound comes from the architecture (a patch must exceed ``4R``
+        or the loss has no interior); the upper bound from the extracted stamp
+        (``native_size // pool_factor``).  Neither dataclass knows both halves,
+        which is why this lives on ``Config`` -- and why it is easy to configure a
+        size that one half allows and the other does not.
+        """
+        from . import geometry
+
+        lo = 4 * geometry.receptive_radius(
+            self.energy.n_layers, self.energy.kernel_size
+        ) + 1
+        hi = self.patch.native_size // self.patch.pool_factor
+        return lo, hi
+
+    def check_sizes(self) -> list[str]:
+        """Warnings about the configured training sizes; empty means fine."""
+        from . import geometry
+
+        lo, hi = self.usable_size_range()
+        out = []
+        if lo > hi:
+            out.append(
+                f"no usable patch size: the model needs > {lo - 1} px but the "
+                f"{self.patch.native_size} px stamps only yield {hi} px. "
+                f"Extract larger stamps or use fewer layers."
+            )
+        for s in self.patch.training_sizes:
+            if s < lo:
+                out.append(f"size {s} is below the minimum {lo} (model crops "
+                           f"{2 * geometry.receptive_radius(self.energy.n_layers, self.energy.kernel_size)} px per side)")
+            elif s > hi:
+                out.append(f"size {s} needs {s * self.patch.pool_factor} native "
+                           f"px but the stamps are {self.patch.native_size}")
+            else:
+                frac = (geometry.interior_size(s, self.energy.n_layers,
+                                               self.energy.kernel_size) / s) ** 2
+                if frac < 0.10:
+                    out.append(f"size {s} spends {100 * (1 - frac):.0f}% of itself "
+                               f"on the cropped margin -- little signal per step")
+        return out
+
     def to_dict(self) -> dict[str, Any]:
         return dataclasses.asdict(self)
 

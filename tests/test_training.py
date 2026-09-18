@@ -350,3 +350,49 @@ def test_all_configured_sizes_are_validated_before_training_starts(tmp_path):
     with pytest.raises(ValueError, match=r"leave no interior"):
         train(model, _varsize_batches(np.random.default_rng(2), (40,)), config,
               out_dir=tmp_path / "r", verbose=False)
+
+
+def test_usable_size_range_combines_both_halves_of_the_config():
+    """The lower bound comes from the architecture, the upper from the stamp.
+    Neither dataclass knows both, which is how a size can satisfy one and not
+    the other -- exactly the trap that motivates this helper."""
+    c = Config(energy=EnergyConfig(channels=(32,) * 8),
+               patch=PatchConfig(native_size=224, nominal_crop=192, out_size=64,
+                                 pool_factor=3))
+    assert c.usable_size_range() == (33, 74)  # 4R+1 = 33, 224//3 = 74
+    big = Config(energy=EnergyConfig(channels=(32,) * 8),
+                 patch=PatchConfig(native_size=384, nominal_crop=288, out_size=96,
+                                   pool_factor=3))
+    assert big.usable_size_range() == (33, 128)
+    shallow = Config(energy=EnergyConfig(channels=(32,) * 3),
+                     patch=PatchConfig(native_size=224, nominal_crop=192,
+                                       out_size=64, pool_factor=3))
+    assert shallow.usable_size_range() == (13, 74)  # 4R+1 with R=3
+
+
+def test_check_sizes_flags_too_small_and_mostly_margin():
+    c = Config(energy=EnergyConfig(channels=(32,) * 8),
+               patch=PatchConfig(native_size=224, nominal_crop=192, out_size=64,
+                                 pool_factor=3))
+    assert c.check_sizes() == []
+    c.patch = dataclasses.replace(c.patch, out_sizes=(16, 40, 64))
+    warnings = c.check_sizes()
+    assert any("below the minimum 33" in w for w in warnings)
+    assert any("40" in w and "margin" in w for w in warnings)
+    assert not any("64" in w.split()[1] for w in warnings if w.split())
+
+
+def test_check_sizes_reports_when_no_size_works_at_all():
+    c = Config(energy=EnergyConfig(channels=(32,) * 20),  # 4R+1 = 81
+               patch=PatchConfig(native_size=96, nominal_crop=96, out_size=32,
+                                 pool_factor=3))
+    assert c.usable_size_range() == (81, 32)
+    assert any("no usable patch size" in w for w in c.check_sizes())
+
+
+def test_report_marks_patches_that_are_mostly_margin():
+    from rubin_host_prior import geometry as geo
+
+    text = geo.report((40, 64), n_layers=8)
+    assert "mostly margin" in text.split("patch   40")[1].split("\n")[0]
+    assert "mostly margin" not in text.split("patch   64")[1].split("\n")[0]

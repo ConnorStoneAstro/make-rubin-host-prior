@@ -109,10 +109,13 @@ def report(
             continue
         e = energy_size(size, n_layers, kernel_size)
         frac = (interior / size) ** 2
+        # The score is computed on every pixel and the crop discards the border,
+        # so this fraction is also the per-step compute efficiency.
+        note = "  <- mostly margin; use larger patches" if frac < 0.10 else ""
         lines.append(
             f"    patch {size:>4}x{size:<4} -> energy map {e}x{e},"
             f" loss on interior {interior}x{interior}"
-            f" ({100 * frac:.0f}% of pixels)"
+            f" ({100 * frac:.0f}% of pixels){note}"
         )
     lines.append(
         f"  at inference: a trustworthy region of N px needs a canvas of "
