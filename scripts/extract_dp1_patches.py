@@ -20,6 +20,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+from pathlib import Path
 
 from rubin_host_prior.rubin.extract import ECDFS, extract_patches, open_butler
 
@@ -47,6 +48,8 @@ def main() -> None:
     p.add_argument("--patches-per-shard", type=int, default=1024)
     p.add_argument("--max-patches", type=int, default=None)
     p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--no-plots", action="store_true",
+                   help="skip the diagnostic figures written to <out>/diagnostics")
     p.add_argument("--verbose", "-v", action="count", default=0)
     args = p.parse_args()
 
@@ -71,6 +74,42 @@ def main() -> None:
         seed=args.seed,
     )
     print(json.dumps(summary, indent=2, default=str))
+
+    if not args.no_plots:
+        # Extraction-side figures only: the loader figures need the softening
+        # scales, which prepare_config.py has not produced yet.  Never let a
+        # plotting failure cost a completed extraction.
+        try:
+            _write_plots(Path(args.out), args.bands)
+        except Exception as exc:
+            logging.getLogger(__name__).warning(
+                "diagnostic plots failed (%s); the extraction itself is fine", exc
+            )
+
+
+def _write_plots(root: Path, bands) -> None:
+    import matplotlib
+
+    matplotlib.use("Agg")
+    from rubin_host_prior import plots
+    from rubin_host_prior.data import ShardSet
+
+    shards = ShardSet.from_dir(root / "shards")
+    hosts = manifest = None
+    try:
+        import pandas as pd
+
+        if (root / "hosts.parquet").exists():
+            hosts = pd.read_parquet(root / "hosts.parquet")
+        if (root / "manifest.parquet").exists():
+            manifest = pd.read_parquet(root / "manifest.parquet")
+    except Exception:
+        pass
+    band = "r" if "r" in bands else bands[0]
+    for path in plots.make_all(shards, hosts=hosts, manifest=manifest,
+                               out_dir=root / "diagnostics", band=band):
+        print(f"  wrote {path}")
+    print("  run scripts/diagnose.py --config <config.json> for the loader figures")
 
 
 if __name__ == "__main__":

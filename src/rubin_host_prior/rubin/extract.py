@@ -471,8 +471,12 @@ def extract_patches(
 
                 band_name = str(data_id.get("band", "r"))
                 nb = neighbours.near(
-                    tgt_ra, tgt_dec, neighbour_radius_arcsec, band_name
+                    tgt_ra, tgt_dec, neighbour_radius_arcsec, band_name,
+                    host_id=int(host_id[h]),
                 )
+                others = [n for n in nb if not n["is_host"]]
+                gal = [n["sep_arcsec"] for n in others if n["extendedness"] > 0.5]
+                star = [n["sep_arcsec"] for n in others if n["extendedness"] <= 0.5]
                 bb = stamp.getBBox()
                 sky = wcs.pixelToSky(xy)
                 acf.add(image)
@@ -499,10 +503,12 @@ def extract_patches(
                         "host_offset_arcsec": float(r),
                         "tract": int(data_id.get("tract", -1)),
                         "patch": int(data_id.get("patch", -1)),
-                        "n_neighbours": len(nb),
+                        "n_neighbours": len(others),
                         "neighbour_flux_max": float(
-                            max([n["flux"] for n in nb], default=np.nan)
+                            max([n["flux"] for n in others], default=np.nan)
                         ),
+                        "nearest_galaxy_arcsec": float(min(gal, default=np.nan)),
+                        "nearest_star_arcsec": float(min(star, default=np.nan)),
                     },
                 )
                 for n in nb:
@@ -515,6 +521,7 @@ def extract_patches(
 
     paths = writer.close() if writer is not None else []
     acf_result = acf.result()
+    _write_table(out_dir / "hosts", hosts)
     summary = _write_manifest(out_dir, records, neighbour_rows)
     summary.update(
         n_accepted=n_accepted,
@@ -563,7 +570,8 @@ class _NeighbourIndex:
             else np.full(len(self.ra), np.nan)
         )
 
-    def near(self, ra: float, dec: float, radius_arcsec: float, band: str):
+    def near(self, ra: float, dec: float, radius_arcsec: float, band: str,
+             host_id: int | None = None):
         cosd = max(np.cos(np.deg2rad(dec)), 1e-6)
         r_deg = radius_arcsec / 3600.0
         box = (np.abs(self.dec - dec) < r_deg) & (
@@ -584,9 +592,32 @@ class _NeighbourIndex:
                 "sep_arcsec": float(s),
                 "flux": float(flux[i]) if flux is not None else float("nan"),
                 "extendedness": float(self.extendedness[i]),
+                # The host is in the catalogue too, so it appears in its own
+                # neighbour list.  Flagged rather than dropped: its separation
+                # here is the jitter offset, which is worth being able to check.
+                "is_host": bool(host_id is not None and int(self.ids[i]) == host_id),
             }
             for i, s in zip(idx, sep)
         ]
+
+
+def _write_table(stem: Path, table) -> None:
+    """Persist the selected host catalogue next to the shards.
+
+    Size, magnitude, ellipticity and blendedness are known only at selection
+    time and are not carried in the shard metadata, so without this the host
+    population cannot be inspected after the fact -- which is most of what the
+    diagnostic plots are for.
+    """
+    try:
+        df = table.to_pandas() if hasattr(table, "to_pandas") else table
+        df.to_parquet(stem.with_suffix(".parquet"), index=False)
+    except Exception as exc:  # pragma: no cover - depends on the environment
+        log.warning("could not write %s.parquet (%s); trying CSV", stem.name, exc)
+        try:
+            table.write(stem.with_suffix(".csv"), format="ascii.csv", overwrite=True)
+        except Exception as exc2:
+            log.warning("could not write host table at all: %s", exc2)
 
 
 def _write_manifest(

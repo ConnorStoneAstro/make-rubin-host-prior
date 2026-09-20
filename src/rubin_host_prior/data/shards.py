@@ -48,6 +48,10 @@ META_DTYPES: dict[str, str] = {
     "patch": "i4",
     "n_neighbours": "i2",
     "neighbour_flux_max": "f4",
+    # Separation to the nearest catalogue object other than the host itself,
+    # split by extendedness.  NaN where there is none inside the search radius.
+    "nearest_galaxy_arcsec": "f4",
+    "nearest_star_arcsec": "f4",
 }
 
 IMAGE_KEYS = ("image", "variance", "mask")

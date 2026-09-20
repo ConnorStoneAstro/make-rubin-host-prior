@@ -142,6 +142,7 @@ def write_synthetic_shards(
     noise = sky_noise_by_band or {
         "u": 28.0, "g": 11.0, "r": 12.0, "i": 16.0, "z": 24.0, "y": 40.0
     }
+    hosts = []
     with ShardWriter(
         out_dir,
         native_size=native_size,
@@ -159,6 +160,19 @@ def write_synthetic_shards(
             p = synthetic_patch(
                 rng, size=native_size, psf_size=psf_size, sky_noise=noise[band],
                 noise_correlation=noise_correlation,
+            )
+            hosts.append(
+                {
+                    "objectId": i,
+                    "coord_ra": 53.13 + float(rng.normal(0, 0.1)),
+                    "coord_dec": -28.10 + float(rng.normal(0, 0.1)),
+                    "shape_xx": float(10 ** rng.uniform(0.8, 2.2)),
+                    "shape_yy": float(10 ** rng.uniform(0.8, 2.2)),
+                    "shape_xy": float(rng.normal(0, 5)),
+                    "refExtendedness": 1.0,
+                    "r_cModelFlux": float(10 ** rng.uniform(2.6, 4.6)),
+                    "r_blendedness": float(rng.beta(1.2, 8)),
+                }
             )
             w.add(
                 p["image"],
@@ -180,6 +194,24 @@ def write_synthetic_shards(
                     "host_offset_arcsec": float(rng.uniform(0, 3)),
                     "tract": 5063,
                     "patch": int(rng.integers(100)),
+                    "n_neighbours": int(rng.poisson(3)),
+                    "neighbour_flux_max": float(10 ** rng.uniform(2, 4.5)),
+                    "nearest_galaxy_arcsec": float(rng.uniform(2, 30)),
+                    "nearest_star_arcsec": float(rng.uniform(2, 30)),
                 },
             )
-        return w.paths
+    _write_synthetic_hosts(Path(out_dir) / "hosts.parquet", hosts, rng)
+    return w.paths
+
+
+def _write_synthetic_hosts(path: Path, rows: list[dict], rng) -> None:
+    """Mirror the ``hosts.parquet`` that extraction writes, so the diagnostic
+    plots can be exercised end to end without the cluster."""
+    if not rows:
+        return
+    try:
+        import pandas as pd
+
+        pd.DataFrame(rows).to_parquet(path, index=False)
+    except Exception:  # pragma: no cover - pandas/pyarrow optional
+        pass

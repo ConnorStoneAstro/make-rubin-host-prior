@@ -60,15 +60,43 @@ as provenance only: at native resolution the small lags are dominated by the PSF
 and the log transform changes the correlation structure. The number to act on is
 the pooled, log-space one from step 2.
 
-### 2. Derive the config from the data
+### 2. Look at the diagnostic figures
+
+Extraction writes them automatically to `<out>/diagnostics` (`--no-plots` to
+skip). Once a config exists, regenerate with the loader figures too:
+
+```bash
+python scripts/diagnose.py --shards data/ecdfs/shards --config config.json
+```
+
+In rough order of how often they catch something:
+
+| figure | what to look for |
+|---|---|
+| `rejections.png` | **the important one.** Rejection reasons, and accepted vs rejected sky noise. If the rejected patches are systematically brighter or denser, the gate is discarding exactly the regime this project models, and the tolerances need loosening. |
+| `transform.png` | native flux → pooled → log space for a few patches, plus the pixel-value histogram. The sky peak must sit on `x = log(log 2) ≈ −0.37` inside the predicted scatter band, with sources clear of it. If it doesn't, the softening scales are wrong. |
+| `training_batch.png` | exactly what the network receives: pooled, log-space, augmented, at the training size(s), on a shared colour scale so the spread between patches is visible. |
+| `cutouts.png` | raw stamps as `asinh(flux / sky noise)` — a stretch in σ units with a pinned low end, so bands of very different depth are directly comparable. |
+| `hosts.png` | the selected population: size, distortion, magnitude, blendedness, band counts, sky noise, PSF size, nearest galaxy/star, neighbour counts, and the extraction jitter. |
+
+The host size/magnitude/distortion panels come from `hosts.parquet`, which
+extraction writes alongside the shards — those quantities are known only at
+selection time and are not carried in the shard metadata.
+
+Note the distortion convention: `|e| = (Ixx−Iyy, 2Ixy)/(Ixx+Iyy)`, which is
+`(1−q²)/(1+q²)`, roughly twice the `(1−q)/(1+q)` shear convention at modest
+ellipticity.
+
+### 3. Derive the config from the data
 
 ```bash
 python scripts/prepare_config.py --shards data/ecdfs/shards --out config.json
 ```
 
-The per-band offsets and the σ range are not free hyperparameters; they follow
-from the noise level and dynamic range. This measures them and prints two checks
-worth reading:
+The per-band softening scales and the σ range are not free hyperparameters;
+they follow from the noise level and dynamic range. This measures them — from
+pooled patches, not the variance planes, since coadd noise is correlated — and
+prints two checks worth reading:
 
 - `sky_scatter` should match `expected_sky_scatter(softening_sigma)`
   (= `0.721 / softening_sigma`). If not, the per-band softening scales are wrong
@@ -84,13 +112,13 @@ pixel variance sits in the zero-lag noise delta; the estimator renormalises at
 lag 1 to exclude it, because a naive 1/e crossing on the raw profile returns
 ξ ≈ 1 regardless of galaxy size (measured: wrong by 4×).
 
-### 3. Train
+### 4. Train
 
 ```bash
 python scripts/train.py --shards data/ecdfs/shards --config config.json --out runs/ecdfs
 ```
 
-### 4. Sample
+### 5. Sample
 
 ```bash
 python scripts/sample.py --checkpoint runs/ecdfs/final --n 16 --out samples
@@ -475,11 +503,12 @@ src/rubin_host_prior/
   nn/                layers.py (FiLM, Fourier, ConvBlock), energy.py (net + score)
   diffusion/         sde.py (VE), loss.py (DSM + interior crop), sampler.py
   training/          trainer.py, ema.py, checkpoint.py
+  plots.py           diagnostic figures (matplotlib imported lazily)
   data/              transform.py, pooling.py, augment.py, shards.py, dataset.py,
                      diagnostics.py (correlation length), synthetic.py (DP1-like
                      fake data for offline testing)
   rubin/             quality.py (stack-free gate), extract.py (lazy LSST imports)
-scripts/             extract_dp1_patches.py, prepare_config.py, train.py,
-                     sample.py, smoke_test.py
+scripts/             extract_dp1_patches.py, diagnose.py, prepare_config.py,
+                     train.py, sample.py, smoke_test.py
 tests/               ~100 tests, no cluster and no LSST stack required
 ```
