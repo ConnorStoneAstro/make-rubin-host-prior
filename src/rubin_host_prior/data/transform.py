@@ -51,6 +51,9 @@ import numpy as np
 
 from ..config import BANDS, TransformConfig
 
+#: ``Phi^-1(0.25) - Phi^-1(0.05)`` -- converts the faint-quartile spread of a
+#: Gaussian into a sigma.
+_P25_P05_TO_SIGMA = 0.9703648
 #: Below this, ``log(softplus(u))`` differs from ``u`` by less than 1e-9, and the
 #: direct expression underflows.
 _LINEAR_BELOW = -20.0
@@ -206,32 +209,63 @@ class LogFluxTransform:
         return 0.5 * (lo + hi)
 
 
-def estimate_band_softening(
-    variance: np.ndarray,
+def measure_pooled_sky_noise(
+    pooled: np.ndarray,
     band_index: np.ndarray,
-    pool_factor: int,
-    softening_sigma: float = 1.0,
     bands: tuple[str, ...] = BANDS,
 ) -> dict[str, float]:
-    """``s_band = softening_sigma * median pooled sky noise`` per band, in nJy.
+    """Per-band sky noise of *pooled* patches, in nJy -- measured, not derived.
 
-    Averaging ``pool_factor**2`` independent pixels divides the noise by
-    ``pool_factor``, hence the factor.  Visit images are in the detector frame
-    and unwarped, so their pixel noise really is close to independent -- this
-    estimate would be optimistic on a coadd, where warping correlates
-    neighbouring pixels and pooling reduces the noise by less than
-    ``pool_factor``.
+    Deriving it as ``sqrt(median variance) / pool_factor`` assumes the pixel
+    noise is uncorrelated, which is true of unwarped visit images and **false of
+    coadds**: coaddition warps input exposures onto the skymap grid, so
+    neighbouring pixels share flux and averaging ``P**2`` of them reduces the
+    noise by less than ``P``.  Measured on synthetic coadd-like patches, the
+    derived value underestimates the real pooled noise by a factor of two at a
+    correlation width of 0.8 px.  Since this number sets the softening scale,
+    getting it wrong by 2x would put the transform's turnover in the wrong place.
 
-    ``variance`` is per-patch native-resolution variance planes; the median over
-    pixels then over patches keeps bright sources from inflating the estimate.
+    The estimator reads only the faint quarter of each patch:
+    ``(p25 - p5) / 0.9704``, which is exactly one sigma for a Gaussian.  Sources
+    are positive, so confining the estimate to the low percentiles makes it
+    immune to them until they cover more than ~75% of a patch -- a plain standard
+    deviation is inflated by every galaxy present, and even a
+    ``median - p16`` form drifts once a source covers a fifth of the frame.  The
+    median is then taken across patches, so the few source-dominated patches that
+    do defeat it cannot move the answer.
+
+    That median wants a real sample: with five patches per band it scatters by
+    ~15%, with twenty by ~1%.  Pass a few hundred.
     """
-    out: dict[str, float] = {}
-    variance = np.asarray(variance)
+    pooled = np.asarray(pooled, dtype=np.float64)
     band_index = np.asarray(band_index)
+    out: dict[str, float] = {}
     for i, band in enumerate(bands):
         sel = band_index == i
         if not np.any(sel):
             continue
-        per_patch = np.sqrt(np.median(variance[sel], axis=(-2, -1)))
-        out[band] = float(softening_sigma * np.median(per_patch) / pool_factor)
+        patches = pooled[sel].reshape(int(np.sum(sel)), -1)
+        p25, p05 = np.percentile(patches, [25.0, 5.0], axis=1)
+        per_patch = (p25 - p05) / _P25_P05_TO_SIGMA
+        good = np.isfinite(per_patch) & (per_patch > 0)
+        if np.any(good):
+            out[band] = float(np.median(per_patch[good]))
     return out
+
+
+def estimate_band_softening(
+    pooled: np.ndarray,
+    band_index: np.ndarray,
+    softening_sigma: float = 1.0,
+    bands: tuple[str, ...] = BANDS,
+) -> dict[str, float]:
+    """``s_band = softening_sigma * measured pooled sky noise``, in nJy.
+
+    Takes *pooled* patches rather than variance planes, so it holds for coadds
+    as well as visit images.  Pooling needs no transform, so this can be run
+    before one exists -- see ``data.dataset.pool_shards``.
+    """
+    return {
+        band: softening_sigma * noise
+        for band, noise in measure_pooled_sky_noise(pooled, band_index, bands).items()
+    }

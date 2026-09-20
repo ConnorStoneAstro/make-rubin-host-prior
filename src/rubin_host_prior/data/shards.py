@@ -27,18 +27,15 @@ import numpy as np
 from ..config import BANDS
 
 #: Per-patch scalar columns and their on-disk dtypes.  ``-1`` is the convention
-#: for "not applicable" (e.g. visit/detector on a coadd patch).
+#: for "not applicable".
 META_DTYPES: dict[str, str] = {
     "band_idx": "u1",
-    "visit": "i8",
-    "detector": "i2",
     "x0": "i4",
     "y0": "i4",
     "center_x": "f8",
     "center_y": "f8",
     "ra": "f8",
     "dec": "f8",
-    "mjd": "f8",
     "psf_sigma": "f4",
     "psf_ixx": "f4",
     "psf_iyy": "f4",

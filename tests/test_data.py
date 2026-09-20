@@ -13,6 +13,7 @@ from rubin_host_prior.data import (
     cache_key,
     dihedral,
     estimate_band_softening,
+    pool_shards,
     pool_to_training_grid,
     random_dihedral,
     suggest_sigma_range,
@@ -191,14 +192,85 @@ def test_log_softplus_is_stable_where_the_naive_form_is_not():
     assert got[4] == pytest.approx(np.log(np.log(2.0)))
 
 
-def test_estimate_band_softening_scales_with_pool_factor():
-    """Averaging P^2 independent pixels divides the noise by P."""
-    var = np.full((12, 8, 8), 144.0, dtype=np.float32)  # sky noise 12 nJy
-    band = np.arange(12) % 6
-    soft = estimate_band_softening(var, band, pool_factor=3, softening_sigma=1.0)
+def test_measure_pooled_sky_noise_recovers_a_known_sigma():
+    """One-sided estimator: median - p15.87 is exactly one sigma for a Gaussian
+    and ignores the positive tail that sources contribute."""
+    from rubin_host_prior.data import measure_pooled_sky_noise
+
+    rng = np.random.default_rng(0)
+    pooled = rng.normal(0.0, 7.0, (60, 32, 32))
+    band = np.arange(60) % 6
+    for v in measure_pooled_sky_noise(pooled, band).values():
+        assert v == pytest.approx(7.0, rel=0.05)
+
+
+def test_sky_noise_estimator_is_not_inflated_by_sources():
+    """Reading only the faint quartile keeps galaxies out of the estimate.
+
+    A plain standard deviation is inflated by an order of magnitude here.
+    """
+    from rubin_host_prior.data import measure_pooled_sky_noise
+
+    rng = np.random.default_rng(1)
+    sky = rng.normal(0.0, 5.0, (40, 48, 48))
+    yy, xx = np.mgrid[0:48, 0:48]
+    source = 4000.0 * np.exp(-(((xx - 24) ** 2 + (yy - 24) ** 2) / 20.0))
+    pooled = sky + source
+    assert pooled.std() > 50.0, "the naive std really is badly inflated here"
+    measured = measure_pooled_sky_noise(pooled, np.arange(40) % 6)["u"]
+    assert measured == pytest.approx(5.0, rel=0.1)
+
+
+def test_source_dominated_patches_cannot_move_the_answer():
+    """The estimator does fail on a patch a galaxy fills -- there is no sky left
+    to measure.  Taking the median across patches is what makes that harmless.
+    """
+    from rubin_host_prior.data import measure_pooled_sky_noise
+
+    rng = np.random.default_rng(4)
+    pooled = rng.normal(0.0, 5.0, (40, 48, 48))
+    yy, xx = np.mgrid[0:48, 0:48]
+    filled = 4000.0 * np.exp(-(((xx - 24) ** 2 + (yy - 24) ** 2) / 4000.0))
+    pooled[:8] += filled  # a fifth of the patches are hopeless
+    band = np.zeros(40, dtype=int)
+    assert measure_pooled_sky_noise(pooled, band)["u"] == pytest.approx(5.0, rel=0.1)
+
+
+def test_softening_measured_not_derived_for_correlated_noise():
+    """Coadds are warped, so pixel noise is correlated and averaging P^2 pixels
+    reduces it by less than P.  Deriving the pooled noise as sigma/P would be
+    about 50% low at a realistic correlation width; measuring it is not."""
+    from rubin_host_prior.data import measure_pooled_sky_noise
+    from rubin_host_prior.data.synthetic import _convolve, _gaussian_psf
+
+    rng = np.random.default_rng(2)
+    native = rng.normal(0.0, 1.0, (120, 96, 96))
+    k = _gaussian_psf(9, 0.8)
+    native = np.stack([_convolve(n, k) for n in native])
+    native /= native.std()  # per-pixel sigma is 1, but neighbours correlate
+    native *= 12.0
+    pooled = block_mean(native, 3)
+
+    derived = 12.0 / 3.0  # what the old variance-plane route would have given
+    truth = float(pooled.std())
+    measured = measure_pooled_sky_noise(pooled, np.zeros(120, dtype=int))["u"]
+
+    assert truth > 1.6 * derived, "correlation should inflate the pooled noise"
+    assert measured == pytest.approx(truth, rel=0.1)
+
+
+def test_estimate_band_softening_scales_the_measured_noise():
+    from rubin_host_prior.data import estimate_band_softening
+
+    rng = np.random.default_rng(3)
+    # 20 patches per band: the median of a handful of per-patch estimates is
+    # noisy (~15% with five), which is why the estimator wants a real sample.
+    pooled = rng.normal(0.0, 6.0, (120, 64, 64))
+    band = np.arange(120) % 6
+    soft = estimate_band_softening(pooled, band, softening_sigma=2.0)
     assert set(soft) == set(BANDS)
     for v in soft.values():
-        assert v == pytest.approx(12.0 / 3.0)
+        assert v == pytest.approx(12.0, rel=0.03)
 
 
 # -- pooling ---------------------------------------------------------------
@@ -377,9 +449,9 @@ def _dataset(shard_dir, out_size=32):
             pool_factor=3,
         )
     )
+    pooled, pooled_bands = pool_shards(ss, config)
     config.transform.band_softening = estimate_band_softening(
-        ss.load("variance"), ss.meta["band_idx"], 3,
-        config.transform.softening_sigma
+        pooled, pooled_bands, config.transform.softening_sigma
     )
     return ss, config, PatchDataset.from_shards(
         ss, config, LogFluxTransform.from_config(config.transform)
@@ -570,9 +642,9 @@ def _varsize_dataset(shard_dir, out_sizes):
     config = Config(patch=PatchConfig(native_size=ss.native_size, nominal_crop=96,
                                       out_size=32, pool_factor=3,
                                       out_sizes=out_sizes))
+    pooled, pooled_bands = pool_shards(ss, config)
     config.transform.band_softening = estimate_band_softening(
-        ss.load("variance"), ss.meta["band_idx"], 3,
-        config.transform.softening_sigma
+        pooled, pooled_bands, config.transform.softening_sigma
     )
     return ss, config, PatchDataset.from_shards(
         ss, config, LogFluxTransform.from_config(config.transform)
@@ -649,53 +721,6 @@ def test_small_crops_do_not_wander_off_the_host(shard_dir):
     assert abs((max(corners) + min(corners)) / 2 - centre) <= 2
 
 
-# -- deep negatives survive the transform ----------------------------------
-
-
-@pytest.fixture(scope="module")
-def dark_halo_shards(tmp_path_factory):
-    """Shards carrying a 1.5-sigma background over-subtraction, kept rather than
-    gated out. Pooling divides the noise by pool_factor but leaves a smooth
-    offset untouched, so this is ~4.5 sigma deep in the pooled data."""
-    d = tmp_path_factory.mktemp("halo")
-    write_synthetic_shards(d, n_patches=48, native_size=112, patches_per_shard=48,
-                           dark_halo_sigma=1.5, seed=3)
-    return d
-
-
-def _halo_dataset(shard_dir, softening_sigma):
-    ss = ShardSet.from_dir(shard_dir)
-    config = Config(patch=PatchConfig(native_size=ss.native_size, nominal_crop=96,
-                                      out_size=32, pool_factor=3))
-    config.transform.softening_sigma = softening_sigma
-    config.transform.band_softening = estimate_band_softening(
-        ss.load("variance"), ss.meta["band_idx"], 3, softening_sigma
-    )
-    return PatchDataset.from_shards(
-        ss, config, LogFluxTransform.from_config(config.transform)
-    )
-
-
-@pytest.mark.parametrize("softening_sigma", [0.5, 1.0, 4.0])
-def test_over_subtracted_regions_are_representable_at_any_softening(
-    dark_halo_shards, softening_sigma
-):
-    """The old log1p transform had a hard wall at -b and needed its offset sized
-    to the deepest artefact. Softplus has no wall, so this holds at every scale."""
-    ds = _halo_dataset(dark_halo_shards, softening_sigma)
-    x = ds.make_batch(np.arange(16), rng=None, augment=False)
-    assert np.all(np.isfinite(x))
-    assert len(np.unique(x)) > 0.9 * x.size, "no pile-up at a floor"
-    f = ds.transform.inverse(x[:, 0], ds.band_idx[:16])
-    assert np.all(f >= 0)
-
-
-def test_deep_negatives_are_reported_but_not_clipped(dark_halo_shards):
-    stats = _halo_dataset(dark_halo_shards, 1.0).stats(48)
-    assert stats["deepest_flux_sigma"] < -3.0, "the halo should show up"
-    assert np.isfinite(stats["skew"])
-
-
 def test_sky_scatter_matches_the_prediction(shard_dir):
     """The check that the per-band softening scales are right: the log-space sky
     scatter should match 0.721 / (softening_sigma * log_scale)."""
@@ -707,8 +732,9 @@ def test_sky_scatter_matches_the_prediction(shard_dir):
                                           nominal_crop=96, out_size=32,
                                           pool_factor=3))
         config.transform.softening_sigma = ss_val
+        pooled, pooled_bands = pool_shards(ss, config)
         config.transform.band_softening = estimate_band_softening(
-            ss.load("variance"), ss.meta["band_idx"], 3, ss_val)
+            pooled, pooled_bands, ss_val)
         ds = PatchDataset.from_shards(
             ss, config, LogFluxTransform.from_config(config.transform))
         assert ds.stats(48)["sky_scatter"] == pytest.approx(
@@ -839,9 +865,9 @@ def _varsize_dataset(shard_dir, out_sizes):
     config = Config(patch=PatchConfig(native_size=ss.native_size, nominal_crop=96,
                                       out_size=32, pool_factor=3,
                                       out_sizes=out_sizes))
+    pooled, pooled_bands = pool_shards(ss, config)
     config.transform.band_softening = estimate_band_softening(
-        ss.load("variance"), ss.meta["band_idx"], 3,
-        config.transform.softening_sigma
+        pooled, pooled_bands, config.transform.softening_sigma
     )
     return ss, config, PatchDataset.from_shards(
         ss, config, LogFluxTransform.from_config(config.transform)
@@ -920,51 +946,6 @@ def test_small_crops_do_not_wander_off_the_host(shard_dir):
 
 # -- deep negatives survive the transform ----------------------------------
 
-
-@pytest.fixture(scope="module")
-def dark_halo_shards(tmp_path_factory):
-    """Shards carrying a 1.5-sigma background over-subtraction, kept rather than
-    gated out. Pooling divides the noise by pool_factor but leaves a smooth
-    offset untouched, so this is ~4.5 sigma deep in the pooled data."""
-    d = tmp_path_factory.mktemp("halo")
-    write_synthetic_shards(d, n_patches=48, native_size=112, patches_per_shard=48,
-                           dark_halo_sigma=1.5, seed=3)
-    return d
-
-
-def _halo_dataset(shard_dir, softening_sigma):
-    ss = ShardSet.from_dir(shard_dir)
-    config = Config(patch=PatchConfig(native_size=ss.native_size, nominal_crop=96,
-                                      out_size=32, pool_factor=3))
-    config.transform.softening_sigma = softening_sigma
-    config.transform.band_softening = estimate_band_softening(
-        ss.load("variance"), ss.meta["band_idx"], 3, softening_sigma
-    )
-    return PatchDataset.from_shards(
-        ss, config, LogFluxTransform.from_config(config.transform)
-    )
-
-
-@pytest.mark.parametrize("softening_sigma", [0.5, 1.0, 4.0])
-def test_over_subtracted_regions_are_representable_at_any_softening(
-    dark_halo_shards, softening_sigma
-):
-    """The old log1p transform had a hard wall at -b and needed its offset sized
-    to the deepest artefact. Softplus has no wall, so this holds at every scale."""
-    ds = _halo_dataset(dark_halo_shards, softening_sigma)
-    x = ds.make_batch(np.arange(16), rng=None, augment=False)
-    assert np.all(np.isfinite(x))
-    assert len(np.unique(x)) > 0.9 * x.size, "no pile-up at a floor"
-    f = ds.transform.inverse(x[:, 0], ds.band_idx[:16])
-    assert np.all(f >= 0)
-
-
-def test_deep_negatives_are_reported_but_not_clipped(dark_halo_shards):
-    stats = _halo_dataset(dark_halo_shards, 1.0).stats(48)
-    assert stats["deepest_flux_sigma"] < -3.0, "the halo should show up"
-    assert np.isfinite(stats["skew"])
-
-
 def test_sky_scatter_matches_the_prediction(shard_dir):
     """The check that the per-band softening scales are right: the log-space sky
     scatter should match 0.721 / (softening_sigma * log_scale)."""
@@ -976,8 +957,9 @@ def test_sky_scatter_matches_the_prediction(shard_dir):
                                           nominal_crop=96, out_size=32,
                                           pool_factor=3))
         config.transform.softening_sigma = ss_val
+        pooled, pooled_bands = pool_shards(ss, config)
         config.transform.band_softening = estimate_band_softening(
-            ss.load("variance"), ss.meta["band_idx"], 3, ss_val)
+            pooled, pooled_bands, ss_val)
         ds = PatchDataset.from_shards(
             ss, config, LogFluxTransform.from_config(config.transform))
         assert ds.stats(48)["sky_scatter"] == pytest.approx(

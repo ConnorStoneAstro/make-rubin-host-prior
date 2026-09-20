@@ -117,18 +117,14 @@ class PatchDataset:
                 )
             pooled = f["x"][:]
             band_idx = f["band_idx"][:]
-        return cls(
-            config=config, transform=transform, band_idx=band_idx, pooled=pooled
-        )
+        return cls(config=config, transform=transform, band_idx=band_idx, pooled=pooled)
 
     @property
     def mode(self) -> str:
         return "pooled" if self._pooled is not None else "native"
 
     def __len__(self) -> int:
-        return (
-            len(self._pooled) if self._pooled is not None else len(self.band_idx)
-        )
+        return len(self._pooled) if self._pooled is not None else len(self.band_idx)
 
     # -- batch construction ----------------------------------------------
 
@@ -171,8 +167,7 @@ class PatchDataset:
         out_size: int | None = None,
     ) -> np.ndarray:
         out = self._pool(indices, rng, translate, scale_jitter, out_size)
-        # Pool in flux, THEN take the log.  The other order computes a geometric
-        # mean and biases every structured patch low.
+        # Pool in flux, THEN take the log.
         return self.transform.forward(out, self.band_idx[indices])
 
     def make_batch(
@@ -194,10 +189,7 @@ class PatchDataset:
                     f"{out_size}px. Rebuild the cache or use the native loader."
                 )
             if out_size < cached:
-                # A sub-crop of a pooled, transformed image is exactly the
-                # pooled transform of the corresponding native sub-region:
-                # pooling is local and the transform is pointwise.  So the
-                # cache serves every size at or below the one it was built at.
+                # the cache serves every size at or below the one it was built at.
                 room = cached - out_size
                 if augment and aug.translate and rng is not None:
                     y0, x0 = rng.integers(0, room + 1, size=2)
@@ -256,9 +248,7 @@ class PatchDataset:
 
     # -- cache ------------------------------------------------------------
 
-    def build_pooled_cache(
-        self, path: str | Path, chunk: int = 512
-    ) -> Path:
+    def build_pooled_cache(self, path: str | Path, chunk: int = 512) -> Path:
         """Write the nominal pooled + transformed array to ``path``."""
         if self._pooled is not None:
             raise ValueError("already serving from a pooled cache")
@@ -270,9 +260,7 @@ class PatchDataset:
         with h5py.File(path, "w") as f:
             f.attrs["cache_key"] = key
             f.attrs["config"] = json.dumps(self.config.to_dict(), sort_keys=True)
-            dset = f.create_dataset(
-                "x", shape=(n, p.out_size, p.out_size), dtype="f4"
-            )
+            dset = f.create_dataset("x", shape=(n, p.out_size, p.out_size), dtype="f4")
             f.create_dataset("band_idx", data=self.band_idx)
             for start in range(0, n, chunk):
                 idx = np.arange(start, min(start + chunk, n))
@@ -306,21 +294,17 @@ class PatchDataset:
         if self._pooled is None:
             flux = self._pool(idx, rng=None, translate=False, scale_jitter=0.0)
             sigma_pooled = (
-                np.asarray(self.shards.meta["sky_noise"])[idx]
-                / self.config.patch.pool_factor
+                np.asarray(self.shards.meta["sky_noise"])[idx] / self.config.patch.pool_factor
             )
             good = np.isfinite(sigma_pooled) & (sigma_pooled > 0)
             if np.any(good):
-                deepest_sigma = float(
-                    (flux[good].min(axis=(1, 2)) / sigma_pooled[good]).min()
-                )
+                deepest_sigma = float((flux[good].min(axis=(1, 2)) / sigma_pooled[good]).min())
         return {
             "n": int(len(idx)),
             "mean": float(x.mean()),
             "std": float(x.std()),
             "percentiles": {
-                str(q): float(np.percentile(x, q))
-                for q in (0.1, 1, 16, 50, 84, 99, 99.9)
+                str(q): float(np.percentile(x, q)) for q in (0.1, 1, 16, 50, 84, 99, 99.9)
             },
             "min": float(x.min()),
             "max": float(x.max()),
@@ -338,9 +322,7 @@ class PatchDataset:
             # Skew of the log-space values.  The softening is nonlinear across
             # the noise range, so sky pixels are left-skewed; that is expected,
             # not a fault, and it grows as softening_sigma falls.
-            "skew": float(
-                np.mean(((x - x.mean()) / max(x.std(), 1e-12)) ** 3)
-            ),
+            "skew": float(np.mean(((x - x.mean()) / max(x.std(), 1e-12)) ** 3)),
             # How far negative the measured flux goes, in pooled sky noise.
             # Informational only: softplus has no floor, so however deep this
             # goes the pixel is representable.
@@ -364,3 +346,28 @@ def suggest_sigma_range(stats: dict, sky_scatter_hint: float | None = None) -> t
         floor = stats.get("sky_scatter", stats["std"])
     sigma_min = float(max(1e-3, 0.05 * floor))
     return sigma_min, sigma_max
+
+
+def pool_shards(
+    shards: ShardSet,
+    config: Config,
+    n: int | None = None,
+    seed: int = 0,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Nominally pooled flux (nJy) and band index, straight from shards.
+
+    Breaks the chicken-and-egg in setting up the transform: the softening scale
+    needs the pooled sky noise, the pooled sky noise needs pooled patches, and
+    pooling needs no transform at all.
+    """
+    p = config.patch
+    idx = np.arange(len(shards))
+    if n is not None and n < len(idx):
+        idx = np.sort(np.random.default_rng(seed).choice(len(idx), n, replace=False))
+    stamps = shards.gather(idx, "image") if len(idx) < len(shards) else shards.load("image")
+    out = np.empty((len(idx), p.out_size, p.out_size), dtype=np.float32)
+    for i in range(len(idx)):
+        out[i] = pool_to_training_grid(
+            stamps[i], out_size=p.out_size, pool_factor=p.pool_factor
+        )
+    return out, np.asarray(shards.meta["band_idx"])[idx]

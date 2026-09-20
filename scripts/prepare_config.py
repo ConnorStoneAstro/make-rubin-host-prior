@@ -28,6 +28,7 @@ from rubin_host_prior.data import (
     ShardSet,
     estimate_band_softening,
     expected_sky_scatter,
+    pool_shards,
     context_advice,
     suggest_sigma_range,
 )
@@ -55,10 +56,13 @@ def main() -> None:
     config.patch.nominal_crop = args.out_size * args.pool_factor
     config.patch.native_size = max(shards.native_size, config.patch.nominal_crop)
     config.transform.softening_sigma = args.softening_sigma
+    # Measured from pooled patches, not derived from the variance plane:
+    # coadd pixel noise is correlated, so pooling reduces it by less than
+    # pool_factor and the derived value would be badly low.
+    pooled, pooled_bands = pool_shards(shards, config, n=args.n_stats)
     config.transform.band_softening = estimate_band_softening(
-        shards.load("variance"),
-        shards.meta["band_idx"],
-        pool_factor=args.pool_factor,
+        pooled,
+        pooled_bands,
         softening_sigma=args.softening_sigma,
         bands=shards.bands,
     )

@@ -3,7 +3,7 @@
 A fully convolutional, energy-based diffusion prior over static scenes in the
 vicinity of a host galaxy, trained on Rubin DP1 image patches. Intended as the
 prior term in a forward model that extracts a point-source transient light curve
-from LSST visit images.
+from LSST visit images. The prior itself is trained on `deep_coadd` images.
 
 The score is the exact gradient of a scalar energy, so it is a conservative
 field — a genuine score, not a network that approximates one.
@@ -40,12 +40,13 @@ python -m pytest            # ~2 min, no cluster, no LSST stack
 ### 1. Extract patches (on NERSC, inside the stack)
 
 ```bash
-python scripts/extract_dp1_patches.py --out data/ecdfs --bands r i --n-hosts 500 -v
+python scripts/extract_dp1_patches.py --out data/ecdfs --bands r i --n-hosts 2000 -v
 ```
 
 Selects extended objects from the per-tract `object` table, finds covering
-`visit_image`s, cuts a **jittered** stamp near each host, runs the artefact gate,
-and writes sharded HDF5 plus a manifest.
+`deep_coadd` patches, cuts a **jittered** stamp near each host, runs the artefact
+gate, and writes sharded HDF5 plus a manifest. A host yields at most one patch
+per band, so `--n-hosts` sets the training-set size fairly directly.
 
 Read `data/ecdfs/summary.json` before trusting the output. It carries
 `rejection_counts`, and those statistics are the only way to see whether the
@@ -369,54 +370,41 @@ No added noise, no added blur, and none is offered.
 
 ### The artefact gate
 
-Three DP1 facts drive it:
+Training on `deep_coadd` rather than visit images removes most of what a gate
+would otherwise have to catch: chip edges, cosmic rays and per-exposure
+electronic artefacts are rejected during coaddition. What remains is
+coadd-specific:
 
-1. **Half the mask planes are never set in `visit_image`** (`STREAK`, `NO_DATA`,
-   `UNMASKEDNAN`, `VIGNETTED`, `SENSOR_EDGE`, `CLIPPED`, `REJECTED`,
-   `DETECTED_NEGATIVE`, `INEXACT_PSF`). A gate built on them passes everything, so
-   pixel finiteness and variance positivity are tested directly, and satellite
-   trails come from the matching `difference_image` mask (`StreakCache`) rather
-   than from the visit image's own STREAK plane.
-2. **Several artefacts have no mask plane at all** — stray light, ghosts, amp
-   jumps, fringing, tree rings, crosshatch, and the dangerous ones here, *dark
-   edge* and *dark halo*: background **over-subtraction**. Those put a smooth
-   negative bowl into exactly the low-surface-brightness regime this project
-   cares about, and a prior trained on them learns that galaxies sit in negative
-   bowls.
-3. **Tolerances for a generative model differ from tolerances for photometry.**
-   The published DP1 table says "retain" for `CR` and `INTRP` because an
-   interpolated pixel barely perturbs a flux. Here the model is learning a
-   distribution over pixel values, and an interpolated pixel is a smooth
-   synthetic patch teaching structure that is not in the sky. `CR` and `INTRP`
-   are tighter than the documentation suggests; every fraction is recorded in the
-   manifest so they can be loosened later without re-reading pixels.
+- **`NO_DATA` matters here and did not before.** A coadd patch has regions with
+  no contributing exposures — corners, gaps, the footprint edge — and those
+  pixels are not sky, they are nothing. Zero tolerance.
+- **`CLIPPED` and `REJECTED`** mark pixels where outlier rejection fired during
+  coaddition. A little is normal; a lot means the stack disagreed with itself.
+- **`INEXACT_PSF`** marks where the coadd PSF model is approximate, which matters
+  for a project whose forward model needs the PSF.
 
-`background_floor` locates the sky floor as a low percentile per block of a
-coarse grid, corrected for the percentile's own Gaussian offset. Two choices
-matter:
+Several planes are never set in `deep_coadd` — `BAD`, `CROSSTALK`,
+`DETECTED_NEGATIVE`, `ITL_DIP`, `NOT_DEBLENDED`, `STREAK`, `UNMASKEDNAN`,
+`VIGNETTED` — so gating on them would do nothing. They are left out rather than
+listed for show. `plane_bitmask` ignores names absent from the mask's own
+dictionary, so the gate degrades safely if a release starts or stops setting one.
 
-- **A percentile, not a fitted surface.** A quadratic fit to a patch containing a
-  bright galaxy absorbs the galaxy and then extrapolates strongly negative
-  towards the corners, reporting a bowl that is not there. A low percentile is
-  blind to positive sources by construction.
-- **One-sided.** A *depressed* floor is over-subtraction; a *raised* one is
-  starlight. Gating on the magnitude would discard the brightest hosts.
-
-**By default it records but does not reject** (`max_depression=None`). The data
-is taken as-is, background-subtraction artefacts included, and the prior is
-allowed to learn them — the right call when the artefacts are a property of the
-current processing that a later release will improve, since you retrain rather
-than filter. Pass `--max-depression 0.3` to reject instead. Keeping them costs
-nothing in the transform: softplus softening has no floor, so however deep a
-region goes it stays representable.
-
-Tested against bright galaxies, faint galaxies, edge galaxies, galaxies filling
-the whole stamp (all accepted) and 6σ bowls, 1σ bowls, gradients and uniform
-offsets (all rejected). Blank-sky noise floor stays inside ±0.25, against a
-threshold of 0.3.
+Tolerances for `CR` and `INTRP` are tighter than the DP1 documentation
+recommends, deliberately. That table is written for *measurement*, where an
+interpolated pixel barely perturbs a flux. Here the model is learning a
+distribution over pixel values, and an interpolated pixel is a smooth synthetic
+patch teaching structure that is not in the sky. Every fraction is recorded in
+the manifest, so they can be loosened later without re-reading pixels.
 
 `DETECTED` is never a rejection reason — gating on it would throw away every
 patch containing a galaxy — and `gate` raises if you try.
+
+**There is no background check.** DP1's background subtraction leaves dark
+haloes and dark edges around bright sources, and the data is taken as-is with
+those included: they are a property of the current processing that a later
+release will improve, so the prior learns them and you retrain rather than
+filter. The softplus transform carries arbitrarily negative pixels without a
+floor, so keeping them costs nothing.
 
 ### Storage
 
@@ -437,43 +425,35 @@ native stamps.
 ## Porting to NERSC: what to verify
 
 The model, loss, loader and gate are all tested locally. The Butler layer is not,
-and these specific items are flagged `WARN` in `rubin/extract.py`:
+and these items are flagged `WARN` in `rubin/extract.py`:
 
 - [ ] **Repo alias.** `"dp1"` is the RSP label. Check `Butler.get_known_repos()`
       or `$DAF_BUTLER_REPOSITORY_INDEX`; pass a path if it differs. Never open the
       shared mirror writeable.
-- [ ] **Component names.** `visit_image.wcs` is the verified idiom;
-      `visit_image.bbox` follows the same pattern but is unconfirmed. The
+- [ ] **Component names.** `deep_coadd.wcs` follows the verified DP1 idiom;
+      `deep_coadd.bbox` follows the same pattern but is unconfirmed. The
       containment pre-check degrades to "unknown" rather than failing, and the
       stamp shape is checked after the read regardless, so a clipped stamp is
       rejected rather than padded.
-- [ ] **`_mjd` accessor chain.** `stamp.visitInfo.date.toAstropy().mjd` is
-      unverified; falls back to the long form, then to NaN.
 - [ ] **`detect_isPrimary`.** Standard in LSST object tables but absent from the
       DP1 tutorials. Requested, with a fall back to deduplicating on `objectId`.
       Without one of the two, tract-overlap regions are silently oversampled.
-- [ ] **`difference_image.mask` component read** for the streak verdict. Falls
-      back to NaN (no rejection) where it fails or no difference image exists.
+- [ ] **`order_by=["band.name"]`** on the coadd query — `band.name` rather than
+      `band` is the verified spelling for *where* clauses; the `order_by` form is
+      assumed to match.
 - [ ] Confirm `BUNIT`, but do not trust it — the header once reported `'adu'` for
       nJy pixels (DM-51270). Pixels are nJy either way.
 
 ## Open questions and known gaps
 
-- **Visit images vs coadds.** `--dataset-type` accepts both. Visit images are
-  closest to the data you will eventually analyse and, being unwarped, have
-  near-independent pixel noise — which matters, since `estimate_band_softening`
-  assumes pooling divides the noise by `pool_factor`. On a coadd, warping
-  correlates neighbouring pixels and pooling reduces noise by less, so that
-  estimate would be optimistic. The cosmic-ray question is empirical: extract a
-  few thousand of each and compare `rejection_counts`.
-- **Visit-level cuts not implemented.** Seeing, zeropoint, sky background and
-  PSF-star count per (visit, detector) would remove whole swathes before any
-  pixel is read. The DP1 column names for `visit_summary` were not verifiable
-  from the material available, and guessing them would be worse than omitting
-  them. Build it as a parquet table once and join it in.
-- **Satellite trails rely on Rubin's own detection.** A Radon/Hough pass per
-  (visit, detector) would catch the faint trails that escaped masking — which are
-  precisely the ones that would teach the model to generate straight lines.
+- **Coadd noise is correlated, and that is handled by measurement.** Warping
+  onto the skymap grid makes neighbouring pixels share flux, so averaging `P²`
+  pixels reduces the noise by *less* than `P`. `measure_pooled_sky_noise` reads
+  the pooled patches directly rather than deriving the value from the variance
+  plane — at a realistic 0.8 px correlation width the derived value is **50%
+  low**, which would put the transform's turnover in the wrong place. Worth
+  checking the measured softening scales against the variance planes on real
+  data to see how large the real effect is.
 - **Correlation length on real data is the open empirical question.** Everything
   about how much context the model needs follows from it, and the synthetic
   generator only crudely imitates the real host size distribution.

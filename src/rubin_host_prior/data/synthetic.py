@@ -61,17 +61,17 @@ def synthetic_patch(
     psf_size: int = 25,
     sky_noise: float = 12.0,
     psf_sigma: float | None = None,
-    dark_halo_sigma: float = 0.0,
+    noise_correlation: float = 0.8,
 ) -> dict:
     """One background-subtracted patch in nJy, with its variance, mask and PSF.
 
-    ``dark_halo_sigma`` adds a smooth negative bowl of that depth, in units of
-    the *native* sky noise, imitating DP1 background over-subtraction around a
-    bright source.  Worth exercising because it is the deep-negative regime: a
-    smooth offset does not average down under pooling while the noise does, so a
-    bowl ``D`` sigma deep natively is ``D * pool_factor`` sigma deep in the
-    pooled data.  The softplus transform carries it through without a floor,
-    mapping it to a correspondingly negative ``x``.
+    ``noise_correlation`` is the Gaussian width, in pixels, of the correlation
+    imposed on the pixel noise -- coadds are built by warping input exposures
+    onto the skymap grid, which makes neighbouring pixels share flux.  The
+    per-pixel variance still matches the variance plane; only the correlation
+    between pixels changes.  This matters because it breaks the assumption that
+    averaging ``P**2`` pixels divides the noise by ``P``: it divides it by less.
+    Set 0 for uncorrelated noise.
     """
     psf_sigma = psf_sigma if psf_sigma is not None else float(rng.uniform(1.4, 2.4))
     psf = _gaussian_psf(psf_size, psf_sigma)
@@ -108,11 +108,12 @@ def synthetic_patch(
 
     image = _convolve(truth, psf)
     variance = sky_noise**2 + np.maximum(image, 0.0)  # sky + shot noise
-    if dark_halo_sigma:
-        yy, xx = np.mgrid[0:size, 0:size].astype(np.float64)
-        rr = ((xx - cx) ** 2 + (yy - cy) ** 2) / (size / 2.0) ** 2
-        image = image - dark_halo_sigma * sky_noise * np.exp(-rr)
-    image = image + rng.normal(0.0, np.sqrt(variance))
+    noise = rng.normal(0.0, 1.0, (size, size))
+    if noise_correlation > 0:
+        k = _gaussian_psf(min(size, 4 * int(noise_correlation) + 5), noise_correlation)
+        noise = _convolve(noise, k)
+        noise /= noise.std()  # keep per-pixel variance; change only correlation
+    image = image + noise * np.sqrt(variance)
     mask = np.zeros((size, size), dtype=np.uint32)
     mask[image > 5 * sky_noise] |= 1 << MASK_PLANES["DETECTED"]
     return {
@@ -132,7 +133,7 @@ def write_synthetic_shards(
     psf_size: int = 25,
     patches_per_shard: int = 128,
     sky_noise_by_band: dict[str, float] | None = None,
-    dark_halo_sigma: float = 0.0,
+    noise_correlation: float = 0.8,
     seed: int = 0,
 ) -> list[Path]:
     """Write shards that look like the real thing to the loader."""
@@ -148,15 +149,16 @@ def write_synthetic_shards(
         mask_plane_dict=MASK_PLANES,
         prefix="synthetic",
         patches_per_shard=patches_per_shard,
-        dataset_type="synthetic",
-        attrs={"synthetic": 1, "sky_noise_by_band": noise},
+        dataset_type="deep_coadd",
+        attrs={"synthetic": 1, "sky_noise_by_band": noise,
+               "correlated_noise": int(noise_correlation > 0)},
     ) as w:
         for i in range(n_patches):
             band_idx = int(rng.integers(len(BANDS)))
             band = BANDS[band_idx]
             p = synthetic_patch(
                 rng, size=native_size, psf_size=psf_size, sky_noise=noise[band],
-                dark_halo_sigma=dark_halo_sigma,
+                noise_correlation=noise_correlation,
             )
             w.add(
                 p["image"],
@@ -165,20 +167,19 @@ def write_synthetic_shards(
                 p["psf"],
                 meta={
                     "band_idx": band_idx,
-                    "visit": 2024110800000 + i,
-                    "detector": int(rng.integers(9)),
                     "x0": 0,
                     "y0": 0,
                     "center_x": p["center"][0],
                     "center_y": p["center"][1],
                     "ra": 53.13 + float(rng.normal(0, 0.1)),
                     "dec": -28.10 + float(rng.normal(0, 0.1)),
-                    "mjd": 60600.0 + float(rng.uniform(0, 60)),
                     "psf_sigma": p["psf_sigma"],
                     "pixel_scale": 0.2003,
                     "sky_noise": noise[band],
                     "host_id": i,
                     "host_offset_arcsec": float(rng.uniform(0, 3)),
+                    "tract": 5063,
+                    "patch": int(rng.integers(100)),
                 },
             )
         return w.paths

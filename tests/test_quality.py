@@ -11,7 +11,6 @@ import pytest
 from rubin_host_prior.rubin.quality import (
     FRAC_TOL,
     NEVER_REJECT,
-    background_floor,
     gate,
     plane_bitmask,
     plane_fraction,
@@ -19,6 +18,10 @@ from rubin_host_prior.rubin.quality import (
 )
 
 # The DP1 r29.2.0 bit assignments.
+#: DP1 r29.2.0 bit assignments.  Several of these are never set in deep_coadd
+#: (BAD, CROSSTALK, DETECTED_NEGATIVE, ITL_DIP, NOT_DEBLENDED, STREAK,
+#: SUSPECT, UNMASKEDNAN, VIGNETTED) -- kept in the dictionary so the tests can
+#: check that gating on an unpopulated plane is a no-op rather than an error.
 PLANES = {
     "BAD": 0, "SAT": 1, "INTRP": 2, "CR": 3, "EDGE": 4, "DETECTED": 5,
     "DETECTED_NEGATIVE": 6, "SUSPECT": 7, "NO_DATA": 8, "VIGNETTED": 9,
@@ -50,8 +53,8 @@ def test_plane_bitmask_ignores_absent_planes():
 
 
 def test_plane_fraction_of_absent_plane_is_zero():
-    """DP1 never sets STREAK in visit_image; a gate on it must not silently
-    pass everything by erroring or by NaN."""
+    """DP1 never sets STREAK in deep_coadd; a gate naming it must not error or
+    return NaN, it must simply contribute nothing."""
     mask = np.zeros((4, 4), np.uint32)
     assert plane_fraction(mask, {"BAD": 0}, "STREAK") == 0.0
 
@@ -113,60 +116,6 @@ OVER_SUBTRACTION = [
     ("uniform over-subtraction", -1.0 * SKY),
 ]
 
-
-@pytest.mark.parametrize("label,extra", OVER_SUBTRACTION)
-def test_over_subtraction_is_measured_but_kept_by_default(label, extra):
-    """Default is to take the data as-is.
-
-    These artefacts have no mask plane in DP1 at all, and they matter: a smooth
-    negative bowl sits in exactly the low-surface-brightness regime this project
-    models. But they are a property of the current processing that a later data
-    release will improve, so the default records them and lets the prior learn
-    them rather than filtering them out. The diagnostic is still written for
-    every patch, so the decision can be revisited from the manifest without
-    re-reading pixels.
-    """
-    reasons, diag = _gate(_scene(extra))
-    assert reasons == [], f"{label} should be kept by default; got {reasons}"
-    assert diag["min_block"] < -0.3, f"{label} should still be measured as depressed"
-
-
-@pytest.mark.parametrize("label,extra", OVER_SUBTRACTION)
-def test_over_subtraction_is_rejected_when_asked(label, extra):
-    reasons, _ = _gate(_scene(extra), max_depression=0.3)
-    assert any("background_depression" in r for r in reasons), (
-        f"{label} was accepted with max_depression=0.3; reasons={reasons}"
-    )
-
-
-def test_depth_of_over_subtraction_is_recorded_for_later_use():
-    """Pooling divides the noise by pool_factor but leaves a smooth offset
-    untouched, so a depressed region is pool_factor times deeper relative to the
-    noise once pooled.  The log transform carries it through regardless --
-    softplus softening has no floor -- but the depth is worth recording so the
-    decision to keep these patches can be revisited from the manifest.
-    """
-    _, diag = _gate(_scene(-1.0 * SKY * (1 - R2)))
-    assert diag["min_block"] < -0.5
-    assert 3 * abs(diag["min_block"]) > 2.0  # pool_factor = 3
-
-
-def test_blank_sky_noise_floor_leaves_headroom():
-    """The min_block statistic must not drift close to the threshold on pure
-    noise, or the gate rejects good patches at random."""
-    floors = [
-        background_floor(_scene(seed=s), SKY)["min_block"] for s in range(20)
-    ]
-    assert max(np.abs(floors)) < 0.25, f"worst blank-sky min_block {max(floors)}"
-
-
-def test_positive_excursions_are_never_rejected_as_background():
-    """One-sidedness, stated directly: a raised sky floor is starlight."""
-    d = background_floor(_scene(2000 * np.exp(-R2 * 4)), SKY)
-    assert d["min_block"] > -0.3
-    assert d["max_block"] > 10
-
-
 # -- mask-plane tolerances -------------------------------------------------
 
 
@@ -177,8 +126,10 @@ def test_a_single_saturated_pixel_rejects():
     assert any(r.startswith("SAT") for r in _gate(_scene(), mask)[0])
 
 
-def test_any_edge_or_itl_dip_pixel_rejects():
-    for plane in ("EDGE", "ITL_DIP", "SENSOR_EDGE"):
+def test_any_no_data_or_edge_pixel_rejects():
+    """NO_DATA is the coadd-specific one: those pixels had no contributing
+    exposures, so they are not sky, they are nothing."""
+    for plane in ("NO_DATA", "EDGE", "SENSOR_EDGE"):
         mask = np.zeros((SIZE, SIZE), np.uint32)
         mask[0, 0] |= 1 << PLANES[plane]
         reasons = _gate(_scene(), mask)[0]
@@ -213,10 +164,10 @@ def test_diagnostics_are_returned_for_rejected_patches_too():
     function, so they must be recorded even when the patch is thrown away."""
     mask = np.zeros((SIZE, SIZE), np.uint32)
     mask[10, 10] |= 1 << PLANES["SAT"]
-    reasons, diag = _gate(_scene(-6 * SKY * (1 - R2)), mask)
+    reasons, diag = _gate(_scene(), mask)
     assert reasons
     assert diag["frac_SAT"] > 0
-    assert np.isfinite(diag["min_block"])
+    assert diag["inner_frac_CR"] == 0.0
     assert diag["sky_noise"] == pytest.approx(SKY, rel=1e-6)
 
 
@@ -236,11 +187,22 @@ def test_tolerances_are_configurable():
     assert _gate(_scene(), small)[0] == []
 
 
-def test_background_floor_degrades_rather_than_crashing():
-    """Almost everything masked: return NaN and do not reject on this basis."""
-    img = _scene()
-    mask = np.full((SIZE, SIZE), 1 << PLANES["BAD"], np.uint32)
-    d = background_floor(img, SKY, mask, PLANES)
-    assert np.isnan(d["min_block"])
-    reasons, diag = _gate(img, mask)
-    assert not any("background" in r for r in reasons)
+def test_gating_on_an_unpopulated_plane_is_a_no_op():
+    """deep_coadd never sets BAD, SUSPECT, ITL_DIP and several others. A gate
+    naming one must neither error nor silently pass everything else."""
+    coadd_planes = {k: v for k, v in PLANES.items()
+                    if k not in ("BAD", "SUSPECT", "ITL_DIP", "CROSSTALK")}
+    mask = np.zeros((SIZE, SIZE), np.uint32)
+    reasons, diag = gate(_scene(), np.full((SIZE, SIZE), SKY**2), mask,
+                         coadd_planes, frac_tol={"BAD": 0.0, "CR": 0.005})
+    assert reasons == []
+    assert diag["frac_BAD"] == 0.0
+
+
+def test_coadd_specific_planes_are_gated():
+    """CLIPPED and REJECTED mark where outlier rejection fired during
+    coaddition; a little is normal, a lot means the stack disagreed with itself."""
+    for plane in ("CLIPPED", "REJECTED"):
+        mask = np.zeros((SIZE, SIZE), np.uint32)
+        mask[:40, :40] |= 1 << PLANES[plane]  # 4.3% of the patch
+        assert any(r.startswith(plane) for r in _gate(_scene(), mask)[0]), plane

@@ -1,25 +1,31 @@
 """Artefact rejection for candidate patches.  Pure numpy -- no LSST stack.
 
-Two things about DP1 make the obvious approach fail.
+Tuned for ``deep_coadd``, which is what this project trains on.  Coadds already
+handle most of what made visit images awkward: chip edges, cosmic rays and other
+per-exposure electronic artefacts are rejected during coaddition rather than
+left for a downstream gate to find.
 
-**Half the mask planes are never set in ``visit_image``**: ``CLIPPED``,
-``DETECTED_NEGATIVE``, ``INEXACT_PSF``, ``NO_DATA``, ``REJECTED``,
-``SENSOR_EDGE``, ``STREAK``, ``UNMASKEDNAN``, ``VIGNETTED``.  A gate built on
-them silently passes everything, so ``gate`` tests pixel finiteness and variance
-positivity directly, and satellite trails have to come from the matching
-``difference_image`` mask (see ``extract.StreakCache``) or from your own
-detection.
+What remains is specific to coadds:
 
-**Several artefacts have no mask plane at all**: stray light, ghosts, amplifier
-jumps, fringing, tree rings, crosshatch, and -- the dangerous ones here --
-*dark edge* and *dark halo*, which are background **over-subtraction**.  Those
-put a smooth negative bowl into exactly the low-surface-brightness regime this
-project cares about, and a prior trained on them learns that galaxies sit in
-negative bowls.  ``background_floor`` exists to catch them.
+* **``NO_DATA`` matters here and did not before.**  A coadd patch has regions
+  with no contributing exposures -- corners, gaps, the edge of the survey
+  footprint -- and those pixels are not sky, they are nothing.
+* **``CLIPPED`` and ``REJECTED``** mark pixels where outlier rejection fired
+  during coaddition.  A little is normal; a lot means the stack disagreed with
+  itself there.
+* **``INEXACT_PSF``** marks where the coadd PSF model is approximate.  That
+  matters for a project whose forward model needs the PSF.
+
+Several planes are never set in ``deep_coadd`` -- ``BAD``, ``CROSSTALK``,
+``DETECTED_NEGATIVE``, ``ITL_DIP``, ``NOT_DEBLENDED``, ``STREAK``,
+``UNMASKEDNAN``, ``VIGNETTED`` -- so gating on them would do nothing.  They are
+left out rather than listed for show.  ``plane_bitmask`` ignores names that are
+absent from the mask's own dictionary, so the gate degrades safely if a later
+release starts or stops setting one.
 
 Tolerances differ from the DP1 documentation's recommendations on purpose.  The
-published table is written for *measurement*, where an interpolated cosmic ray
-is harmless because it barely perturbs a flux.  Here the model is learning a
+published table is written for *measurement*, where an interpolated pixel is
+harmless because it barely perturbs a flux.  Here the model is learning a
 distribution over pixel values, and an interpolated pixel is a smooth synthetic
 patch that teaches the model structure that is not in the sky.  ``CR`` and
 ``INTRP`` are therefore tighter than the documentation suggests.  All fractions
@@ -31,29 +37,27 @@ from __future__ import annotations
 
 import numpy as np
 
-#: Any pixel set in these planes disqualifies the patch.  ``SENSOR_EDGE`` is
-#: listed defensively -- DP1 never sets it in ``visit_image``, so it costs
-#: nothing here, but it should not be *relied* on (hence ``EDGE`` alongside).
-ZERO_TOL: tuple[str, ...] = ("EDGE", "ITL_DIP", "SENSOR_EDGE")
+#: Any pixel set in these planes disqualifies the patch.  ``NO_DATA`` is the
+#: important one for coadds: those pixels had no contributing exposures.
+ZERO_TOL: tuple[str, ...] = ("NO_DATA", "EDGE", "SENSOR_EDGE")
 
 #: Maximum allowed fraction of the patch, per plane.  Stricter than the DP1
 #: measurement recommendations for CR/INTRP -- see the module docstring.
 FRAC_TOL: dict[str, float] = {
     "SAT": 0.0,  # saturation bleeds; the DP1 docs say exclude outright
-    "BAD": 0.005,
-    "SUSPECT": 0.005,
-    "CR": 0.005,  # docs say "retain"; too generous for a generative model
-    "INTRP": 0.02,  # docs say "retain"; likewise
-    "CROSSTALK": 0.02,
+    "CR": 0.005,  # mostly rejected during coaddition, so this is a safety net
+    "INTRP": 0.02,  # smooth synthetic fill; bad for a generative model
+    "CLIPPED": 0.02,  # outlier rejection fired during coaddition
+    "REJECTED": 0.02,
+    "INEXACT_PSF": 0.05,  # the forward model needs a trustworthy PSF
 }
 
 #: Same planes, applied to the central region, where structure matters most.
 INNER_FRAC_TOL: dict[str, float] = {
     "SAT": 0.0,
-    "BAD": 0.0,
-    "SUSPECT": 0.0,
     "CR": 0.0,
     "INTRP": 0.0,
+    "CLIPPED": 0.0,
 }
 
 #: Never gate on this: it marks real sources, and rejecting on it throws away
@@ -85,91 +89,6 @@ def plane_fractions(mask: np.ndarray, plane_dict: dict[str, int]) -> dict[str, f
     return {name: plane_fraction(mask, plane_dict, name) for name in plane_dict}
 
 
-def _norm_ppf(q: float) -> float:
-    """Inverse standard normal CDF by bisection; avoids a scipy dependency."""
-    from math import erf, sqrt
-
-    lo, hi = -8.0, 8.0
-    for _ in range(100):
-        mid = 0.5 * (lo + hi)
-        if 0.5 * (1.0 + erf(mid / sqrt(2.0))) < q:
-            lo = mid
-        else:
-            hi = mid
-    return 0.5 * (lo + hi)
-
-
-def background_floor(
-    image: np.ndarray,
-    sky_noise: float,
-    mask: np.ndarray | None = None,
-    plane_dict: dict[str, int] | None = None,
-    n_blocks: int = 8,
-    percentile: float = 25.0,
-) -> dict[str, float]:
-    """Locate the sky *floor*, globally and per block, in units of the sky noise.
-
-    ``visit_image`` is background-subtracted, so the true smooth background is
-    zero everywhere.  Anything significantly **below** zero is over-subtraction:
-    dark edge, or the dark halo around a bright star.  Those matter more here
-    than in most analyses, because they deposit a smooth negative bowl into
-    exactly the low-surface-brightness regime the model is meant to represent,
-    and a prior trained on them learns that galaxies sit in negative bowls.
-
-    The estimator is a low percentile per block of a coarse grid, corrected for
-    the percentile's own offset under Gaussian noise so that blank sky reads
-    zero.  Deliberately **not** a fitted surface: a quadratic fit to a patch
-    containing a bright galaxy absorbs the galaxy and then extrapolates strongly
-    negative towards the corners, reporting a bowl that is not there --
-    rejecting precisely the bright, dense hosts this project exists to model.
-    A low percentile is blind to positive sources by construction and still
-    tracks a real depression.
-
-    ``min_block`` is the number to gate on.  Its noise floor is roughly
-    ``-2.5 * sqrt(q(1-q)/n_pix_per_block) / phi(z_q)`` sky-noise units (about
-    -0.15 for the defaults), so a threshold near -0.3 has headroom.
-    """
-    image = np.asarray(image, dtype=np.float64)
-    h, w = image.shape
-    good = np.isfinite(image)
-    if mask is not None and plane_dict is not None:
-        bit = plane_bitmask(plane_dict, ("SAT", "BAD", "EDGE", "INTRP"))
-        if bit:
-            good &= (mask & bit) == 0
-
-    offset = _norm_ppf(percentile / 100.0) * sky_noise
-    nan = {
-        "sky_floor": np.nan,
-        "min_block": np.nan,
-        "max_block": np.nan,
-        "n_background_blocks": 0,
-    }
-    if good.sum() < 64 or not np.isfinite(sky_noise) or sky_noise <= 0:
-        return nan
-
-    nb = max(int(n_blocks), 2)
-    bh, bw = max(h // nb, 1), max(w // nb, 1)
-    min_pix = max(bh * bw // 4, 16)
-    blocks = []
-    for by in range(0, h - bh + 1, bh):
-        for bx in range(0, w - bw + 1, bw):
-            sel = good[by : by + bh, bx : bx + bw]
-            if sel.sum() < min_pix:
-                continue
-            block = image[by : by + bh, bx : bx + bw][sel]
-            blocks.append((np.percentile(block, percentile) - offset) / sky_noise)
-    if len(blocks) < 8:
-        return nan
-    return {
-        "sky_floor": float(
-            (np.percentile(image[good], percentile) - offset) / sky_noise
-        ),
-        "min_block": float(np.min(blocks)),
-        "max_block": float(np.max(blocks)),
-        "n_background_blocks": len(blocks),
-    }
-
-
 def gate(
     image: np.ndarray,
     variance: np.ndarray,
@@ -180,7 +99,6 @@ def gate(
     zero_tol: tuple[str, ...] = ZERO_TOL,
     frac_tol: dict[str, float] | None = None,
     inner_frac_tol: dict[str, float] | None = None,
-    max_depression: float | None = None,
 ) -> tuple[list[str], dict[str, float]]:
     """Return ``(rejection_reasons, diagnostics)``.  Empty reasons means accept.
 
@@ -231,29 +149,5 @@ def gate(
         diag[f"inner_frac_{plane}"] = f
         if f > tol:
             reasons.append(f"inner_{plane}:{f:.4f}>{tol}")
-
-    if np.isfinite(sky_noise) and sky_noise > 0 and np.all(np.isfinite(image)):
-        bg = background_floor(image, sky_noise, mask, plane_dict)
-        diag.update(bg)
-        # ``max_depression=None`` (the default) measures the sky floor and
-        # records it without rejecting anything: the data is taken as-is,
-        # background-subtraction artefacts included, and the prior is allowed to
-        # learn them.  That is the right default when the artefacts are a
-        # property of the current processing that a later data release will
-        # improve -- you retrain rather than filter.
-        #
-        # Set a number to reject on it.  One-sided on purpose: a depressed sky
-        # floor is over-subtraction, a raised one is starlight, and gating on
-        # the magnitude would discard the brightest hosts.  Keeping depressed
-        # regions costs nothing in the log transform: softplus softening has
-        # no floor, so however negative a pixel goes it stays representable.
-        if (
-            max_depression is not None
-            and np.isfinite(bg["min_block"])
-            and bg["min_block"] < -max_depression
-        ):
-            reasons.append(
-                f"background_depression:{bg['min_block']:.2f}<-{max_depression}"
-            )
 
     return reasons, diag

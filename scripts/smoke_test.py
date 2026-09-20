@@ -27,6 +27,7 @@ from rubin_host_prior.data import (
     ShardSet,
     estimate_band_softening,
     expected_sky_scatter,
+    pool_shards,
     context_advice,
     suggest_sigma_range,
 )
@@ -78,9 +79,9 @@ def main() -> None:
     config.train.batch_size = args.batch_size
     config.train.log_every = max(args.steps // 10, 1)
     config.train.ckpt_every = 0
+    pooled, pooled_bands = pool_shards(shards, config)
     config.transform.band_softening = estimate_band_softening(
-        shards.load("variance"), shards.meta["band_idx"], 3,
-        config.transform.softening_sigma,
+        pooled, pooled_bands, config.transform.softening_sigma
     )
     transform = LogFluxTransform.from_config(config.transform)
     dataset = PatchDataset.from_shards(shards, config, transform)

@@ -1,12 +1,18 @@
 #!/usr/bin/env python
-"""Extract a patch training set from DP1.  Runs on NERSC, inside the LSST stack.
+"""Extract a ``deep_coadd`` patch training set from DP1.
 
-    python scripts/extract_dp1_patches.py --out data/ecdfs_r --bands r --n-hosts 500
+Runs on NERSC, inside the LSST stack.
+
+    python scripts/extract_dp1_patches.py --out data/ecdfs --bands r i --n-hosts 2000
 
 Writes ``<out>/shards/*.h5``, ``<out>/manifest.parquet``, ``<out>/summary.json``.
 Read the rejection counts in the summary before trusting the set: if bright
 dense centres are being rejected, the training set is biased against the regime
 this project cares about and the gate needs loosening.
+
+Coadds give at most one patch per band per host, so ``--n-hosts`` sets the
+training-set size fairly directly: expect roughly ``n_hosts * len(bands)``
+patches before rejections.
 """
 
 from __future__ import annotations
@@ -27,13 +33,6 @@ def main() -> None:
     p.add_argument("--dec", type=float, default=ECDFS[1])
     p.add_argument("--bands", nargs="+", default=["u", "g", "r", "i", "z", "y"])
     p.add_argument(
-        "--dataset-type",
-        default="visit_image",
-        choices=["visit_image", "deep_coadd"],
-        help="visit_image is closest to the data you will eventually analyse; "
-        "deep_coadd is cleaner but has correlated noise from warping",
-    )
-    p.add_argument(
         "--native-size",
         type=int,
         default=416,
@@ -43,21 +42,10 @@ def main() -> None:
         "translation augmentation",
     )
     p.add_argument("--psf-size", type=int, default=41)
-    p.add_argument("--n-hosts", type=int, default=2000)
-    p.add_argument("--max-images-per-host", type=int, default=20)
+    p.add_argument("--n-hosts", type=int, default=8000)
     p.add_argument("--jitter-arcsec", type=float, default=4.0)
     p.add_argument("--patches-per-shard", type=int, default=1024)
     p.add_argument("--max-patches", type=int, default=None)
-    p.add_argument("--no-streak-check", action="store_true")
-    p.add_argument(
-        "--max-depression",
-        type=float,
-        default=None,
-        help="reject patches whose block sky floor sits this far below zero, in "
-        "sky-noise units. Default: do not reject, only record -- the data is "
-        "taken as-is and the prior learns the background-subtraction artefacts. "
-        "Set e.g. 0.3 to filter them instead",
-    )
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--verbose", "-v", action="count", default=0)
     args = p.parse_args()
@@ -74,16 +62,12 @@ def main() -> None:
         ra=args.ra,
         dec=args.dec,
         bands=args.bands,
-        dataset_type=args.dataset_type,
         native_size=args.native_size,
         psf_size=args.psf_size,
         n_hosts=args.n_hosts,
-        max_images_per_host=args.max_images_per_host,
         jitter_arcsec=args.jitter_arcsec,
         patches_per_shard=args.patches_per_shard,
         max_patches=args.max_patches,
-        use_difference_streak=not args.no_streak_check,
-        gate_kwargs={"max_depression": args.max_depression},
         seed=args.seed,
     )
     print(json.dumps(summary, indent=2, default=str))

@@ -1,28 +1,39 @@
-"""Build a patch training set from the DP1 repo.
+"""Build a patch training set from DP1 ``deep_coadd`` images.
 
 Plain Python against the Butler as a data-access layer -- no ``pipetask``, no
 BPS.  Import-safe without the LSST stack: everything stack-specific is imported
 lazily by ``_lsst()``, so the rest of the package (and the test suite) works on a
 laptop.
 
-DP1 specifics that this file depends on, and that are easy to get wrong:
+**Coadds, not visit images.**  Coaddition has already dealt with chip edges,
+cosmic rays and per-exposure electronic artefacts, which removes most of what a
+downstream quality gate would otherwise have to catch.  Two things follow that
+are easy to forget:
 
-* Dataset types are ``visit_image`` / ``deep_coadd``, not ``calexp`` /
-  ``deepCoadd``.  Queries go through ``butler.query_datasets``.
-* Band constraints are ``band.name = 'r'``, not ``band = 'r'``.
-* **Pixels are already nanojanskys** and variance is nJy^2; ``photoCalib`` is
-  spatially constant with mean 1.0.  No calibration step belongs here.  The
-  header may report ``'adu'`` (DM-51270) -- it lies.
-* Spatial predicates differ by dataset: ``visit_detector_region.region`` for
-  visit/difference images, ``patch.region`` for coadds, ``tract.region`` for the
-  object table.
+* **Coadd pixel noise is correlated.**  Input exposures are warped onto the
+  skymap grid, so neighbouring pixels share flux.  Averaging ``P**2`` pixels
+  therefore reduces the noise by *less* than ``P``, and the pooled sky noise must
+  be measured rather than derived from the variance plane -- see
+  ``data.transform.measure_pooled_sky_noise``.
+* **There are at most one coadd per band per patch.**  Where visit images gave
+  many epochs of the same host, coadds give six at most, so a training set of a
+  given size needs correspondingly more hosts.
+
+DP1 specifics this file depends on, and that are easy to get wrong:
+
+* The dataset type is ``deep_coadd``, not ``deepCoadd``, with dimensions
+  ``{band, skymap, tract, patch}``.  Queries go through ``butler.query_datasets``.
+* The spatial predicate for coadds is ``patch.region OVERLAPS POINT(...)``; the
+  object table uses ``tract.region``.  Band constraints are ``band.name``.
+* **Pixels are already nanojanskys** and variance is nJy^2.  No calibration step
+  belongs here.  The header may report ``'adu'`` (DM-51270) -- it lies.
 * The ``object`` table is per-tract and has >1000 columns; always subset with
   ``parameters={'columns': ...}``.  It has no ``[f]_psfMag`` columns -- those
   exist only in TAP.  Magnitudes: ``m = -2.5*log10(f_nJy) + 31.4``.
 
-Items marked WARN below are not verified against the DP1 tutorials and are
-written defensively.  Check them on the cluster; the code degrades rather than
-crashes if a name is wrong.
+Items marked WARN are not verified against the DP1 tutorials and are written
+defensively.  Check them on the cluster; the code degrades rather than crashes if
+a name is wrong.
 """
 
 from __future__ import annotations
@@ -44,13 +55,9 @@ log = logging.getLogger(__name__)
 
 _STACK: SimpleNamespace | None = None
 
-#: Spatial predicate per dataset type.
-REGION_PREDICATE = {
-    "visit_image": "visit_detector_region.region OVERLAPS POINT(:ra, :dec)",
-    "difference_image": "visit_detector_region.region OVERLAPS POINT(:ra, :dec)",
-    "deep_coadd": "patch.region OVERLAPS POINT(:ra, :dec)",
-    "template_coadd": "patch.region OVERLAPS POINT(:ra, :dec)",
-}
+DATASET_TYPE = "deep_coadd"
+#: Coadds are tiled by patch, so this is the predicate that finds one.
+COADD_REGION = "patch.region OVERLAPS POINT(:ra, :dec)"
 
 #: Minimal column subset of the per-tract ``object`` table.
 OBJECT_COLUMNS = [
@@ -214,77 +221,29 @@ def select_hosts(
 # -- image discovery -------------------------------------------------------
 
 
-def find_image_refs(
+def find_coadd_refs(
     butler,
     ra: float,
     dec: float,
     bands: Sequence[str] = BANDS,
-    dataset_type: str = "visit_image",
     limit: int | None = None,
 ):
-    """Refs for images covering ``(ra, dec)``, time-ordered where meaningful."""
-    if dataset_type not in REGION_PREDICATE:
-        raise ValueError(
-            f"unsupported dataset_type {dataset_type!r}; "
-            f"expected one of {sorted(REGION_PREDICATE)}"
-        )
-    where = REGION_PREDICATE[dataset_type]
-    bind: dict = {"ra": float(ra), "dec": float(dec)}
+    """Refs for the ``deep_coadd`` patches covering ``(ra, dec)``.
+
+    At most one per band, so a host yields at most ``len(bands)`` patches.
+    """
+    where = COADD_REGION
     if bands is not None and len(bands) < len(BANDS):
         where += " AND band.name IN (" + ", ".join(f"'{b}'" for b in bands) + ")"
-    # Ordering in the query, not by sorting visitInfo afterwards.
-    order_by = (
-        ["visit.timespan.begin"] if dataset_type.endswith("_image") else ["band.name"]
-    )
     return list(
         butler.query_datasets(
-            dataset_type, where=where, bind=bind, order_by=order_by, limit=limit
+            DATASET_TYPE,
+            where=where,
+            bind={"ra": float(ra), "dec": float(dec)},
+            order_by=["band.name"],
+            limit=limit,
         )
     )
-
-
-class StreakCache:
-    """Per-(visit, detector) satellite-trail verdict from the difference image.
-
-    The ``visit_image`` ``STREAK`` plane is **not reliably populated in DP1** -- it
-    is set during difference imaging and only propagates back sometimes.  A gate
-    built on the visit image's own STREAK plane silently passes every trail.  The
-    cheap correct route is to read the matching ``difference_image`` mask, which
-    uses Rubin's own detection; the same (visit, detector) dataId works for both.
-
-    Faint trails that escaped masking are exactly the ones that would teach a
-    diffusion model to generate straight lines, so this is worth the extra read.
-    Where no difference image exists the verdict is ``nan`` and the patch is not
-    rejected on this basis.
-    """
-
-    def __init__(self, butler, enabled: bool = True):
-        self.butler = butler
-        self.enabled = enabled
-        self._cache: dict[tuple, float] = {}
-
-    def fraction(self, data_id) -> float:
-        if not self.enabled:
-            return float("nan")
-        key = (data_id.get("visit"), data_id.get("detector"))
-        if key in self._cache:
-            return self._cache[key]
-        value = float("nan")
-        try:
-            mask = self.butler.get(
-                "difference_image.mask",
-                visit=key[0],
-                detector=key[1],
-                instrument=data_id.get("instrument", "LSSTComCam"),
-            )
-            planes = dict(mask.getMaskPlaneDict())
-            if "STREAK" in planes:
-                bit = 1 << int(planes["STREAK"])
-                value = float(np.mean((mask.array & bit) != 0))
-        except Exception as exc:  # no difference image, or component unavailable
-            log.debug("no difference_image mask for %s: %s", key, exc)
-        self._cache[key] = value
-        return value
 
 
 # -- stamps ----------------------------------------------------------------
@@ -303,21 +262,21 @@ def stamp_bbox(wcs, ra: float, dec: float, size: int):
     return geom.Box2I.makeCenteredBox(xy, geom.Extent2I(size, size)), xy
 
 
-def get_component(butler, dataset_type: str, data_id, component: str):
-    """Component read (``'visit_image.wcs'``), which moves no pixels.
+def get_component(butler, data_id, component: str):
+    """Component read (``'deep_coadd.wcs'``), which moves no pixels.
 
     The ``.wcs`` form is the verified DP1 idiom; ``.bbox``/``.psf`` follow the
     same pattern.  WARN: not every component name is confirmed, so callers
     should tolerate failure.
     """
-    return butler.get(f"{dataset_type}.{component}", dataId=data_id)
+    return butler.get(f"{DATASET_TYPE}.{component}", dataId=data_id)
 
 
 def psf_bundle(stamp, xy, psf_size: int) -> dict | None:
-    """PSF image and moments at ``xy``, or ``None`` if the PSF cannot be evaluated.
+    """Coadd PSF image and moments at ``xy``, or ``None`` if it cannot be built.
 
     ``computeImage`` carries the sub-pixel offset of the requested position and
-    raises near detector edges -- caught here, because a patch without a PSF
+    can raise near patch edges -- caught here, because a patch without a PSF
     cannot be forward-modelled later and should be rejected rather than stored
     incomplete.
     """
@@ -337,19 +296,6 @@ def psf_bundle(stamp, xy, psf_size: int) -> dict | None:
         return None
 
 
-def _mjd(stamp) -> float:
-    """Mid-exposure MJD.  WARN: accessor chain not verified; degrades to nan."""
-    for getter in (
-        lambda: stamp.visitInfo.date.toAstropy().mjd,
-        lambda: stamp.getInfo().getVisitInfo().getDate().toAstropy().mjd,
-    ):
-        try:
-            return float(getter())
-        except Exception:
-            continue
-    return float("nan")
-
-
 # -- the driver ------------------------------------------------------------
 
 
@@ -359,18 +305,14 @@ def extract_patches(
     ra: float = ECDFS[0],
     dec: float = ECDFS[1],
     bands: Sequence[str] = BANDS,
-    dataset_type: str = "visit_image",
     native_size: int = 416,
     psf_size: int = 41,
-    n_hosts: int | None = 2000,
-    max_images_per_host: int = 20,
+    n_hosts: int | None = 8000,
     jitter_arcsec: float = 4.0,
     host_flux_range: tuple[float, float] = (360.0, 36000.0),
     max_blendedness: float | None = None,
     patches_per_shard: int = 1024,
     max_patches: int | None = None,
-    use_difference_streak: bool = True,
-    max_streak_fraction: float = 1e-4,
     neighbour_radius_arcsec: float = 30.0,
     gate_kwargs: dict | None = None,
     seed: int = 0,
@@ -378,20 +320,21 @@ def extract_patches(
 ) -> dict:
     """Extract patches near selected hosts and write shards plus a manifest.
 
-    Ordering is deliberate and matters for cost: catalogue selection and the
-    cached streak verdict come before any pixel read, and the bbox containment
-    test comes before the stamp read.
+    Ordering is deliberate and matters for cost: catalogue selection comes before
+    any pixel read, and the bbox containment test before the stamp read.
 
     Positions are **jittered** around each host rather than centred on it.  A
     prior trained on centred galaxies learns that galaxies are always centred,
     which is useless for a transient that can sit anywhere in the scene.
+
+    A host yields at most one patch per band, so ``n_hosts`` sets the training
+    set size much more directly than it did with visit images.
 
     Every attempt is recorded in the manifest, rejections included, with the
     reason and the diagnostics.  Those statistics are the only way to find out
     whether the selection function is biased against bright dense centres -- the
     regime this project exists to model.
     """
-    geom = _lsst().geom
     rng = np.random.default_rng(seed)
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -410,15 +353,13 @@ def extract_patches(
     log.info("selected %d hosts from %d catalogue rows", len(hosts), len(catalogue))
 
     neighbours = _NeighbourIndex(catalogue, bands)
-    streaks = StreakCache(butler, enabled=use_difference_streak)
     records: list[dict] = []
     neighbour_rows: list[dict] = []
-    # Streaming, so xi is measured over every accepted patch rather than a
-    # subsample held in memory.
-    acf = AutocorrelationAccumulator(native_size)
     mask_plane_dict: dict[str, int] | None = None
     writer: ShardWriter | None = None
     n_accepted = 0
+    # Streaming, so xi is measured over every accepted patch at constant memory.
+    acf = AutocorrelationAccumulator(native_size)
 
     host_ra = np.asarray(hosts["coord_ra"], dtype=float)
     host_dec = np.asarray(hosts["coord_dec"], dtype=float)
@@ -426,18 +367,13 @@ def extract_patches(
 
     try:
         for h in range(len(hosts)):
-            refs = find_image_refs(
-                butler, host_ra[h], host_dec[h], bands, dataset_type
-            )
+            refs = find_coadd_refs(butler, host_ra[h], host_dec[h], bands)
             if not refs:
                 records.append(
                     {"host_id": int(host_id[h]), "status": "rejected",
-                     "reasons": "no_images"}
+                     "reasons": "no_coadd"}
                 )
                 continue
-            if len(refs) > max_images_per_host:
-                refs = [refs[i] for i in rng.choice(len(refs), max_images_per_host,
-                                                    replace=False)]
 
             for ref in refs:
                 if max_patches is not None and n_accepted >= max_patches:
@@ -447,19 +383,12 @@ def extract_patches(
                     "host_id": int(host_id[h]),
                     "dataId": json.dumps({k: str(v) for k, v in dict(data_id).items()}),
                     "band": str(data_id.get("band", "?")),
-                    "visit": int(data_id.get("visit", -1)),
-                    "detector": int(data_id.get("detector", -1)),
+                    "tract": int(data_id.get("tract", -1)),
+                    "patch": int(data_id.get("patch", -1)),
                 }
 
-                streak = streaks.fraction(data_id)
-                rec["streak_fraction"] = streak
-                if np.isfinite(streak) and streak > max_streak_fraction:
-                    rec.update(status="rejected", reasons=f"streak:{streak:.5f}")
-                    records.append(rec)
-                    continue
-
                 try:
-                    wcs = get_component(butler, dataset_type, data_id, "wcs")
+                    wcs = get_component(butler, data_id, "wcs")
                 except Exception as exc:
                     rec.update(status="rejected", reasons=f"no_wcs:{exc!r}"[:120])
                     records.append(rec)
@@ -478,7 +407,7 @@ def extract_patches(
 
                 bbox, xy = stamp_bbox(wcs, tgt_ra, tgt_dec, native_size)
                 try:
-                    full = get_component(butler, dataset_type, data_id, "bbox")
+                    full = get_component(butler, data_id, "bbox")
                     contained = full.contains(bbox)
                 except Exception:
                     contained = None  # WARN: component name unconfirmed
@@ -488,7 +417,7 @@ def extract_patches(
                     continue
 
                 try:
-                    handle = butler.getDeferred(dataset_type, dataId=data_id)
+                    handle = butler.getDeferred(DATASET_TYPE, dataId=data_id)
                     stamp = handle.get(parameters={"bbox": bbox})
                 except Exception as exc:
                     rec.update(status="rejected", reasons=f"read_failed:{exc!r}"[:120])
@@ -497,10 +426,8 @@ def extract_patches(
 
                 image = np.asarray(stamp.image.array, dtype=np.float32)
                 if image.shape != (native_size, native_size):
-                    # Silent clipping at the detector edge.  Never pad.
-                    rec.update(
-                        status="rejected", reasons=f"clipped:{image.shape}"
-                    )
+                    # Silent clipping at the patch edge.  Never pad.
+                    rec.update(status="rejected", reasons=f"clipped:{image.shape}")
                     records.append(rec)
                     continue
                 variance = np.asarray(stamp.variance.array, dtype=np.float32)
@@ -531,21 +458,24 @@ def extract_patches(
                         mask_plane_dict=mask_plane_dict,
                         prefix=prefix,
                         patches_per_shard=patches_per_shard,
-                        dataset_type=dataset_type,
+                        dataset_type=DATASET_TYPE,
                         attrs={
                             "field_ra": ra,
                             "field_dec": dec,
                             "bands": json.dumps(list(bands)),
                             "jitter_arcsec": jitter_arcsec,
                             "flux_units": "nJy",
+                            "correlated_noise": 1,  # coadds are warped
                         },
                     )
 
-                nb = neighbours.near(tgt_ra, tgt_dec, neighbour_radius_arcsec,
-                                     str(data_id.get("band", "r")))
-                bb = stamp.getBBox()
                 band_name = str(data_id.get("band", "r"))
+                nb = neighbours.near(
+                    tgt_ra, tgt_dec, neighbour_radius_arcsec, band_name
+                )
+                bb = stamp.getBBox()
                 sky = wcs.pixelToSky(xy)
+                acf.add(image)
                 writer.add(
                     image,
                     variance,
@@ -553,15 +483,12 @@ def extract_patches(
                     psf["psf"],
                     meta={
                         "band_idx": BANDS.index(band_name) if band_name in BANDS else 255,
-                        "visit": int(data_id.get("visit", -1)),
-                        "detector": int(data_id.get("detector", -1)),
                         "x0": int(bb.getMinX()),
                         "y0": int(bb.getMinY()),
                         "center_x": float(xy.getX()),
                         "center_y": float(xy.getY()),
                         "ra": float(sky.getRa().asDegrees()),
                         "dec": float(sky.getDec().asDegrees()),
-                        "mjd": _mjd(stamp),
                         "psf_sigma": psf["psf_sigma"],
                         "psf_ixx": psf["psf_ixx"],
                         "psf_iyy": psf["psf_iyy"],
@@ -578,7 +505,6 @@ def extract_patches(
                         ),
                     },
                 )
-                acf.add(image)
                 for n in nb:
                     neighbour_rows.append({"patch_index": n_accepted, **n})
                 rec.update(status="accepted", patch_index=n_accepted)
@@ -588,19 +514,20 @@ def extract_patches(
         log.info("reached max_patches=%s", max_patches)
 
     paths = writer.close() if writer is not None else []
-    summary = _write_manifest(out_dir, records, neighbour_rows)
     acf_result = acf.result()
+    summary = _write_manifest(out_dir, records, neighbour_rows)
     summary.update(
         n_accepted=n_accepted,
         n_shards=len(paths),
         shards=[str(p) for p in paths],
         n_hosts=len(hosts),
-        # Native-resolution, flux-space correlation length: provenance and a
-        # sanity check, NOT the number to act on.  At native resolution the
-        # small lags are dominated by the PSF, and the log transform changes the
-        # correlation structure anyway.  The number that decides how much
-        # context the model needs is measured on the pooled, log-space training
-        # representation -- scripts/prepare_config.py reports that one.
+        dataset_type=DATASET_TYPE,
+        # Native-resolution correlation length: provenance and a sanity check,
+        # NOT the number to act on.  At native resolution the small lags are
+        # dominated by the PSF and by the coadd's own noise correlation, and the
+        # log transform changes the structure anyway.  The number that decides
+        # how much context the model needs is measured on the pooled, log-space
+        # training representation -- scripts/prepare_config.py reports that one.
         correlation_length_native_flux_px=acf_result["xi"],
         correlation_length_noise_fraction=acf_result["noise_fraction"],
         correlation_length_n_patches=acf_result["n_patches"],
