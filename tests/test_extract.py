@@ -6,6 +6,9 @@ object-table columns (DP2 moved second moments per band and dropped
 PSF moments, which DP2's PSF object cannot compute for you.
 """
 
+from collections.abc import Mapping
+from types import MappingProxyType
+
 import numpy as np
 import pytest
 
@@ -14,6 +17,7 @@ from rubin_host_prior.rubin.extract import (
     PHOTOMETRY_BANDS,
     SIGMA_TO_FWHM,
     _adaptive_moments,
+    _data_id_dict,
     dedupe_hosts,
     host_trace_radius_px,
     select_hosts,
@@ -239,3 +243,80 @@ def test_adaptive_moments_resist_wings():
 def test_adaptive_moments_degrade_cleanly_on_an_empty_kernel():
     m = _adaptive_moments(np.zeros((21, 21)))
     assert all(np.isnan(v) for v in m.values())
+
+
+# -- data ids --------------------------------------------------------------
+
+
+class _ModernDataCoordinate:
+    """daf_butler >= v27: exposes ``.mapping``/``.required``, is not a Mapping.
+
+    With ``__getitem__`` but no ``keys``, ``dict()`` falls through to sequence
+    iteration and asks for element 0, which is the ``KeyError: 0`` seen on the
+    stack rather than anything that names the real problem.
+    """
+
+    def __init__(self, values):
+        self._values = dict(values)
+        self.mapping = MappingProxyType(self._values)
+        self.required = MappingProxyType(self._values)
+
+    def __getitem__(self, key):
+        return self._values[key]
+
+    def __str__(self):
+        return f"{{{', '.join(f'{k}: {v}' for k, v in self._values.items())}}}"
+
+
+class _LegacyDataCoordinate(Mapping):
+    """daf_butler < v27, where ``dict(data_id)`` worked."""
+
+    def __init__(self, values):
+        self._values = dict(values)
+
+    def __getitem__(self, key):
+        return self._values[key]
+
+    def __iter__(self):
+        return iter(self._values)
+
+    def __len__(self):
+        return len(self._values)
+
+
+DATA_ID = {"band": "r", "skymap": "lsst_cells_v2", "tract": 5063, "patch": 17}
+
+
+def test_plain_dict_on_a_modern_data_id_is_the_bug_we_are_fixing():
+    with pytest.raises(KeyError):
+        dict(_ModernDataCoordinate(DATA_ID))
+
+
+@pytest.mark.parametrize("cls", [_ModernDataCoordinate, _LegacyDataCoordinate])
+def test_data_id_dict_works_on_both_butler_generations(cls):
+    assert _data_id_dict(cls(DATA_ID)) == DATA_ID
+
+
+def test_data_id_dict_falls_back_to_required_when_mapping_is_absent():
+    coord = _ModernDataCoordinate(DATA_ID)
+    del coord.mapping
+    assert _data_id_dict(coord) == DATA_ID
+
+
+def test_data_id_dict_keeps_provenance_when_nothing_works():
+    class _Opaque:
+        def __getitem__(self, key):
+            raise KeyError(key)
+
+        def __str__(self):
+            return "opaque-data-id"
+
+    out = _data_id_dict(_Opaque())
+    assert out == {"repr": "opaque-data-id"}
+
+
+def test_extracted_fields_survive_the_conversion():
+    fields = _data_id_dict(_ModernDataCoordinate(DATA_ID))
+    assert str(fields.get("band", "?")) == "r"
+    assert int(fields.get("tract", -1)) == 5063
+    assert int(fields.get("patch", -1)) == 17

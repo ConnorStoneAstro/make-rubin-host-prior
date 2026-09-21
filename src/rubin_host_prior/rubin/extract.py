@@ -187,6 +187,31 @@ def _attr(obj, role: str):
         ) from None
 
 
+def _data_id_dict(data_id) -> dict[str, object]:
+    """A ``DataCoordinate`` as a plain dict, across daf_butler versions.
+
+    ``DataCoordinate`` stopped being a ``Mapping`` in daf_butler v27, so
+    ``dict(data_id)`` no longer takes the mapping path: it falls through to
+    *sequence* iteration, asks for ``data_id[0]``, and dies with ``KeyError: 0``
+    -- an error that names neither the object nor the problem.  ``.mapping``
+    (every dimension) and ``.required`` (the required ones) are the
+    replacements; the old path stays for older stacks.
+    """
+    for attr in ("mapping", "required"):
+        view = getattr(data_id, attr, None)
+        if view is not None:
+            try:
+                return {str(k): v for k, v in dict(view).items()}
+            except (TypeError, ValueError, KeyError):
+                pass
+    try:
+        return {str(k): v for k, v in dict(data_id).items()}
+    except (TypeError, ValueError, KeyError):
+        # Worth keeping the provenance even unparsed.  The caller reads only
+        # band/tract/patch out of this and has defaults for all three.
+        return {"repr": str(data_id)}
+
+
 # -- repo ------------------------------------------------------------------
 
 
@@ -642,26 +667,43 @@ def extract_patches(
     # covered by more than one patch and would otherwise be extracted twice in
     # the same band -- duplicates that a training set would silently weight up.
     seen: set[tuple[int, str]] = set()
+    component_reads_failed = False
 
     try:
         for ref in refs:
             data_id = ref.dataId
-            band_name = str(data_id.get("band", "?"))
+            fields = _data_id_dict(data_id)
+            band_name = str(fields.get("band", "?"))
             base = {
-                "dataId": json.dumps({k: str(v) for k, v in dict(data_id).items()}),
+                "dataId": json.dumps({k: str(v) for k, v in fields.items()}),
                 "band": band_name,
-                "tract": int(data_id.get("tract", -1)),
-                "patch": int(data_id.get("patch", -1)),
+                "tract": int(fields.get("tract", -1)),
+                "patch": int(fields.get("patch", -1)),
             }
 
             # Component reads move no pixels, so the patch is only loaded if a
-            # host actually lands in it.  With ~10^6 coadds that matters.
+            # host actually lands in it.  With ~10^6 coadds that matters.  If
+            # this repo will not serve components, fall back to whole patches:
+            # slower, but the alternative is rejecting every ref in the field
+            # and finding out at the end of the run.
+            coadd = None
             try:
                 wcs = butler.get(f"{DATASET_TYPE}.sky_projection", dataId=data_id)
             except Exception as exc:
-                records.append({**base, "status": "rejected",
-                                "reasons": f"no_wcs:{exc!r}"[:120]})
-                continue
+                if not component_reads_failed:
+                    log.warning(
+                        "component read of %s.sky_projection failed (%r); loading "
+                        "whole patches instead, which is slower but equivalent",
+                        DATASET_TYPE, exc,
+                    )
+                    component_reads_failed = True
+                try:
+                    coadd = butler.get(ref)
+                except Exception as exc2:
+                    records.append({**base, "status": "rejected",
+                                    "reasons": f"read_failed:{exc2!r}"[:120]})
+                    continue
+                wcs = _attr(coadd, "wcs")
 
             candidates = [
                 h for h in range(len(hosts))
@@ -671,12 +713,14 @@ def extract_patches(
                 continue
             xs, ys = _sky_to_pixel(wcs, tgt_ra[candidates], tgt_dec[candidates])
 
-            try:
-                bbox = butler.get(f"{DATASET_TYPE}.bbox", dataId=data_id)
-                coadd = None
-            except Exception:
-                coadd = butler.get(ref)
+            if coadd is not None:
                 bbox = _attr(coadd, "bbox")
+            else:
+                try:
+                    bbox = butler.get(f"{DATASET_TYPE}.bbox", dataId=data_id)
+                except Exception:
+                    coadd = butler.get(ref)
+                    bbox = _attr(coadd, "bbox")
 
             inside = [
                 (h, x, y) for h, x, y in zip(candidates, xs, ys)

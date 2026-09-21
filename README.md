@@ -524,9 +524,14 @@ than guessed, so the list is short:
 - [ ] **`Butler("dp2", collections="dp2")`** — both are literally `"dp2"`.
       Off-platform, confirm the alias with `Butler.get_known_repos()` or
       `$DAF_BUTLER_REPOSITORY_INDEX`.
-- [ ] **`deep_coadd.bbox` as a component read.** `sky_projection` and `psf` are
-      documented component reads; `bbox` is assumed to work the same way and
-      falls back to loading the patch if not, which is correct either way.
+- [x] **Butler API generation.** `DataCoordinate` stopped being a `Mapping` in
+      daf_butler v27, so `dict(data_id)` now falls through to sequence iteration
+      and raises `KeyError: 0`. `_data_id_dict` goes through `.mapping` /
+      `.required` instead, and still handles the old form.
+- [ ] **`deep_coadd.bbox` and `.sky_projection` as component reads.** Both are
+      documented, but if either is refused the loop falls back to loading the
+      whole patch (slower, identical result) and warns once, rather than
+      rejecting every ref in the field.
 - [ ] **`grid.index_of(x=, y=)` returning `.i`/`.j`.** Used only for the
       `n_cells_spanned` covariate, and degrades to `-1` if the attribute names
       differ.
