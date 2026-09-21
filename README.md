@@ -525,6 +525,23 @@ more but needs nothing beyond the repo. It is not a silent fallback — ask for 
 Sampling deliberately does *not* happen during either scan: a stratified draw has
 to see the whole pool or it stratifies within tracts instead of across them.
 
+TAP results are unmasked before use. A VOTable NULL comes back masked, and
+`np.asarray` on a masked column hands back the raw buffer with no hint that part
+of it is not data — for a float that is usually NaN and harmless, but for an
+integer like `patch` it is whatever was in memory, which would file a host under
+a patch it is nowhere near. Nulls in `patch`/`tract` are logged and set to -1 so
+they match nothing; rows with no sky position are dropped with a count.
+
+A position that will not project is not fatal either. It means "not in this
+patch" — either the row had no coordinates or the patch does not cover that piece
+of sky — so it is a rejection, not a crash. If **`PATCH_CHECK_AFTER` patches in a
+row hold none** of the hosts the catalogue assigned to them, the run says so and
+prints where the hosts actually projected against the patch's pixel span, because
+that pattern means the `Object.patch` column and the `deep_coadd` dataId `patch`
+are not the same numbering rather than a run of unlucky edges.
+`n_patches_with_hosts` / `n_patches_without_hosts` in the summary is the same
+thing after the fact.
+
 The sweep is then **tract-major**, which is what makes the footprint affordable.
 The object table is per tract, so the neighbour index is built once per tract and
 thrown away; and within a tract only the patches that actually hold a host are

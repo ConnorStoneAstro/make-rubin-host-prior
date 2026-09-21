@@ -25,6 +25,11 @@ from rubin_host_prior.rubin.extract import (
     build_host_catalogue,
     coadd_refs_for_tract,
     read_component,
+    _fits_in_patch,
+    _sky_to_pixel,
+    _stamp_box,
+    unmask,
+    with_positions,
     host_adql,
     TAP_URL_FALLBACK,
     TOKEN_ENV_VARS,
@@ -1102,3 +1107,64 @@ def test_an_unexpected_status_is_not_treated_as_a_rejection(monkeypatch):
     monkeypatch.setattr("rubin_host_prior.rubin.extract.requests.get",
                         lambda *a, **k: _response(503))
     assert token_info("gt-x") == {}
+
+
+# -- rows that have no position --------------------------------------------
+
+
+def test_a_non_finite_position_is_not_in_the_patch():
+    """Two ways a position arrives non-finite: a catalogue row with no
+    coordinates, or a projection of somewhere the patch does not cover. Both
+    mean 'not here', and neither is worth ending a run over."""
+    box = SimpleNamespace(contains=lambda x, y: True)
+    assert _fits_in_patch(box, np.nan, 100.0, 416) is False
+    assert _fits_in_patch(box, 100.0, np.inf, 416) is False
+    assert _fits_in_patch(box, 100.0, 100.0, 416) is True
+
+
+def test_a_stamp_is_never_centred_on_a_non_finite_position():
+    with pytest.raises(ValueError, match="cannot centre"):
+        _stamp_box(np.nan, 10.0, 416)
+
+
+def test_a_projection_that_refuses_a_position_gives_nan_not_an_exception():
+    class _Wcs:
+        def sky_to_pixel(self, coord):
+            raise ValueError("outside the projection")
+
+    xs, ys = _sky_to_pixel(_Wcs(), [53.1], [-28.1])
+    assert np.isnan(xs[0]) and np.isnan(ys[0])
+
+
+def test_non_finite_input_coordinates_never_reach_the_projection():
+    class _Wcs:
+        def sky_to_pixel(self, coord):
+            raise AssertionError("should not have been called")
+
+    xs, ys = _sky_to_pixel(_Wcs(), [np.nan], [np.nan])
+    assert np.isnan(xs[0]) and np.isnan(ys[0])
+
+
+def test_null_floats_from_tap_become_nan():
+    """np.asarray on a masked column hands back the raw buffer with no hint that
+    part of it is not data."""
+    t = Table({"coord_ra": np.ma.array([53.1, 0.0], mask=[False, True])})
+    out = unmask(t)
+    assert out["coord_ra"][0] == 53.1 and np.isnan(out["coord_ra"][1])
+
+
+def test_a_null_integer_is_flagged_and_made_unmatchable(caplog):
+    """A garbage `patch` would file a host under a patch it is nowhere near."""
+    t = Table({"patch": np.ma.array([3, 999], mask=[False, True])})
+    with caplog.at_level("WARNING"):
+        out = unmask(t)
+    assert out["patch"][0] == 3 and out["patch"][1] == -1
+    assert "patch" in caplog.text
+
+
+def test_rows_without_a_position_are_dropped_with_a_count(caplog):
+    t = Table({"coord_ra": [53.1, np.nan, 53.3],
+               "coord_dec": [-28.1, -28.2, np.nan]})
+    with caplog.at_level("WARNING"):
+        out = with_positions(t)
+    assert len(out) == 1 and "2 host candidate" in caplog.text

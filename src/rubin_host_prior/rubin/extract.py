@@ -113,6 +113,11 @@ DP2_ATTRS = {
 #: expect.  ``yx0`` converts to patch-local if ever needed.
 PIXEL_ORIGIN = "tract"
 
+#: How many patches may hold none of their assigned hosts before the run says
+#: the patch numbering is probably wrong rather than the hosts merely being near
+#: an edge.
+PATCH_CHECK_AFTER = 20
+
 #: Maximum separation between where a stamp actually landed and where it was
 #: asked for, in arcsec.  A pixel-origin mix-up is off by far more than this.
 CENTRE_TOLERANCE_ARCSEC = 1.0
@@ -575,6 +580,44 @@ def run_adql(service, query: str, timeout: float | None = None):
             log.debug("could not delete TAP job: %r", exc)
 
 
+def unmask(table):
+    """Masked TAP columns to plain values.  NULL floats become NaN.
+
+    A VOTable NULL comes back as a masked entry, and ``np.asarray`` on a masked
+    column hands back the raw buffer with no hint that part of it is not data.
+    For a float that is usually NaN and harmless downstream; for an integer like
+    ``patch`` it is whatever happened to be in memory, which would file a host
+    under a patch it is nowhere near.
+    """
+    for name in list(getattr(table, "colnames", [])):
+        column = table[name]
+        mask = getattr(column, "mask", None)
+        if mask is None or not np.any(mask):
+            continue
+        n = int(np.sum(mask))
+        if column.dtype.kind == "f":
+            table[name] = np.asarray(column.filled(np.nan), dtype=column.dtype)
+        elif column.dtype.kind in "iu":
+            log.warning("%d row(s) have no %s; setting them to -1, which will "
+                        "not match any patch", n, name)
+            table[name] = np.asarray(column.filled(-1), dtype=column.dtype)
+        else:
+            continue
+        log.debug("unmasked %d null(s) in %s", n, name)
+    return table
+
+
+def with_positions(table):
+    """Rows that have a usable sky position, with a count of those that do not."""
+    ra = np.asarray(table["coord_ra"], dtype=float)
+    dec = np.asarray(table["coord_dec"], dtype=float)
+    ok = np.isfinite(ra) & np.isfinite(dec)
+    if not ok.all():
+        log.warning("dropping %d host candidate(s) with no sky position",
+                    int((~ok).sum()))
+    return table[ok]
+
+
 def build_host_catalogue(
     butler=None,
     bands: Sequence[str] = BANDS,
@@ -638,8 +681,9 @@ def build_host_catalogue(
                if k in ("flux_range", "min_reff_arcsec", "max_blendedness")},
         )
         log.info("querying %s:\n%s", TAP_TABLE, query)
-        pool = run_adql(tap_service or tap_client(url=tap_url), query)
-        log.info("TAP returned %d rows", len(pool))
+        pool = with_positions(unmask(run_adql(
+            tap_service or tap_client(url=tap_url), query)))
+        log.info("TAP returned %d usable rows", len(pool))
         # The service applied the numeric cuts; these are the rest -- the Sersic
         # failure flags, the point-source cross-check, and the dedupe across
         # tracts, which the query cannot do.
@@ -685,7 +729,7 @@ def build_host_catalogue(
     pool = vstack(kept, metadata_conflicts="silent") if len(kept) > 1 else kept[0]
     # Tracts overlap, so a host in an overlap appears in two tables under two
     # different objectIds.  The per-tract dedupe cannot see that; this can.
-    pool = dedupe_hosts(pool)
+    pool = dedupe_hosts(with_positions(pool))
     log.info("host catalogue: %d candidates from %d rows across %d tables",
              len(pool), n_rows, len(refs))
     if cache is not None:
@@ -998,10 +1042,19 @@ def _sky_to_pixel(wcs, ra, dec) -> tuple[np.ndarray, np.ndarray]:
     xs = np.empty(ra.size)
     ys = np.empty(ra.size)
     for i in range(ra.size):
-        xy = wcs.sky_to_pixel(
-            SkyCoord(ra=ra[i] * u.deg, dec=dec[i] * u.deg, frame="icrs")
-        )
-        xs[i], ys[i] = float(xy.x), float(xy.y)
+        if not (np.isfinite(ra[i]) and np.isfinite(dec[i])):
+            xs[i] = ys[i] = np.nan
+            continue
+        try:
+            xy = wcs.sky_to_pixel(
+                SkyCoord(ra=ra[i] * u.deg, dec=dec[i] * u.deg, frame="icrs")
+            )
+            xs[i], ys[i] = float(xy.x), float(xy.y)
+        except Exception as exc:
+            # A projection can refuse a position far outside what it covers.
+            # That is an answer -- "not here" -- not a failure.
+            log.debug("sky_to_pixel(%s, %s) failed: %r", ra[i], dec[i], exc)
+            xs[i] = ys[i] = np.nan
     return xs, ys
 
 
@@ -1031,6 +1084,8 @@ def _stamp_box(x: float, y: float, size: int):
     ``Box2I(x, y)``.  A transposed stamp is square and will not error; it will
     just be wrong.
     """
+    if not (np.isfinite(x) and np.isfinite(y)):
+        raise ValueError(f"cannot centre a stamp on ({x}, {y})")
     Box = _lsst().Box
     iy, ix = int(round(y)), int(round(x))
     half = size // 2
@@ -1045,6 +1100,11 @@ def _fits_in_patch(bbox, x: float, y: float, size: int) -> bool:
     repairing; the rejection is logged so the selection function stays
     measurable.
     """
+    # A position can arrive non-finite two ways: a catalogue row with no
+    # coordinates, or a projection of somewhere this patch does not cover.  Both
+    # mean "not in this patch", and neither is worth ending a run over.
+    if not (np.isfinite(x) and np.isfinite(y)):
+        return False
     ix, iy = int(round(x)), int(round(y))
     half = size // 2
     return bool(
@@ -1263,6 +1323,8 @@ def extract_patches(
     depth_logged = False
     depth_checked = False
     depth_usable = True
+    n_empty_patches = 0
+    n_matched_patches = 0
 
     n_refs = 0
     neighbour_columns = host_columns(bands)
@@ -1276,7 +1338,7 @@ def extract_patches(
         the patches that actually hold a host are asked for.
         """
         nonlocal writer, mask_mapping, n_accepted, component_reads_failed
-        nonlocal bbox_reads_failed
+        nonlocal bbox_reads_failed, n_empty_patches, n_matched_patches
         nonlocal depth_logged, depth_checked, depth_usable, n_refs
 
         by_patch: dict[tuple[int, int], list[int]] = {}
@@ -1358,7 +1420,24 @@ def extract_patches(
                     if _fits_in_patch(bbox, x, y, native_size)
                 ]
                 if not inside:
+                    n_empty_patches += 1
+                    if n_matched_patches == 0 and n_empty_patches == PATCH_CHECK_AFTER:
+                        n_projected = int(np.sum(np.isfinite(xs) & np.isfinite(ys)))
+                        log.warning(
+                            "%d patches so far have held none of the hosts the "
+                            "catalogue assigned to them (this one: %d of %d "
+                            "positions even projected; patch x spans %s, hosts "
+                            "project to x in [%.1f, %.1f]). If that continues, "
+                            "the Object table's `patch` column and the deep_coadd "
+                            "dataId `patch` are not the same numbering and every "
+                            "host is being matched to the wrong patch.",
+                            n_empty_patches, n_projected, len(xs),
+                            (bbox.x.start, bbox.x.stop),
+                            float(np.nanmin(xs)) if n_projected else float("nan"),
+                            float(np.nanmax(xs)) if n_projected else float("nan"),
+                        )
                     continue
+                n_matched_patches += 1
                 try:
                     psf_model = (_attr(coadd, "psf") if coadd is not None
                                  else read_component(butler, ref, "psf"))
@@ -1638,6 +1717,8 @@ def extract_patches(
         n_hosts_tried=len(tried),
         n_hosts_attempted=len(attempted),
         n_hosts_no_stamp_fitted=never,
+        n_patches_with_hosts=n_matched_patches,
+        n_patches_without_hosts=n_empty_patches,
         field_radius_deg=radius_deg,
         n_host_candidates=len(field),
         n_hosts=len(hosts),
