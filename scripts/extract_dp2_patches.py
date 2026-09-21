@@ -1,9 +1,9 @@
 #!/usr/bin/env python
-"""Extract a ``deep_coadd`` patch training set from DP1.
+"""Extract a ``deep_coadd`` patch training set from DP2.
 
 Runs on NERSC, inside the LSST stack.
 
-    python scripts/extract_dp1_patches.py --out data/ecdfs --bands r i --n-hosts 2000
+    python scripts/extract_dp2_patches.py --out data/ecdfs --bands r i --n-hosts 2000
 
 Writes ``<out>/shards/*.h5``, ``<out>/manifest.parquet``, ``<out>/summary.json``.
 Read the rejection counts in the summary before trusting the set: if bright
@@ -13,6 +13,10 @@ this project cares about and the gate needs loosening.
 Coadds give at most one patch per band per host, so ``--n-hosts`` sets the
 training-set size fairly directly: expect roughly ``n_hosts * len(bands)``
 patches before rejections.
+
+Early DP2 publishes ``deep_coadd`` and nothing else -- no ``visit_image``, no
+``difference_image`` -- which suits this project, since the prior trains on
+coadds anyway.
 """
 
 from __future__ import annotations
@@ -22,16 +26,24 @@ import json
 import logging
 from pathlib import Path
 
-from rubin_host_prior.rubin.extract import ECDFS, extract_patches, open_butler
+from rubin_host_prior.rubin.extract import (
+    COLLECTION,
+    ECDFS,
+    REPO,
+    extract_patches,
+    open_butler,
+)
 
 
 def main() -> None:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--out", required=True, help="output directory")
-    p.add_argument("--repo", default="dp1", help="butler repo alias or path")
-    p.add_argument("--collection", default="LSSTComCam/DP1")
+    p.add_argument("--repo", default=REPO, help="butler repo alias or path")
+    p.add_argument("--collection", default=COLLECTION)
     p.add_argument("--ra", type=float, default=ECDFS[0])
     p.add_argument("--dec", type=float, default=ECDFS[1])
+    p.add_argument("--radius-deg", type=float, default=0.3,
+                   help="field radius searched for coadd patches")
     p.add_argument("--bands", nargs="+", default=["u", "g", "r", "i", "z", "y"])
     p.add_argument(
         "--native-size",
@@ -64,6 +76,7 @@ def main() -> None:
         out_dir=args.out,
         ra=args.ra,
         dec=args.dec,
+        radius_deg=args.radius_deg,
         bands=args.bands,
         native_size=args.native_size,
         psf_size=args.psf_size,

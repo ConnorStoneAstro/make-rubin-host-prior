@@ -9,10 +9,11 @@ forward models:
   the per-band offsets all happen in the loader, so any of them can change
   without re-extracting terabytes.
 * **Keep the variance plane, the mask, the mask plane dictionary, the PSF and
-  ``x0y0``.**  A patch without variance and PSF cannot be forward-modelled, and
-  a mask without its plane dictionary is uninterpretable -- LSST does not
-  guarantee bit assignments across releases.  ``x0y0`` is the PARENT origin;
-  without it an array index cannot be mapped back to the sky.
+  the origin.**  A patch without variance and PSF cannot be forward-modelled,
+  and a mask without its plane dictionary is uninterpretable -- DP2 bit
+  assignments are dynamic, so extraction repacks the mask and records the
+  mapping it used.  ``x0``/``y0`` is the stamp origin; without it an array index
+  cannot be mapped back to the sky.
 """
 
 from __future__ import annotations
@@ -52,6 +53,13 @@ META_DTYPES: dict[str, str] = {
     # split by extendedness.  NaN where there is none inside the search radius.
     "nearest_galaxy_arcsec": "f4",
     "nearest_star_arcsec": "f4",
+    # DP2 covariates: recorded for every stamp, never gated on.  INEXACT_PSF and
+    # REJECTED cover a large fraction of the coadd, so a cut on them keeps
+    # almost nothing; frac_no_data is DP2's inf-variance regions, which include
+    # the cores of saturated stars.
+    "frac_no_data": "f4",
+    "frac_inexact_psf": "f4",
+    "frac_rejected": "f4",
 }
 
 IMAGE_KEYS = ("image", "variance", "mask")

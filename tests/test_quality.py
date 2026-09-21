@@ -18,16 +18,13 @@ from rubin_host_prior.rubin.quality import (
 )
 
 # The DP1 r29.2.0 bit assignments.
-#: DP1 r29.2.0 bit assignments.  Several of these are never set in deep_coadd
-#: (BAD, CROSSTALK, DETECTED_NEGATIVE, ITL_DIP, NOT_DEBLENDED, STREAK,
-#: SUSPECT, UNMASKEDNAN, VIGNETTED) -- kept in the dictionary so the tests can
-#: check that gating on an unpopulated plane is a no-op rather than an error.
+#: DP2 plane names with a locally assigned packing, which is what extraction
+#: records per shard.  DP2 bit numbers are dynamic, so nothing may hard-code
+#: one; these values are arbitrary and the tests must not depend on them.
 PLANES = {
-    "BAD": 0, "SAT": 1, "INTRP": 2, "CR": 3, "EDGE": 4, "DETECTED": 5,
-    "DETECTED_NEGATIVE": 6, "SUSPECT": 7, "NO_DATA": 8, "VIGNETTED": 9,
-    "STREAK": 10, "CLIPPED": 11, "CROSSTALK": 12, "INEXACT_PSF": 13,
-    "ITL_DIP": 14, "NOT_DEBLENDED": 15, "REJECTED": 16, "SENSOR_EDGE": 17,
-    "UNMASKEDNAN": 18,
+    "SATURATED": 0, "COSMIC_RAY": 1, "INTERPOLATED": 2, "DETECTION_EDGE": 3,
+    "DETECTED": 4, "DETECTED_NEGATIVE": 5, "INEXACT_PSF": 6, "REJECTED": 7,
+    "CLIPPED": 8, "SUSPECT": 9,
 }
 SIZE, SKY = 192, 12.0
 _Y, _X = np.mgrid[0:SIZE, 0:SIZE]
@@ -47,43 +44,90 @@ def _gate(image, mask=None, **kw):
 
 
 def test_plane_bitmask_ignores_absent_planes():
-    assert plane_bitmask(PLANES, "SAT") == 2
-    assert plane_bitmask(PLANES, ["BAD", "CR"]) == 1 | 8
-    assert plane_bitmask({"BAD": 0}, "STREAK") == 0  # DP1 leaves many unset
+    assert plane_bitmask(PLANES, "SATURATED") == 1
+    assert plane_bitmask(PLANES, ["SATURATED", "COSMIC_RAY"]) == 1 | 2
+    # DP2 coadds have no STREAK plane at all
+    assert plane_bitmask(PLANES, "STREAK") == 0
 
 
 def test_plane_fraction_of_absent_plane_is_zero():
-    """DP1 never sets STREAK in deep_coadd; a gate naming it must not error or
+    """DP2 coadds carry no STREAK plane; a gate naming it must not error or
     return NaN, it must simply contribute nothing."""
     mask = np.zeros((4, 4), np.uint32)
-    assert plane_fraction(mask, {"BAD": 0}, "STREAK") == 0.0
+    assert plane_fraction(mask, {"SATURATED": 0}, "STREAK") == 0.0
 
 
 def test_plane_fractions_covers_every_declared_plane():
     mask = np.zeros((8, 8), np.uint32)
-    mask[0, 0] = 1 << PLANES["CR"]
+    mask[0, 0] = 1 << PLANES["COSMIC_RAY"]
     fracs = plane_fractions(mask, PLANES)
     assert set(fracs) == set(PLANES)
-    assert fracs["CR"] == pytest.approx(1 / 64)
+    assert fracs["COSMIC_RAY"] == pytest.approx(1 / 64)
 
 
 # -- pixel-level tests DP1 forces on us -----------------------------------
 
 
-def test_nonfinite_pixels_are_caught_without_a_mask_plane():
-    """NO_DATA and UNMASKEDNAN are unset in DP1, so the pixels must be tested."""
+def test_nonfinite_image_pixels_are_caught():
     img = _scene()
     img[5, 5] = np.nan
     assert "nonfinite_image" in _gate(img)[0]
 
 
-def test_nonpositive_variance_is_caught():
+def test_inf_variance_is_measured_not_treated_as_corruption():
+    """DP2 marks "no contributing exposures" with inf variance, and that
+    includes the cores of saturated stars.  Rejecting on its mere presence would
+    discard every stamp with a bright neighbour -- the regime of interest."""
     img = _scene()
     var = np.full((SIZE, SIZE), SKY**2)
-    var[3, 3] = 0.0
-    assert "nonpositive_variance" in gate(
-        img, var, np.zeros((SIZE, SIZE), np.uint32), PLANES
-    )[0]
+    var[3:6, 3:6] = np.inf
+    reasons, diag = gate(img, var, np.zeros((SIZE, SIZE), np.uint32), PLANES)
+    assert reasons == []
+    assert diag["frac_no_data"] == pytest.approx(9 / SIZE**2)
+    # sky noise must be measured from the finite pixels only
+    assert diag["sky_noise"] == pytest.approx(SKY, rel=1e-6)
+
+
+def test_too_much_no_data_is_rejected():
+    img = _scene()
+    var = np.full((SIZE, SIZE), SKY**2)
+    var[:40, :40] = np.inf  # 4.3%
+    assert any("no_data" in r for r in
+               gate(img, var, np.zeros((SIZE, SIZE), np.uint32), PLANES)[0])
+
+
+def test_no_data_at_the_centre_is_rejected_outright():
+    """That is where the transient goes; missing pixels there are not
+    recoverable and the model would have to invent them."""
+    img = _scene()
+    var = np.full((SIZE, SIZE), SKY**2)
+    var[SIZE // 2, SIZE // 2] = np.inf
+    assert any("inner_no_data" in r for r in
+               gate(img, var, np.zeros((SIZE, SIZE), np.uint32), PLANES)[0])
+
+
+def test_stale_dp1_plane_names_fail_loudly():
+    """The documented DP1->DP2 failure mode: the planes were renamed, so an old
+    gate matches nothing and silently passes every stamp.  That must be an
+    error, not a clean bill of health."""
+    with pytest.raises(ValueError, match="none of the gated planes"):
+        gate(_scene(), np.full((SIZE, SIZE), SKY**2),
+             np.zeros((SIZE, SIZE), np.uint32), {"SAT": 0, "CR": 1, "INTRP": 2})
+
+
+def test_covariate_planes_are_recorded_but_never_gated():
+    """INEXACT_PSF and REJECTED cover a large fraction of the DP2 coadd, so a
+    cut on them keeps almost nothing.  Record, do not reject."""
+    from rubin_host_prior.rubin.quality import COVARIATE_PLANES
+
+    mask = np.zeros((SIZE, SIZE), np.uint32)
+    for plane in ("INEXACT_PSF", "REJECTED"):
+        mask[: int(0.8 * SIZE)] |= 1 << PLANES[plane]
+    reasons, diag = _gate(_scene(), mask)
+    assert reasons == []
+    for plane in ("INEXACT_PSF", "REJECTED"):
+        assert diag[f"frac_{plane}"] == pytest.approx(0.8, rel=0.02)
+    assert not set(FRAC_TOL) & set(COVARIATE_PLANES)
 
 
 # -- the central requirement ----------------------------------------------
@@ -119,17 +163,32 @@ OVER_SUBTRACTION = [
 # -- mask-plane tolerances -------------------------------------------------
 
 
-def test_a_single_saturated_pixel_rejects():
-    """SAT is dilated to cover bleed trails; the DP1 docs say exclude outright."""
+def test_saturation_is_tolerated_away_from_the_centre():
+    """DP1 excluded any saturation outright.  On a DP2 coadd the saturated core
+    of a bright neighbour lands in a great many stamps, and a scene with a
+    bright neighbour is the regime this project models -- so a small fraction
+    away from the centre is kept, and the manifest records how much."""
     mask = np.zeros((SIZE, SIZE), np.uint32)
-    mask[10, 10] |= 1 << PLANES["SAT"]
-    assert any(r.startswith("SAT") for r in _gate(_scene(), mask)[0])
+    mask[10:13, 10:13] |= 1 << PLANES["SATURATED"]
+    reasons, diag = _gate(_scene(), mask)
+    assert reasons == []
+    assert diag["frac_SATURATED"] > 0
 
 
-def test_any_no_data_or_edge_pixel_rejects():
-    """NO_DATA is the coadd-specific one: those pixels had no contributing
-    exposures, so they are not sky, they are nothing."""
-    for plane in ("NO_DATA", "EDGE", "SENSOR_EDGE"):
+def test_a_lot_of_saturation_still_rejects():
+    mask = np.zeros((SIZE, SIZE), np.uint32)
+    mask[:40, :40] |= 1 << PLANES["SATURATED"]
+    assert any(r.startswith("SATURATED") for r in _gate(_scene(), mask)[0])
+
+
+def test_saturation_at_the_centre_rejects():
+    mask = np.zeros((SIZE, SIZE), np.uint32)
+    mask[SIZE // 2, SIZE // 2] |= 1 << PLANES["SATURATED"]
+    assert any("inner_SATURATED" in r for r in _gate(_scene(), mask)[0])
+
+
+def test_any_detection_edge_pixel_rejects():
+    for plane in ("DETECTION_EDGE",):
         mask = np.zeros((SIZE, SIZE), np.uint32)
         mask[0, 0] |= 1 << PLANES[plane]
         reasons = _gate(_scene(), mask)[0]
@@ -152,22 +211,22 @@ def test_gating_on_detected_is_refused_loudly():
 def test_inner_region_is_stricter_than_the_whole_patch():
     """A cosmic ray 80 px from the host matters far less than one on top of it."""
     off_centre = np.zeros((SIZE, SIZE), np.uint32)
-    off_centre[2:4, 2:4] |= 1 << PLANES["CR"]
+    off_centre[2:4, 2:4] |= 1 << PLANES["COSMIC_RAY"]
     centred = np.zeros((SIZE, SIZE), np.uint32)
-    centred[SIZE // 2, SIZE // 2] |= 1 << PLANES["CR"]
+    centred[SIZE // 2, SIZE // 2] |= 1 << PLANES["COSMIC_RAY"]
     assert _gate(_scene(), off_centre)[0] == []
-    assert any("inner_CR" in r for r in _gate(_scene(), centred)[0])
+    assert any("inner_COSMIC_RAY" in r for r in _gate(_scene(), centred)[0])
 
 
 def test_diagnostics_are_returned_for_rejected_patches_too():
     """The rejection statistics are the only way to detect a biased selection
     function, so they must be recorded even when the patch is thrown away."""
     mask = np.zeros((SIZE, SIZE), np.uint32)
-    mask[10, 10] |= 1 << PLANES["SAT"]
+    mask[:40, :40] |= 1 << PLANES["SATURATED"]
     reasons, diag = _gate(_scene(), mask)
     assert reasons
-    assert diag["frac_SAT"] > 0
-    assert diag["inner_frac_CR"] == 0.0
+    assert diag["frac_SATURATED"] > 0
+    assert diag["inner_frac_COSMIC_RAY"] == 0.0
     assert diag["sky_noise"] == pytest.approx(SKY, rel=1e-6)
 
 
@@ -178,31 +237,23 @@ def test_sky_noise_is_inferred_from_the_variance_plane():
 
 def test_tolerances_are_configurable():
     mask = np.zeros((SIZE, SIZE), np.uint32)
-    mask[0:20, 0:20] |= 1 << PLANES["CR"]  # 1.1% of the patch, above the 0.5% default
-    assert any(r.startswith("CR") for r in _gate(_scene(), mask)[0])
-    assert _gate(_scene(), mask, frac_tol={"CR": 0.05})[0] == []
+    mask[0:20, 0:20] |= 1 << PLANES["COSMIC_RAY"]  # 1.1%, above the 0.5% default
+    assert any(r.startswith("COSMIC_RAY") for r in _gate(_scene(), mask)[0])
+    assert _gate(_scene(), mask, frac_tol={"COSMIC_RAY": 0.05})[0] == []
     # And just under the default is accepted, so the threshold is where it says.
     small = np.zeros((SIZE, SIZE), np.uint32)
-    small[0:13, 0:13] |= 1 << PLANES["CR"]  # 0.46%
+    small[0:13, 0:13] |= 1 << PLANES["COSMIC_RAY"]  # 0.46%
     assert _gate(_scene(), small)[0] == []
 
 
 def test_gating_on_an_unpopulated_plane_is_a_no_op():
-    """deep_coadd never sets BAD, SUSPECT, ITL_DIP and several others. A gate
-    naming one must neither error nor silently pass everything else."""
-    coadd_planes = {k: v for k, v in PLANES.items()
-                    if k not in ("BAD", "SUSPECT", "ITL_DIP", "CROSSTALK")}
+    """A plane absent from this release's schema must contribute nothing -- so
+    long as at least one gated plane IS present, which the loud check covers."""
     mask = np.zeros((SIZE, SIZE), np.uint32)
-    reasons, diag = gate(_scene(), np.full((SIZE, SIZE), SKY**2), mask,
-                         coadd_planes, frac_tol={"BAD": 0.0, "CR": 0.005})
+    reasons, diag = gate(_scene(), np.full((SIZE, SIZE), SKY**2), mask, PLANES,
+                         frac_tol={"VIGNETTED": 0.0, "SATURATED": 0.005})
     assert reasons == []
-    assert diag["frac_BAD"] == 0.0
+    assert diag["frac_VIGNETTED"] == 0.0
 
 
-def test_coadd_specific_planes_are_gated():
-    """CLIPPED and REJECTED mark where outlier rejection fired during
-    coaddition; a little is normal, a lot means the stack disagreed with itself."""
-    for plane in ("CLIPPED", "REJECTED"):
-        mask = np.zeros((SIZE, SIZE), np.uint32)
-        mask[:40, :40] |= 1 << PLANES[plane]  # 4.3% of the patch
-        assert any(r.startswith(plane) for r in _gate(_scene(), mask)[0]), plane
+

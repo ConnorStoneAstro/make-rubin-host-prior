@@ -1,4 +1,4 @@
-"""DP1 extraction.  ``quality`` is stack-free; ``extract`` imports LSST lazily."""
+"""DP2 extraction.  ``quality`` is stack-free; ``extract`` imports LSST lazily."""
 
 from .quality import (
     FRAC_TOL,

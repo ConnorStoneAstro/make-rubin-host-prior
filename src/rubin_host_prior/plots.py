@@ -283,6 +283,16 @@ def plot_hosts(shards, hosts=None, band: str = "r", out: Path | None = None):
                    30, "count within search radius", False))
     panels.append(("host offset from centre", meta["host_offset_arcsec"], 30,
                    "arcsec (extraction jitter)", False))
+    # DP2 covariates: recorded, never gated on.  Worth looking at, because if
+    # INEXACT_PSF or REJECTED covers most of the accepted stamps then the PSF
+    # the forward model relies on is approximate over most of the training set.
+    for key, title, xlabel in (
+        ("frac_no_data", "no-data fraction", "inf-variance pixels (DP2)"),
+        ("frac_inexact_psf", "INEXACT_PSF fraction", "fraction of stamp"),
+        ("frac_rejected", "REJECTED fraction", "fraction of stamp"),
+    ):
+        if key in meta:
+            panels.append((title, meta[key], 40, xlabel, False))
 
     n_panels = len(panels) + 1  # + the band bar chart
     rows, cols = _grid(n_panels)

@@ -1,68 +1,85 @@
 """Artefact rejection for candidate patches.  Pure numpy -- no LSST stack.
 
-Tuned for ``deep_coadd``, which is what this project trains on.  Coadds already
-handle most of what made visit images awkward: chip edges, cosmic rays and other
-per-exposure electronic artefacts are rejected during coaddition rather than
-left for a downstream gate to find.
+Tuned for DP2 ``deep_coadd``.  Coaddition already handles chip edges, cosmic
+rays and per-exposure electronic artefacts, so what is left is coadd-specific
+and, on DP2, quite different from DP1.
 
-What remains is specific to coadds:
+**Plane names changed and bit numbers are dynamic.**  DP2 renamed ``SAT`` ->
+``SATURATED``, ``CR`` -> ``COSMIC_RAY``, ``INTRP`` -> ``INTERPOLATED`` and
+``EDGE`` -> ``DETECTION_EDGE``, and the bit assignments are not stable across
+releases.  A DP1-era gate does not error on DP2 -- it matches nothing and passes
+every stamp.  Nothing here hard-codes a bit: the packing is recorded per shard by
+extraction from the coadd's own ``mask.schema``, and every plane name absent from
+that mapping contributes nothing.
 
-* **``NO_DATA`` matters here and did not before.**  A coadd patch has regions
-  with no contributing exposures -- corners, gaps, the edge of the survey
-  footprint -- and those pixels are not sky, they are nothing.
-* **``CLIPPED`` and ``REJECTED``** mark pixels where outlier rejection fired
-  during coaddition.  A little is normal; a lot means the stack disagreed with
-  itself there.
-* **``INEXACT_PSF``** marks where the coadd PSF model is approximate.  That
-  matters for a project whose forward model needs the PSF.
+**No-data is carried by the variance, not by a plane.**  DP2 variance holds
+``inf`` where there were no contributing exposures -- including the cores of
+saturated stars.  Rejecting a stamp merely because non-finite variance is
+*present* would throw away every patch containing a bright neighbour, which is
+the regime this project exists to model.  The fraction is measured instead, with
+a tolerance, and a stricter one at the centre.
 
-Several planes are never set in ``deep_coadd`` -- ``BAD``, ``CROSSTALK``,
-``DETECTED_NEGATIVE``, ``ITL_DIP``, ``NOT_DEBLENDED``, ``STREAK``,
-``UNMASKEDNAN``, ``VIGNETTED`` -- so gating on them would do nothing.  They are
-left out rather than listed for show.  ``plane_bitmask`` ignores names that are
-absent from the mask's own dictionary, so the gate degrades safely if a later
-release starts or stops setting one.
+**``INEXACT_PSF`` and ``REJECTED`` are not quality cuts.**  They cover a large
+fraction of the DP2 coadd, so gating on them discards almost everything.  They
+are recorded as per-stamp covariates so a later cut can be made from the
+manifest without re-reading pixels.  ``DETECTED`` is likewise informational --
+rejecting on it would reject every patch containing a galaxy.
 
-Tolerances differ from the DP1 documentation's recommendations on purpose.  The
-published table is written for *measurement*, where an interpolated pixel is
-harmless because it barely perturbs a flux.  Here the model is learning a
-distribution over pixel values, and an interpolated pixel is a smooth synthetic
-patch that teaches the model structure that is not in the sky.  ``CR`` and
-``INTRP`` are therefore tighter than the documentation suggests.  All fractions
-are recorded in the manifest, so they can be loosened later without re-reading
-pixels.
+**Neither release masks satellite trails in what you train on.**  DP2 coadds have
+no ``STREAK`` plane at all.  Trails and unmasked electronics artefacts have to
+come from your own detection step; nothing here will catch them.
+
+Tolerances for ``COSMIC_RAY`` and ``INTERPOLATED`` are tighter than the
+documentation recommends, deliberately.  That guidance is written for
+*measurement*, where an interpolated pixel barely perturbs a flux.  Here the
+model is learning a distribution over pixel values, and an interpolated pixel is
+a smooth synthetic patch teaching structure that is not in the sky.
 """
 
 from __future__ import annotations
 
 import numpy as np
 
-#: Any pixel set in these planes disqualifies the patch.  ``NO_DATA`` is the
-#: important one for coadds: those pixels had no contributing exposures.
-ZERO_TOL: tuple[str, ...] = ("NO_DATA", "EDGE", "SENSOR_EDGE")
+#: Any pixel set in these planes disqualifies the patch.
+ZERO_TOL: tuple[str, ...] = ("DETECTION_EDGE",)
 
 #: Maximum allowed fraction of the patch, per plane.  Stricter than the DP1
 #: measurement recommendations for CR/INTRP -- see the module docstring.
 FRAC_TOL: dict[str, float] = {
-    "SAT": 0.0,  # saturation bleeds; the DP1 docs say exclude outright
-    "CR": 0.005,  # mostly rejected during coaddition, so this is a safety net
-    "INTRP": 0.02,  # smooth synthetic fill; bad for a generative model
-    "CLIPPED": 0.02,  # outlier rejection fired during coaddition
-    "REJECTED": 0.02,
-    "INEXACT_PSF": 0.05,  # the forward model needs a trustworthy PSF
+    # A *fraction*, not zero.  DP1 excluded any saturation outright, but on a
+    # DP2 coadd the saturated core of a bright neighbour lands in a great many
+    # stamps -- and a scene with a bright neighbour is precisely the regime this
+    # project exists to model.  Zero tolerance here would reproduce the same
+    # selection bias the rejection statistics are meant to expose.  The inner
+    # region stays at zero, since that is where the transient goes.
+    "SATURATED": 0.005,
+    "COSMIC_RAY": 0.005,  # mostly rejected during coaddition; a safety net
+    "INTERPOLATED": 0.02,  # smooth synthetic fill; bad for a generative model
 }
+
+#: Measured and recorded for every stamp, never gated on.  ``INEXACT_PSF`` and
+#: ``REJECTED`` cover a large fraction of the DP2 coadd, so a cut on them keeps
+#: almost nothing; ``DETECTED`` marks the targets.  Having the fractions in the
+#: manifest means a cut can still be made later without re-reading pixels.
+COVARIATE_PLANES: tuple[str, ...] = (
+    "INEXACT_PSF",
+    "REJECTED",
+    "DETECTED",
+    "DETECTED_NEGATIVE",
+    "CLIPPED",
+    "SUSPECT",
+)
 
 #: Same planes, applied to the central region, where structure matters most.
 INNER_FRAC_TOL: dict[str, float] = {
-    "SAT": 0.0,
-    "CR": 0.0,
-    "INTRP": 0.0,
-    "CLIPPED": 0.0,
+    "SATURATED": 0.0,
+    "COSMIC_RAY": 0.0,
+    "INTERPOLATED": 0.0,
 }
 
-#: Never gate on this: it marks real sources, and rejecting on it throws away
-#: every patch that contains a galaxy.
-NEVER_REJECT: tuple[str, ...] = ("DETECTED", "DETECTED_NEGATIVE")
+#: Never gate on these: they mark real sources, or cover so much of the coadd
+#: that a cut keeps nothing.
+NEVER_REJECT: tuple[str, ...] = COVARIATE_PLANES
 
 
 def plane_bitmask(plane_dict: dict[str, int], names) -> int:
@@ -99,6 +116,9 @@ def gate(
     zero_tol: tuple[str, ...] = ZERO_TOL,
     frac_tol: dict[str, float] | None = None,
     inner_frac_tol: dict[str, float] | None = None,
+    max_no_data: float = 0.02,
+    max_inner_no_data: float = 0.0,
+    require_known_planes: bool = True,
 ) -> tuple[list[str], dict[str, float]]:
     """Return ``(rejection_reasons, diagnostics)``.  Empty reasons means accept.
 
@@ -113,19 +133,47 @@ def gate(
     if bad:
         raise ValueError(f"refusing to gate on {sorted(bad)}: these mark real sources")
 
+    # The documented DP1->DP2 failure mode: the planes were renamed, so a stale
+    # gate matches nothing and silently passes every stamp.  Absent names are
+    # meant to contribute nothing, but *all* of them being absent means the
+    # mapping is wrong, not that the data is clean.
+    if require_known_planes:
+        wanted = set(zero_tol) | set(frac_tol) | set(inner_frac_tol)
+        if wanted and not (wanted & set(plane_dict)):
+            raise ValueError(
+                f"none of the gated planes {sorted(wanted)} appear in the mask "
+                f"mapping {sorted(plane_dict)}. DP2 renamed SAT->SATURATED, "
+                f"CR->COSMIC_RAY, INTRP->INTERPOLATED, EDGE->DETECTION_EDGE; a "
+                f"stale gate matches nothing and passes everything."
+            )
+
     reasons: list[str] = []
     diag: dict[str, float] = {}
 
-    # DP1 leaves NO_DATA and UNMASKEDNAN unset, so test the pixels themselves.
     if not np.all(np.isfinite(image)):
         reasons.append("nonfinite_image")
-    if not np.all(np.isfinite(variance)):
-        reasons.append("nonfinite_variance")
-    elif np.any(variance <= 0):
-        reasons.append("nonpositive_variance")
+
+    # DP2 marks "no contributing exposures" with inf variance rather than with a
+    # mask plane, and that includes the cores of saturated stars.  Measure the
+    # fraction; rejecting on its mere presence would discard every stamp with a
+    # bright neighbour.
+    no_data = ~np.isfinite(variance) | (variance <= 0)
+    frac_no_data = float(np.mean(no_data))
+    diag["frac_no_data"] = frac_no_data
+    if frac_no_data > max_no_data:
+        reasons.append(f"no_data:{frac_no_data:.4f}>{max_no_data}")
+
+    h, w = np.shape(mask)
+    ih, iw = max(int(h * inner_fraction), 1), max(int(w * inner_fraction), 1)
+    y0, x0 = (h - ih) // 2, (w - iw) // 2
+    inner_slice = (slice(y0, y0 + ih), slice(x0, x0 + iw))
+    inner_no_data = float(np.mean(no_data[inner_slice]))
+    diag["inner_frac_no_data"] = inner_no_data
+    if inner_no_data > max_inner_no_data:
+        reasons.append(f"inner_no_data:{inner_no_data:.4f}>{max_inner_no_data}")
 
     if sky_noise is None:
-        finite = variance[np.isfinite(variance) & (variance > 0)]
+        finite = variance[~no_data]
         sky_noise = float(np.sqrt(np.median(finite))) if finite.size else np.nan
     diag["sky_noise"] = float(sky_noise)
 
@@ -140,14 +188,15 @@ def gate(
         if f > tol:
             reasons.append(f"{plane}:{f:.4f}>{tol}")
 
-    h, w = mask.shape
-    ih, iw = max(int(h * inner_fraction), 1), max(int(w * inner_fraction), 1)
-    y0, x0 = (h - ih) // 2, (w - iw) // 2
-    inner = mask[y0 : y0 + ih, x0 : x0 + iw]
+    inner = mask[inner_slice]
     for plane, tol in sorted(inner_frac_tol.items()):
         f = plane_fraction(inner, plane_dict, plane)
         diag[f"inner_frac_{plane}"] = f
         if f > tol:
             reasons.append(f"inner_{plane}:{f:.4f}>{tol}")
+
+    # Recorded, never gated on -- see COVARIATE_PLANES.
+    for plane in COVARIATE_PLANES:
+        diag[f"frac_{plane}"] = plane_fraction(mask, plane_dict, plane)
 
     return reasons, diag

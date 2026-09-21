@@ -1,9 +1,9 @@
 # make-rubin-host-prior
 
 A fully convolutional, energy-based diffusion prior over static scenes in the
-vicinity of a host galaxy, trained on Rubin DP1 image patches. Intended as the
+vicinity of a host galaxy, trained on Rubin DP2 `deep_coadd` image patches. Intended as the
 prior term in a forward model that extracts a point-source transient light curve
-from LSST visit images. The prior itself is trained on `deep_coadd` images.
+from LSST visit images. The prior itself trains on DP2 `deep_coadd` patches.
 
 The score is the exact gradient of a scalar energy, so it is a conservative
 field — a genuine score, not a network that approximates one.
@@ -16,7 +16,7 @@ python -m pip install -e ".[dev]"
 
 JAX, equinox, optax, numpy and h5py are all that the model and training side
 need. The extraction side additionally needs the LSST Science Pipelines
-(r29.2.0), which are not pip-installable — on NERSC they come from the stack
+(r30.0.11), which are not pip-installable — on NERSC they come from the stack
 environment. `rubin_host_prior.rubin.extract` imports the stack lazily, so
 everything else works on a laptop.
 
@@ -26,7 +26,7 @@ everything else works on a laptop.
 python scripts/smoke_test.py --steps 400
 ```
 
-Generates synthetic DP1-like shards, estimates the per-band offsets, builds the
+Generates synthetic DP2-like shards, estimates the softening scales, builds the
 loader, trains briefly, checkpoints, reloads and samples. Run it after any
 change to the model or the transform; it exercises everything except the Butler,
 so porting to NERSC only has to debug that part.
@@ -40,7 +40,7 @@ python -m pytest            # ~2 min, no cluster, no LSST stack
 ### 1. Extract patches (on NERSC, inside the stack)
 
 ```bash
-python scripts/extract_dp1_patches.py --out data/ecdfs --bands r i --n-hosts 2000 -v
+python scripts/extract_dp2_patches.py --out data/ecdfs --bands r i --n-hosts 2000 -v
 ```
 
 Selects extended objects from the per-tract `object` table, finds covering
@@ -209,7 +209,7 @@ as pixels remain correlated. Measured in the same Gaussian analogue, in 2D:
 | 1.3 | 1.2% |
 
 So you want a margin of roughly **1.5–3 × ξ**. On synthetic patches ξ ≈ 6 pooled
-pixels, giving `2R/ξ ≈ 2.5` at `L = 8` — comfortable. **Measure it on real DP1
+pixels, giving `2R/ξ ≈ 2.5` at `L = 8` — comfortable. **Measure it on real DP2
 data** (see below); if ξ comes back above ~15 pooled pixels, `2R = 16` is only
 ~1 × ξ and you need more layers or a larger analysis margin.
 
@@ -398,41 +398,52 @@ No added noise, no added blur, and none is offered.
 
 ### The artefact gate
 
-Training on `deep_coadd` rather than visit images removes most of what a gate
-would otherwise have to catch: chip edges, cosmic rays and per-exposure
-electronic artefacts are rejected during coaddition. What remains is
-coadd-specific:
+DP2 is not DP1 with more data, and the differences all land here.
 
-- **`NO_DATA` matters here and did not before.** A coadd patch has regions with
-  no contributing exposures — corners, gaps, the footprint edge — and those
-  pixels are not sky, they are nothing. Zero tolerance.
-- **`CLIPPED` and `REJECTED`** mark pixels where outlier rejection fired during
-  coaddition. A little is normal; a lot means the stack disagreed with itself.
-- **`INEXACT_PSF`** marks where the coadd PSF model is approximate, which matters
-  for a project whose forward model needs the PSF.
+**Plane names changed and bit numbers are dynamic.** `SAT` → `SATURATED`,
+`CR` → `COSMIC_RAY`, `INTRP` → `INTERPOLATED`, `EDGE` → `DETECTION_EDGE`, and the
+bit assignments are not stable across releases. A DP1-era gate does not error on
+DP2 — it matches nothing and passes every stamp. Nothing here hard-codes a bit:
+extraction repacks each mask into a `uint32` using a mapping derived from the
+coadd's own `mask.schema`, stores that mapping with the shard, and `gate`
+**raises** if none of the planes it is asked to gate on appear in the mapping.
+That last check is the difference between a loud failure and a silently useless
+training set.
 
-Several planes are never set in `deep_coadd` — `BAD`, `CROSSTALK`,
-`DETECTED_NEGATIVE`, `ITL_DIP`, `NOT_DEBLENDED`, `STREAK`, `UNMASKEDNAN`,
-`VIGNETTED` — so gating on them would do nothing. They are left out rather than
-listed for show. `plane_bitmask` ignores names absent from the mask's own
-dictionary, so the gate degrades safely if a release starts or stops setting one.
+**No-data is carried by the variance, not by a plane.** DP2 variance holds `inf`
+where there were no contributing exposures, including the cores of saturated
+stars. The fraction is measured, with a tolerance, and zero tolerance at the
+centre where the transient goes. Rejecting merely because non-finite variance is
+*present* would discard every stamp containing a bright neighbour.
 
-Tolerances for `CR` and `INTRP` are tighter than the DP1 documentation
-recommends, deliberately. That table is written for *measurement*, where an
-interpolated pixel barely perturbs a flux. Here the model is learning a
-distribution over pixel values, and an interpolated pixel is a smooth synthetic
-patch teaching structure that is not in the sky. Every fraction is recorded in
-the manifest, so they can be loosened later without re-reading pixels.
+**`SATURATED` gets a fraction, not zero.** DP1 excluded any saturation outright.
+On a DP2 coadd the saturated core of a bright neighbour lands in a great many
+stamps, and a scene with a bright neighbour is exactly the regime this project
+models — so a small fraction away from the centre is kept, and the manifest
+records how much.
 
-`DETECTED` is never a rejection reason — gating on it would throw away every
-patch containing a galaxy — and `gate` raises if you try.
+**`INEXACT_PSF` and `REJECTED` are not quality cuts.** They cover a large
+fraction of the DP2 coadd, so gating on them keeps almost nothing. They are
+recorded as per-stamp covariates (`frac_inexact_psf`, `frac_rejected`,
+`frac_no_data`) so a cut can still be made from the manifest without re-reading
+pixels — and so `hosts.png` can show you whether the PSF your forward model
+relies on is approximate over most of the training set. `DETECTED` is
+informational; rejecting on it would reject every patch containing a galaxy.
 
-**There is no background check.** DP1's background subtraction leaves dark
-haloes and dark edges around bright sources, and the data is taken as-is with
-those included: they are a property of the current processing that a later
-release will improve, so the prior learns them and you retrain rather than
-filter. The softplus transform carries arbitrarily negative pixels without a
-floor, so keeping them costs nothing.
+**Neither release masks satellite trails in what you train on.** DP2 coadds have
+no `STREAK` plane at all. Trails and unmasked electronics artefacts need your own
+detection step; nothing here will catch them.
+
+Tolerances for `COSMIC_RAY` and `INTERPOLATED` are tighter than the documentation
+recommends, deliberately: that guidance is written for *measurement*, where an
+interpolated pixel barely perturbs a flux, whereas here the model is learning a
+distribution over pixel values and an interpolated pixel is smooth synthetic fill
+teaching structure that is not in the sky.
+
+**There is no background check.** DP2 coadds are over-subtracted around extended
+galaxies and the background is recoverable via `apply_background`. The images are
+taken **as delivered**, without restoration, and every shard records
+`background_restored=0` so a set made the other way is distinguishable.
 
 ### Storage
 
@@ -452,28 +463,47 @@ native stamps.
 
 ## Porting to NERSC: what to verify
 
-The model, loss, loader and gate are all tested locally. The Butler layer is not,
-and these items are flagged `WARN` in `rubin/extract.py`:
+The model, loss, loader and gate are tested locally. The Butler and `lsst.images`
+layer is not. **The DP2 skill shipped only its overview — `references/dp2-facts.md`
+and `references/dp2-images-api.md` were not available** — so the items below are
+written from the overview's description of the semantics, not from verified
+signatures. They are collected so each is a one-line fix.
 
-- [ ] **Repo alias.** `"dp1"` is the RSP label. Check `Butler.get_known_repos()`
-      or `$DAF_BUTLER_REPOSITORY_INDEX`; pass a path if it differs. Never open the
-      shared mirror writeable.
-- [ ] **Component names.** `deep_coadd.wcs` follows the verified DP1 idiom;
-      `deep_coadd.bbox` follows the same pattern but is unconfirmed. The
-      containment pre-check degrades to "unknown" rather than failing, and the
-      stamp shape is checked after the read regardless, so a clipped stamp is
-      rejected rather than padded.
-- [ ] **`detect_isPrimary`.** Standard in LSST object tables but absent from the
-      DP1 tutorials. Requested, with a fall back to deduplicating on `objectId`.
-      Without one of the two, tract-overlap regions are silently oversampled.
-- [ ] **`order_by=["band.name"]`** on the coadd query — `band.name` rather than
-      `band` is the verified spelling for *where* clauses; the `order_by` form is
-      assumed to match.
-- [ ] Confirm `BUNIT`, but do not trust it — the header once reported `'adu'` for
-      nJy pixels (DM-51270). Pixels are nJy either way.
+- [ ] **`REPO` / `COLLECTION`** in `rubin/extract.py` — `"dp2"` and
+      `"LSSTCam/DP2"` are guesses. Check `Butler.get_known_repos()`,
+      `$DAF_BUTLER_REPOSITORY_INDEX`, `butler.collections.query("*")`.
+- [ ] **`DP2_ATTRS`** — the `CellCoadd` attribute names for image, variance,
+      mask, psf, wcs, schema and origin. Every access goes through `_attr`,
+      which on failure reports what the object actually offers, so a wrong name
+      produces a useful error rather than a crash.
+- [ ] **`PIXEL_ORIGIN`.** DP2 has two conventions: `sky_projection` works in
+      *tract* coordinates, `astropy_wcs` in *patch-local*. Mixing them misplaces
+      a position by up to a patch — far enough to land on the wrong galaxy, close
+      enough to look plausible. This module commits to patch-local and then
+      round-trips **every** stamp centre back to the sky, rejecting anything more
+      than `CENTRE_TOLERANCE_ARCSEC` from the position asked for. If the
+      convention is wrong, the first patch fails loudly with `centre_mismatch`
+      in the manifest instead of quietly producing a mis-centred training set.
+      **Check the rejection counts for `centre_mismatch` on your first run.**
+- [ ] **`Box.factory` is `[y, x]`** — numpy order, the opposite of DP1's
+      `Box2I(x, y)`. `_stamp_box` assumes this.
+- [ ] **`coadd[box]` returns a view**, so `_extract` calls `.copy()`. If the API
+      instead returns a copy this is merely wasteful, not wrong.
+- [ ] **PSF accessor.** `psf_bundle` tries several spellings and gives up
+      cleanly; the moments are computed from the returned stamp locally, so they
+      do not depend on an unverified accessor.
+- [ ] **Object-table columns** assumed unchanged from DP1 (`coord_ra`,
+      `shape_xx`, `refExtendedness`, `{b}_cModelFlux`, `detect_isPrimary`).
+- [ ] **Field coordinates.** ECDFS is a standard deep-drilling field so DP2 very
+      likely covers it, but the DP2 field list was not available.
+- [ ] Pixels are nJy in both releases; do not apply a calibration step.
 
 ## Open questions and known gaps
 
+- **Source injection on DP2 is uncharted.** `CoaddInjectTask` against a
+  `CellCoadd` is untested, and DP1 is the only release with per-visit pixels and
+  difference images — so an injection campaign or a diffim comparison still has
+  to happen on DP1 even though the prior trains on DP2.
 - **Coadd noise is correlated, and that is handled by measurement.** Warping
   onto the skymap grid makes neighbouring pixels share flux, so averaging `P²`
   pixels reduces the noise by *less* than `P`. `measure_pooled_sky_noise` reads
@@ -505,10 +535,10 @@ src/rubin_host_prior/
   training/          trainer.py, ema.py, checkpoint.py
   plots.py           diagnostic figures (matplotlib imported lazily)
   data/              transform.py, pooling.py, augment.py, shards.py, dataset.py,
-                     diagnostics.py (correlation length), synthetic.py (DP1-like
+                     diagnostics.py (correlation length), synthetic.py (DP2-like
                      fake data for offline testing)
   rubin/             quality.py (stack-free gate), extract.py (lazy LSST imports)
-scripts/             extract_dp1_patches.py, diagnose.py, prepare_config.py,
+scripts/             extract_dp2_patches.py, diagnose.py, prepare_config.py,
                      train.py, sample.py, smoke_test.py
 tests/               ~100 tests, no cluster and no LSST stack required
 ```
