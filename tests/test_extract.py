@@ -16,6 +16,7 @@ import pytest
 
 from rubin_host_prior.rubin.extract import (
     OBJECT_COLUMNS,
+    OBJECT_BAND_COLUMNS,
     PHOTOMETRY_BANDS,
     SIGMA_TO_FWHM,
     _adaptive_moments,
@@ -37,8 +38,8 @@ Table = pytest.importorskip("astropy.table").Table
 
 def _catalogue(n=3000, seed=0, band="r"):
     rng = np.random.default_rng(seed)
-    ixx = 10 ** rng.uniform(0.4, 2.4, n)
-    iyy = 10 ** rng.uniform(0.4, 2.4, n)
+    ixx = 10 ** rng.uniform(0.4, 3.2, n)
+    iyy = 10 ** rng.uniform(0.4, 3.2, n)
     reff = np.sqrt(0.5 * (ixx + iyy)) * 0.2 * 1.177  # trace px -> half-light arcsec
     return Table({
         "objectId": np.arange(n),
@@ -51,13 +52,14 @@ def _catalogue(n=3000, seed=0, band="r"):
         f"{band}_ixx": ixx,
         f"{band}_iyy": iyy,
         f"{band}_ixy": rng.normal(0, 5, n),
-        # Half-light radius tracks the moments trace, as it does on the sky, so
-        # the two size cuts are consistent with each other.
-        f"{band}_cModel_exp_reff_major": reff,
-        f"{band}_cModel_exp_reff_minor": 0.7 * reff,
-        f"{band}_cModel_dev_reff_major": reff,
-        f"{band}_cModel_dev_reff_minor": 0.7 * reff,
-        f"{band}_cModel_fracDev": rng.uniform(0, 1, n),
+        # The multiband Sersic fit: one morphology for all six bands, so these
+        # carry no band prefix. Size tracks the moments trace, as it does on the
+        # sky, so the two size cuts stay consistent with each other.
+        "sersic_reff_major": reff,
+        "sersic_reff_minor": 0.7 * reff,
+        "sersic_index": rng.uniform(0.5, 6.0, n),
+        "sersic_unknown_flag": np.zeros(n, bool),
+        "sersic_no_data_flag": np.zeros(n, bool),
     })
 
 
@@ -72,20 +74,11 @@ def test_object_columns_do_not_ask_for_dp1_only_names():
     assert {"objectId", "coord_ra", "coord_dec", "refExtendedness"} <= set(OBJECT_COLUMNS)
 
 
-def test_photometry_bands_exclude_z_and_y():
-    """Coadd images exist in all six bands, but the Object table carries
-    photometry and shapes only for ugri."""
-    assert PHOTOMETRY_BANDS == ("u", "g", "r", "i")
-    for b in ("z", "y"):
-        assert b not in PHOTOMETRY_BANDS
-
-
-def test_selecting_on_a_band_without_photometry_is_refused():
-    with pytest.raises(ValueError, match="no DP2 Object photometry"):
-        select_hosts(_catalogue(), band="z")
-
-
-# -- second moments --------------------------------------------------------
+def test_selecting_on_an_unknown_band_is_refused():
+    """Requesting a column that does not exist fails the whole read, so the band
+    is checked before any of them is built."""
+    with pytest.raises(ValueError, match="photometry"):
+        select_hosts(_catalogue(), band="H")
 
 
 def test_trace_radius_uses_per_band_moments():
@@ -147,7 +140,7 @@ def test_select_hosts_dedupes_before_selecting():
     assert len(select_hosts(doubled, band="r")) == len(select_hosts(t, band="r"))
 
 
-def _sized_catalogue(n, scale=0.25, seed=1, size_mult=1.0):
+def _sized_catalogue(n, scale=0.25, seed=1, size_mult=25.0):
     """A catalogue with a steep size distribution, as a real one has."""
     rng = np.random.default_rng(seed)
     trace_sq = size_mult * 10 ** rng.exponential(scale, n)
@@ -159,11 +152,11 @@ def _sized_catalogue(n, scale=0.25, seed=1, size_mult=1.0):
         "refExtendedness": np.ones(n),
         "r_cModelFlux": 10 ** rng.uniform(2.6, 4.5, n),
         "r_ixx": trace_sq, "r_iyy": trace_sq, "r_ixy": np.zeros(n),
-        "r_cModel_exp_reff_major": reff,
-        "r_cModel_exp_reff_minor": 0.7 * reff,
-        "r_cModel_dev_reff_major": reff,
-        "r_cModel_dev_reff_minor": 0.7 * reff,
-        "r_cModel_fracDev": rng.uniform(0, 1, n),
+        "sersic_reff_major": reff,
+        "sersic_reff_minor": 0.7 * reff,
+        "sersic_index": rng.uniform(0.5, 6.0, n),
+        "sersic_unknown_flag": np.zeros(n, bool),
+        "sersic_no_data_flag": np.zeros(n, bool),
     })
 
 
@@ -181,12 +174,12 @@ def test_size_stratification_actually_stratifies():
     """
     t = _sized_catalogue(4000, seed=1)
     kw = dict(band="r", min_reff_arcsec=None)  # isolate stratification from the cut
-    parent = host_half_light_arcsec(select_hosts(t, **kw), "r")
+    parent = host_half_light_arcsec(select_hosts(t, **kw))
     big = np.percentile(parent, 90)
 
-    strat = host_half_light_arcsec(select_hosts(t, n_hosts=50, seed=0, **kw), "r")
+    strat = host_half_light_arcsec(select_hosts(t, n_hosts=50, seed=0, **kw))
     flat = host_half_light_arcsec(
-        select_hosts(t, n_hosts=50, seed=0, size_stratified=False, **kw), "r"
+        select_hosts(t, n_hosts=50, seed=0, size_stratified=False, **kw)
     )
     assert np.mean(strat > big) > 4 * np.mean(flat > big)
     assert np.median(strat) > np.median(flat)
@@ -337,78 +330,86 @@ def test_extracted_fields_survive_the_conversion():
 # -- host size -------------------------------------------------------------
 
 
-def _two_component(exp, dev, frac, band="r"):
-    n = len(exp)
+def _sersic(reff, unknown=False, no_data=False, minor=None):
+    reff = np.atleast_1d(np.asarray(reff, float))
+    n = len(reff)
     return Table({
-        f"{band}_cModel_exp_reff_major": np.asarray(exp, float),
-        f"{band}_cModel_dev_reff_major": np.asarray(dev, float),
-        f"{band}_cModel_fracDev": np.asarray(frac, float),
+        "sersic_reff_major": reff,
+        "sersic_reff_minor": np.full(n, 0.6) * reff if minor is None else minor,
+        "sersic_unknown_flag": np.full(n, unknown),
+        "sersic_no_data_flag": np.full(n, no_data),
     })
 
 
-def test_half_light_follows_the_component_that_has_the_flux():
-    """DP2 publishes no combined cModel radius, and whichever component carries
-    no flux has a radius to match. fracDev is the fit's own statement of how the
-    flux divides, so weighting by it gives the runaway component no say."""
-    t = _two_component(exp=[2.0, 2.0, 2.0], dev=[8.0, 8.0, 8.0], frac=[0.0, 1.0, 0.5])
-    assert host_half_light_arcsec(t, "r") == pytest.approx([2.0, 8.0, 5.0])
+def test_size_comes_from_the_multiband_sersic_fit():
+    """One morphology fit to all six bands at once, so the column carries no band
+    prefix and does not inherit the band-to-band scatter of a per-band fit."""
+    assert "sersic_reff_major" in OBJECT_COLUMNS
+    assert not any(c.startswith("{b}_sersic") or "reff" in c
+                   for c in OBJECT_BAND_COLUMNS)
+    assert host_half_light_arcsec(_sersic([3.2, 5.0])) == pytest.approx([3.2, 5.0])
 
 
-def test_half_light_is_neither_the_larger_nor_the_smaller_component():
-    """Taking max would admit small galaxies whose unconstrained component ran
-    away; taking min would reject large ones whose component collapsed."""
-    t = _two_component(exp=[0.4], dev=[9.0], frac=[0.05])
-    r = float(host_half_light_arcsec(t, "r")[0])
-    assert 0.4 < r < 9.0 and r == pytest.approx(0.83, abs=0.01)
+def test_a_failed_sersic_fit_is_not_a_size():
+    """The flags are the only thing separating a fit from whatever was left in
+    the column when it failed, and a size cut compares NaN away but not junk."""
+    assert np.isnan(host_half_light_arcsec(_sersic([4.0], unknown=True))[0])
+    assert np.isnan(host_half_light_arcsec(_sersic([4.0], no_data=True))[0])
 
 
-def test_a_missing_component_shifts_the_weight_rather_than_zeroing_it():
-    t = _two_component(exp=[3.0], dev=[np.nan], frac=[0.8])
-    assert host_half_light_arcsec(t, "r") == pytest.approx([3.0])
+def test_nonsensical_radii_are_nan():
+    out = host_half_light_arcsec(_sersic([np.nan, 0.0, -1.0, 4.0]))
+    assert np.isnan(out[:3]).all() and out[3] == 4.0
 
 
-def test_half_light_is_nan_when_neither_component_was_fit():
-    t = _two_component(exp=[np.nan], dev=[np.nan], frac=[0.5])
-    assert np.isnan(host_half_light_arcsec(t, "r")[0])
-
-
-def test_a_missing_fracDev_is_refused_not_guessed():
-    t = _two_component(exp=[1.0], dev=[1.0], frac=[0.5])
-    t.remove_column("r_cModel_fracDev")
-    with pytest.raises(KeyError, match="fracDev"):
-        host_half_light_arcsec(t, "r")
-
-
-def test_minor_axis_is_available_but_not_the_default():
-    t = _catalogue(50)
-    major = host_half_light_arcsec(t, "r", axis="major")
-    minor = host_half_light_arcsec(t, "r", axis="minor")
-    assert np.all(minor < major)
+def test_the_minor_axis_is_available_but_not_the_default():
+    t = _sersic([5.0])
+    assert host_half_light_arcsec(t, axis="minor")[0] == pytest.approx(3.0)
     with pytest.raises(ValueError):
-        host_half_light_arcsec(t, "r", axis="circularised")
+        host_half_light_arcsec(t, axis="circularised")
+
+
+def test_passing_a_band_fails_loudly():
+    """The fit is multiband. A call written against the old per-band signature
+    must not be silently reinterpreted."""
+    with pytest.raises(ValueError, match="axis"):
+        host_half_light_arcsec(_sersic([5.0]), "r")
+
+
+def test_a_missing_sersic_column_is_refused_not_guessed():
+    t = _sersic([5.0])
+    t.remove_column("sersic_reff_major")
+    with pytest.raises(KeyError, match="sersic"):
+        host_half_light_arcsec(t)
+
+
+def test_all_six_bands_carry_photometry():
+    """Corrects an earlier reading of the rendered HTML schema page, which is
+    large enough that an excerpt gives a confidently wrong answer. The schema
+    YAML has u..y for cModelFlux, ixx and sersicFlux alike."""
+    assert PHOTOMETRY_BANDS == ("u", "g", "r", "i", "z", "y")
 
 
 def test_small_hosts_are_cut():
     """The catalogue is dominated by galaxies a pixel or two across, which carry
     no structure for a prior to learn from."""
     t = _sized_catalogue(3000, scale=0.6, seed=7)
-    out = select_hosts(t, band="r", min_reff_arcsec=1.0)
-    assert len(out) and np.all(host_half_light_arcsec(out, "r") >= 1.0)
+    out = select_hosts(t, band="r", min_reff_arcsec=3.0)
+    assert len(out) and np.all(host_half_light_arcsec(out) >= 3.0)
     assert len(out) < len(select_hosts(t, band="r", min_reff_arcsec=None))
 
 
 def test_the_size_cut_can_be_turned_off():
     t = _sized_catalogue(3000, scale=0.6, seed=7)
     loose = select_hosts(t, band="r", min_reff_arcsec=None)
-    assert np.nanmin(host_half_light_arcsec(loose, "r")) < 1.0
+    assert np.nanmin(host_half_light_arcsec(loose)) < 3.0
 
 
-def test_hosts_without_a_cmodel_fit_do_not_pass_the_size_cut():
+def test_hosts_without_a_sersic_fit_do_not_pass_the_size_cut():
     """NaN is not a size. It must not compare its way through the cut."""
     t = _sized_catalogue(400, scale=0.6, seed=8)
-    for col in ("r_cModel_exp_reff_major", "r_cModel_dev_reff_major"):
-        t[col][:200] = np.nan
-    out = select_hosts(t, band="r", min_reff_arcsec=1.0)
+    t["sersic_no_data_flag"][:200] = True
+    out = select_hosts(t, band="r", min_reff_arcsec=3.0)
     assert len(out) and np.all(np.asarray(out["objectId"]) >= 200)
 
 

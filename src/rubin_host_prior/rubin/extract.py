@@ -123,6 +123,13 @@ CENTRE_TOLERANCE_ARCSEC = 1.0
 #: -- and there are no ``detect_*`` columns at all, so ``detect_isPrimary`` is
 #: not available for dropping deblend and overlap duplicates.  See
 #: ``dedupe_hosts``.
+#:
+#: The ``sersic_*`` columns are the multiband fit and carry no band prefix: one
+#: morphology fit to all six bands at once, which is why it is the size
+#: measurement here.  ``sersic_reff_major`` is in **arcsec** (unlike
+#: ``sersic_reff_x``, which is in pixels) and is the radius *before* convolution
+#: with the PSF, so it is the galaxy's intrinsic size rather than its observed
+#: extent.
 OBJECT_COLUMNS = [
     "objectId",
     "coord_ra",
@@ -131,21 +138,26 @@ OBJECT_COLUMNS = [
     "refBand",
     "tract",
     "patch",
+    "sersic_reff_major",
+    "sersic_reff_minor",
+    "sersic_index",
+    # Booleans marking a fit that failed or had nothing to fit.  Without them a
+    # failed fit contributes whatever happened to be in the column.
+    "sersic_unknown_flag",
+    "sersic_no_data_flag",
+    "sersic_chi2_reduced",
 ]
 
-#: Bands for which the DP2 Object table carries photometry and shapes.  Coadd
-#: *images* exist in all six, so z and y stamps are extractable; only the
-#: catalogue quantities are missing there, which costs neighbour fluxes and host
-#: magnitudes in those bands.  Requesting a column that does not exist fails the
-#: whole read, so the request is intersected with this list.
-PHOTOMETRY_BANDS = ("u", "g", "r", "i")
+#: Bands for which the DP2 Object table carries photometry and shapes.  Verified
+#: against the schema YAML (``sdm_schemas``, ``drp_base.yaml``), which is the
+#: source to use: the rendered HTML schema page is large enough that reading it
+#: in excerpts gives a confidently wrong answer about which bands exist.
+PHOTOMETRY_BANDS = ("u", "g", "r", "i", "z", "y")
 
 #: Added per band in ``PHOTOMETRY_BANDS``.  ``_ixx``/``_iyy``/``_ixy`` are
-#: Gaussian-weighted adaptive moments in pixel^2; the ``reff`` columns are
-#: half-light ellipse axes in arcsec.  DP2 publishes no single combined cModel
-#: radius -- only the exponential and de Vaucouleurs components separately -- so
-#: ``_cModel_fracDev`` comes along to weight them; see
-#: ``host_half_light_arcsec``.
+#: Gaussian-weighted adaptive moments in pixel^2, kept for ellipticity and as a
+#: non-parametric size cross-check.  Size itself comes from the band-independent
+#: ``sersic_reff_major`` in ``OBJECT_COLUMNS``, not from anything per band.
 OBJECT_BAND_COLUMNS = [
     "{b}_cModelFlux",
     "{b}_cModelFluxErr",
@@ -153,11 +165,6 @@ OBJECT_BAND_COLUMNS = [
     "{b}_ixx",
     "{b}_iyy",
     "{b}_ixy",
-    "{b}_cModel_dev_reff_major",
-    "{b}_cModel_dev_reff_minor",
-    "{b}_cModel_exp_reff_major",
-    "{b}_cModel_exp_reff_minor",
-    "{b}_cModel_fracDev",
 ]
 
 #: ECDFS, still in tract 5063 as on DP1, and the field the DP2 tutorials use
@@ -379,51 +386,38 @@ def host_trace_radius_px(table, band: str) -> np.ndarray:
     return np.sqrt(np.maximum(0.5 * (ixx + iyy), 0.0))
 
 
-def host_half_light_arcsec(table, band: str, axis: str = "major") -> np.ndarray:
-    """Half-light radius in arcsec, blending the two cModel components.
+def host_half_light_arcsec(table, axis: str = "major") -> np.ndarray:
+    """Half-light radius in arcsec, from the multiband Sersic fit.
 
-    DP2 publishes no combined cModel radius: the exponential and de Vaucouleurs
-    half-light ellipses are separate columns, and whichever component carries
-    little flux has a correspondingly ill-constrained radius.  Taking the larger
-    of the two would admit small galaxies whose unconstrained component ran away,
-    and taking the smaller would reject large ones whose unconstrained component
-    collapsed.  Weighting by ``fracDev`` -- the fit's own statement of how the
-    flux divides -- gives the runaway component no say precisely when it has no
-    flux to justify it.
+    ``sersic_reff_major`` carries no band prefix: it is one morphology fit to all
+    six bands at once, so it does not inherit the band-to-band scatter of a
+    per-band fit and does not have to be blended across components the way
+    cModel's separate exponential and de Vaucouleurs radii do.
 
-    ``major`` is the default rather than the circularised ``sqrt(a*b)`` because
-    the point of a size cut here is structure to learn from, and an inclined disc
-    at a = 2", b = 0.4" has plenty of it while circularising would call it 0.9"
-    and throw it away.
+    Two things to know about what it means.  It is in **arcsec** -- unlike
+    ``sersic_reff_x``, which is the same quantity in pixels -- and it is measured
+    *before* convolution with the PSF, so it is the galaxy's intrinsic size
+    rather than its observed extent.  The seen object is a little larger.
 
-    NaN where neither component was fit.
+    NaN where the fit failed, had no data, or is absent, so a failure cannot
+    compare its way through a size cut.
     """
     if axis not in ("major", "minor"):
         raise ValueError(f"axis must be 'major' or 'minor', not {axis!r}")
-    cols = {k: f"{band}_cModel_{k}_reff_{axis}" for k in ("exp", "dev")}
-    frac_col = f"{band}_cModel_fracDev"
+    col = f"sersic_reff_{axis}"
     have = _colnames(table)
-    missing = [c for c in (*cols.values(), frac_col) if c not in have]
-    if missing:
+    if col not in have:
         raise KeyError(
-            f"{missing} not in the object table. DP2 half-light radii are per "
-            f"band and split into exp/dev components, and only "
-            f"{PHOTOMETRY_BANDS} carry them. Columns present: "
-            f"{sorted(c for c in have if 'reff' in c or 'fracDev' in c)[:12]}"
+            f"{col!r} not in the object table. It is the multiband Sersic fit and "
+            f"carries no band prefix. Columns present: "
+            f"{sorted(c for c in have if 'sersic' in c or 'reff' in c)[:12]}"
         )
-    exp = np.asarray(table[cols["exp"]], dtype=float)
-    dev = np.asarray(table[cols["dev"]], dtype=float)
-    frac = np.asarray(table[frac_col], dtype=float)
-    frac = np.where(np.isfinite(frac), np.clip(frac, 0.0, 1.0), 0.0)
-
-    exp_ok = np.isfinite(exp) & (exp > 0)
-    dev_ok = np.isfinite(dev) & (dev > 0)
-    # A weighted mean over whichever components exist, renormalised so that a
-    # missing component shifts the weight onto the other rather than to zero.
-    weight = np.where(exp_ok, 1.0 - frac, 0.0) + np.where(dev_ok, frac, 0.0)
-    total = (np.where(exp_ok, exp, 0.0) * (1.0 - frac)
-             + np.where(dev_ok, dev, 0.0) * frac)
-    return np.where(weight > 0, total / np.maximum(weight, 1e-12), np.nan)
+    r = np.asarray(table[col], dtype=float)
+    ok = np.isfinite(r) & (r > 0)
+    for flag in ("sersic_unknown_flag", "sersic_no_data_flag"):
+        if flag in have:
+            ok &= ~np.asarray(table[flag], dtype=bool)
+    return np.where(ok, r, np.nan)
 
 
 def select_hosts(
@@ -435,7 +429,7 @@ def select_hosts(
     seed: int = 0,
     exclude_ids: set[int] | None = None,
     size_stratified: bool = True,
-    min_reff_arcsec: float = 1.0,
+    min_reff_arcsec: float = 3.0,
     min_trace_px: float = 1.75,
     dedupe_radius_arcsec: float = 0.5,
     n_size_bins: int = 5,
@@ -444,13 +438,17 @@ def select_hosts(
 
     ``flux_range`` bounds are 360 nJy (r = 25.0) to 36000 nJy (r = 20.0).
 
-    ``min_reff_arcsec`` is the real size cut: the cModel half-light major axis,
-    blended across the two components by ``fracDev``.  The catalogue is dominated
-    by galaxies a pixel or two across, which carry no structure for a prior to
-    learn, and they would otherwise be most of the sample.  For scale, at the DP2
-    pixel of 0.2 arcsec a 1 arcsec half-light radius is 5 native pixels, which is
-    1.7 pixels after the 3x pooling -- small, but the visible galaxy runs to
-    several half-light radii beyond it.
+    ``min_reff_arcsec`` is the real size cut, on ``sersic_reff_major`` from the
+    multiband Sersic fit.  The catalogue is dominated by galaxies a pixel or two
+    across, which carry no structure for a prior to learn, and they would
+    otherwise be most of the sample.  At the DP2 pixel of 0.2 arcsec the default
+    3 arcsec is 15 native pixels of half-light radius, 5 after the 3x pooling,
+    with the visible galaxy running several half-light radii beyond that.
+
+    That is a demanding cut: galaxies this large are rare, so a small field will
+    not supply many of them and ``--radius-deg`` is the knob that matters more
+    than ``--n-hosts``.  The count surviving is logged, split by whether the
+    object was too small or simply had no usable Sersic fit.
 
     ``refExtendedness`` is a hard 0/1 threshold on a flux ratio, so it is
     unreliable near the faint limit -- a cut on it alone at r > 23 admits a lot
@@ -503,14 +501,14 @@ def select_hosts(
     trace = host_trace_radius_px(t, band)
     keep &= np.isfinite(trace) & (trace > min_trace_px)
 
-    reff = host_half_light_arcsec(t, band)
+    reff = host_half_light_arcsec(t)
     if min_reff_arcsec is not None:
         big_enough = np.isfinite(reff) & (reff >= min_reff_arcsec)
         # Split the loss, because "no cModel fit" and "genuinely small" are very
         # different statements about the selection function.
         log.info(
             "half-light cut at %.2f\": %d of %d survive; %d dropped as smaller, "
-            "%d for having no cModel fit",
+            "%d for having no usable Sersic fit",
             min_reff_arcsec, int((keep & big_enough).sum()), int(keep.sum()),
             int((keep & np.isfinite(reff) & ~big_enough).sum()),
             int((keep & ~np.isfinite(reff)).sum()),
@@ -783,7 +781,7 @@ def extract_patches(
     jitter_arcsec: float = 4.0,
     host_flux_range: tuple[float, float] = (360.0, 36000.0),
     max_blendedness: float | None = None,
-    min_reff_arcsec: float = 1.0,
+    min_reff_arcsec: float = 3.0,
     patches_per_shard: int = 1024,
     max_patches: int | None = None,
     neighbour_radius_arcsec: float = 30.0,

@@ -73,9 +73,11 @@ def main() -> None:
         help="give up topping up towards --n-patches after this many rounds",
     )
     p.add_argument(
-        "--min-reff-arcsec", type=float, default=1.0,
-        help="host cModel half-light major axis floor. The catalogue is mostly "
-             "galaxies a pixel or two across, which carry no structure to learn",
+        "--min-reff-arcsec", type=float, default=3.0,
+        help="host half-light major axis floor, from the multiband Sersic fit. "
+             "The catalogue is mostly galaxies a pixel or two across, which carry "
+             "no structure to learn. Galaxies above 3 arcsec are rare, so widen "
+             "--radius-deg rather than raising --n-hosts if the yield is short",
     )
     p.add_argument(
         "--max-variance-step", type=float, default=MAX_VARIANCE_STEP,

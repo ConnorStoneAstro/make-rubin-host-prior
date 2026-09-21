@@ -265,8 +265,8 @@ def plot_hosts(shards, hosts=None, band: str = "r", out: Path | None = None):
             # and which the size cut is made on; fall back to the moments trace
             # converted with the pixel scale.
             try:
-                size = host_half_light_arcsec(hosts, band)
-                label = "half-light major axis (arcsec)"
+                size = host_half_light_arcsec(hosts)
+                label = "Sersic half-light major axis (arcsec)"
             except KeyError:
                 size = np.sqrt(np.maximum(0.5 * (ixx + iyy), 0)) * scale
                 label = "trace radius (arcsec)"
@@ -278,6 +278,12 @@ def plot_hosts(shards, hosts=None, band: str = "r", out: Path | None = None):
                 mag = -2.5 * np.log10(np.where(flux > 0, flux, np.nan)) + 31.4
             panels.append((f"host magnitude ({band})", mag, 40,
                            f"{band} cModel mag", False))
+        if "sersic_index" in cols:
+            # n ~ 1 is a disc, n ~ 4 an elliptical: the two kinds of host this
+            # prior is meant to cover, so the balance between them matters.
+            panels.append(("host Sersic index",
+                           np.asarray(hosts["sersic_index"], dtype=float), 40,
+                           "n (1 = exponential, 4 = de Vaucouleurs)", False))
         bcol = f"{band}_blendedness"
         if bcol in cols:
             panels.append(("host blendedness", np.asarray(hosts[bcol], dtype=float),

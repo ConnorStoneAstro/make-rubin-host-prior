@@ -494,11 +494,13 @@ than loudly, so `select_hosts` is built to fail loudly instead:
   (`{band}_ixx`, `{band}_iyy`, `{band}_ixy`, in pixel²). `host_trace_radius_px`
   raises if they are absent rather than returning NaN, because every caller uses
   it to avoid a sample dominated by the smallest, faintest galaxies.
-- **Only `ugri` carry photometry and shapes.** Coadd *images* exist in all six
-  bands, so z and y stamps are extractable; only the catalogue quantities are
-  missing, costing neighbour fluxes and host magnitudes there. Requesting a
-  column that does not exist fails the whole read, so the request is intersected
-  with `PHOTOMETRY_BANDS` and the shortfall is logged.
+- **All six bands carry photometry and shapes.** `u` through `y` all have
+  `_cModelFlux`, `_ixx` and `_sersicFlux`. An earlier version of this file said
+  only `ugri` did; that came from reading the *rendered* schema page in excerpts,
+  which is long enough to truncate mid-table and give a confidently wrong answer.
+  Check column questions against the schema YAML in `lsst/sdm_schemas`
+  (`python/lsst/sdm/schemas/drp_base.yaml`), which is small enough to grep and
+  carries the units as `ivoa:unit`.
 - **There are no `detect_*` columns at all**, so `detect_isPrimary` is not
   available for dropping duplicates — and tracts and patches overlap, so a
   source in an overlap region appears twice, across two tracts under two
@@ -507,28 +509,34 @@ than loudly, so `select_hosts` is built to fail loudly instead:
 - DP2 also offers continuous `{band}_sizeExtendedness` and
   `{band}_model_extendedness`, either a better primary cut than the hard 0/1
   `refExtendedness` if the sample turns out to need one, and
-  `{band}_cModel_{exp,dev}_reff_{major,minor}` — half-light ellipse axes directly
-  in arcsec, which the size cut and the diagnostic plots use in preference to the
-  moments trace.
+  the band-independent `sersic_*` block — `reff_major`/`reff_minor` in arcsec,
+  `index`, `theta`, `rho`, and per-band `{band}_sersicFlux` for all six bands —
+  which is what the size cut and the diagnostic plots use.
 
-**Hosts must be at least 1″ across.** `min_reff_arcsec` cuts on the cModel
-half-light radius, and it is the cut that decides what the prior sees: the
-catalogue is dominated by galaxies a pixel or two across, which carry no
-structure to learn from, and without it they are most of the sample. At the DP2
-pixel of 0.2″ a 1″ half-light radius is 5 native pixels, or 1.7 after the 3×
-pooling — small, but the visible galaxy runs to several half-light radii beyond
-it.
+**Hosts must be at least 3″ across.** `min_reff_arcsec` is the cut that decides
+what the prior sees: the catalogue is dominated by galaxies a pixel or two
+across, which carry no structure to learn from, and without it they are most of
+the sample. At the DP2 pixel of 0.2″ a 3″ half-light radius is 15 native pixels,
+or 5 after the 3× pooling, with the visible galaxy running several half-light
+radii beyond that.
 
-DP2 publishes no single combined cModel radius, only the exponential and de
-Vaucouleurs half-light ellipses separately, and whichever component carries
-little flux has a correspondingly ill-constrained radius. Taking the larger would
-admit small galaxies whose unconstrained component ran away; taking the smaller
-would reject large ones whose component collapsed. `host_half_light_arcsec`
-weights the two by `fracDev` — the fit's own statement of how the flux divides —
-which gives the runaway component no say precisely when it has no flux to justify
-it. The **major** axis is used rather than the circularised √(ab), because the
-point is structure to learn from and an inclined disc at a = 2″, b = 0.4″ has
-plenty of it while circularising would call it 0.9″ and throw it away.
+The size is `sersic_reff_major`, from the **multiband Sersic fit**. That column
+carries no band prefix — one morphology fit to all six bands at once — so it
+neither inherits the band-to-band scatter of a per-band fit nor needs blending
+across components the way cModel's separate exponential and de Vaucouleurs radii
+do. Two things it does mean: it is in arcsec, unlike `sersic_reff_x` which is the
+same quantity in pixels; and it is measured *before* convolution with the PSF, so
+it is the galaxy's intrinsic size and the seen object is a little larger.
+`sersic_unknown_flag` and `sersic_no_data_flag` are read alongside it, because
+without them a failed fit contributes whatever happened to be in the column.
+
+The **major** axis is used rather than the circularised √(ab): the point is
+structure to learn from, and an inclined disc at a = 4″, b = 0.8″ has plenty of
+it while circularising would call it 1.8″ and throw it away.
+
+This is a demanding cut — galaxies this large are not common — so `--radius-deg`
+matters more than `--n-hosts` for reaching a target. The surviving count is
+logged, split by whether the object was too small or had no usable fit.
 
 `min_trace_px` stays as a second, non-parametric floor from the adaptive moments,
 a cross-check against a runaway fit.
