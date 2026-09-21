@@ -50,11 +50,11 @@ Other DP2 specifics this file depends on:
   that one read.  The obvious galaxy-by-galaxy loop reloads the same patch for
   each host and dominates the runtime.
 
-Items marked WARN are not verified against the DP2 tutorials -- the skill's
-``references/dp2-facts.md`` and ``references/dp2-images-api.md`` were not
-available.  They are collected in ``DP2_ATTRS``, ``REPO``, ``COLLECTION`` and
-``FIELDS`` so each is a one-line fix, and the accessors report what the object
-actually offers when a name is wrong.
+Everything above is taken from the verified DP2 reference.  The few items still
+marked WARN are the ones it does not cover: the object-table column names (taken
+from DP1 and assumed unchanged) and the DP2 field inventory.  Accessors go
+through ``_attr``, which reports what an object actually offers if a name is ever
+wrong, so a mismatch is a clear error rather than a crash.
 """
 
 from __future__ import annotations
@@ -129,8 +129,10 @@ OBJECT_COLUMNS = [
 #: Added per band.
 OBJECT_BAND_COLUMNS = ["{b}_cModelFlux", "{b}_cModelFluxErr", "{b}_blendedness"]
 
-#: WARN: ECDFS is a standard LSST deep-drilling field, so DP2 very likely covers
-#: it, but the DP2 field list was not available to check.
+#: ECDFS, still in tract 5063 as on DP1, and the field the DP2 tutorials use
+#: throughout.  ELAISS1 (10.26, -44.49) and EDFS (59.10, -48.73) also appear.
+#: WARN: a full DP2 field/depth inventory is not in the tutorials -- check
+#: dp2.lsst.io before choosing a field on cadence grounds.
 ECDFS = (53.13, -28.10)
 
 
