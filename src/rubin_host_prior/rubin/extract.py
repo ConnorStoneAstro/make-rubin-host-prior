@@ -100,6 +100,7 @@ DP2_ATTRS = {
     "schema": "schema",
     "origin": "yx0",
     "grid": "grid",
+    "provenance": "provenance",
 }
 
 #: DP2 offers three WCS representations and they do **not** share a pixel
@@ -184,6 +185,21 @@ def _lsst() -> SimpleNamespace:
 
         _STACK = SimpleNamespace(Butler=Butler, Box=Box, sphgeom=sphgeom)
     return _STACK
+
+
+def read_component(butler, ref, role: str):
+    """A ``deep_coadd`` component, or ``None`` if the repo will not serve it.
+
+    Components move no pixels, so everything needed to place and characterise a
+    stamp -- WCS, bounding box, PSF, cell grid, provenance -- can be had without
+    reading the patch.  The pixels then come from a bbox read of just the stamp.
+    """
+    name = DP2_ATTRS[role]
+    try:
+        return butler.get(f"{DATASET_TYPE}.{name}", dataId=ref.dataId)
+    except Exception as exc:
+        log.debug("component %s.%s unavailable: %r", DATASET_TYPE, name, exc)
+        return None
 
 
 def _attr(obj, role: str):
@@ -754,10 +770,13 @@ def _fits_in_patch(bbox, x: float, y: float, size: int) -> bool:
     )
 
 
-def cells_in_stamp(coadd, x: float, y: float, size: int) -> list[tuple[int, int]]:
-    """Every ``(i, j)`` cell index the stamp covers.  Empty if the grid is absent."""
+def cells_in_stamp(source, x: float, y: float, size: int) -> list[tuple[int, int]]:
+    """Every ``(i, j)`` cell index the stamp covers.  Empty if the grid is absent.
+
+    Takes a CellCoadd or a cell grid on its own, so a component read serves.
+    """
     try:
-        grid = _attr(coadd, "grid")
+        grid = getattr(source, "grid", source)
         half = size // 2
         corners = [
             grid.index_of(x=int(round(x)) + dx, y=int(round(y)) + dy)
@@ -787,7 +806,7 @@ CONTRIB_CELL_COLUMNS: tuple[tuple[str, str], ...] = (
 )
 
 
-def cell_visit_counts(coadd) -> dict[tuple[int, int], int]:
+def cell_visit_counts(source) -> dict[tuple[int, int], int]:
     """Distinct visits contributing to each ``(i, j)`` cell.
 
     This is the quantity that makes a depth step, and it is exact: DP2 exposures
@@ -805,8 +824,10 @@ def cell_visit_counts(coadd) -> dict[tuple[int, int], int]:
     leaves the measured ``variance_step`` as the only detector rather than
     failing the run.
     """
-    prov = getattr(coadd, "provenance", None)
-    contributions = getattr(prov, "contributions", None) if prov is not None else None
+    # Accepts a CellCoadd or the provenance on its own, so it works equally off
+    # a component read and off a patch that had to be loaded whole.
+    prov = getattr(source, "provenance", source)
+    contributions = getattr(prov, "contributions", None)
     if contributions is None or len(contributions) == 0:
         log.debug("no coadd provenance; falling back to the measured variance step")
         return {}
@@ -949,6 +970,7 @@ def extract_patches(
     seen: set[tuple[int, str]] = set()
     tried: set[int] = set()
     component_reads_failed = False
+    bbox_reads_failed = False
     depth_logged = False
     depth_checked = False
     depth_usable = True
@@ -965,6 +987,7 @@ def extract_patches(
         the patches that actually hold a host are asked for.
         """
         nonlocal writer, mask_mapping, n_accepted, component_reads_failed
+        nonlocal bbox_reads_failed
         nonlocal depth_logged, depth_checked, depth_usable, n_refs
 
         by_patch: dict[tuple[int, int], list[int]] = {}
@@ -993,29 +1016,37 @@ def extract_patches(
                     "patch": int(fields.get("patch", -1)),
                 }
 
-                # Component reads move no pixels, so the patch is only loaded if a
-                # host actually lands in it.  With ~10^6 coadds that matters.  If
-                # this repo will not serve components, fall back to whole patches:
-                # slower, but the alternative is rejecting every ref in the field
-                # and finding out at the end of the run.
+                # Components move no pixels, so a patch is characterised without
+                # being read: WCS, bounding box, PSF, cell grid and provenance all
+                # come this way, and the pixels then come from a bbox read of just
+                # the stamp.  A patch is ~4100 px square and a stamp is 416, so
+                # that is two orders of magnitude less I/O -- and with hosts this
+                # thinly spread there is rarely a second stamp in a patch to
+                # amortise a whole read against.  If the repo refuses components,
+                # fall back to reading patches whole.
                 coadd = None
-                try:
-                    wcs = butler.get(f"{DATASET_TYPE}.sky_projection", dataId=data_id)
-                except Exception as exc:
+
+                def _whole_patch():
+                    nonlocal coadd
+                    if coadd is None:
+                        coadd = butler.get(ref)
+                    return coadd
+
+                wcs = read_component(butler, ref, "wcs")
+                if wcs is None:
                     if not component_reads_failed:
                         log.warning(
-                            "component read of %s.sky_projection failed (%r); loading "
+                            "component read of %s.sky_projection failed; loading "
                             "whole patches instead, which is slower but equivalent",
-                            DATASET_TYPE, exc,
+                            DATASET_TYPE,
                         )
                         component_reads_failed = True
                     try:
-                        coadd = butler.get(ref)
+                        wcs = _attr(_whole_patch(), "wcs")
                     except Exception as exc2:
                         records.append({**base, "status": "rejected",
                                         "reasons": f"read_failed:{exc2!r}"[:120]})
                         continue
-                    wcs = _attr(coadd, "wcs")
 
                 # Only the hosts the catalogue assigned to this patch.  Testing
                 # every host against every patch is quadratic and unaffordable once
@@ -1028,14 +1059,10 @@ def extract_patches(
                     continue
                 xs, ys = _sky_to_pixel(wcs, tgt_ra[candidates], tgt_dec[candidates])
 
-                if coadd is not None:
-                    bbox = _attr(coadd, "bbox")
-                else:
-                    try:
-                        bbox = butler.get(f"{DATASET_TYPE}.bbox", dataId=data_id)
-                    except Exception:
-                        coadd = butler.get(ref)
-                        bbox = _attr(coadd, "bbox")
+                bbox = (_attr(coadd, "bbox") if coadd is not None
+                        else read_component(butler, ref, "bbox"))
+                if bbox is None:
+                    bbox = _attr(_whole_patch(), "bbox")
 
                 inside = [
                     (h, x, y) for h, x, y in zip(candidates, xs, ys)
@@ -1043,17 +1070,26 @@ def extract_patches(
                 ]
                 if not inside:
                     continue
-                if coadd is None:
-                    try:
-                        coadd = butler.get(ref)
-                    except Exception as exc:
-                        records.append({**base, "status": "rejected",
-                                        "reasons": f"read_failed:{exc!r}"[:120]})
-                        continue
-                psf_model = _attr(coadd, "psf")
+                try:
+                    psf_model = (_attr(coadd, "psf") if coadd is not None
+                                 else read_component(butler, ref, "psf"))
+                    if psf_model is None:
+                        psf_model = _attr(_whole_patch(), "psf")
+                    grid_src = (coadd if coadd is not None
+                                else read_component(butler, ref, "grid"))
+                    if grid_src is None:
+                        grid_src = _whole_patch()
+                    prov = (coadd if coadd is not None
+                            else read_component(butler, ref, "provenance"))
+                    if prov is None:
+                        prov = _whole_patch()
+                except Exception as exc:
+                    records.append({**base, "status": "rejected",
+                                    "reasons": f"read_failed:{exc!r}"[:120]})
+                    continue
                 # Once per patch: which visits went into which cell.  This is the
                 # depth step stated exactly, rather than inferred from the noise.
-                visit_counts = cell_visit_counts(coadd)
+                visit_counts = cell_visit_counts(prov)
                 if visit_counts and not depth_logged:
                     log.info("per-cell visit counts available: %d cells, %d-%d visits",
                              len(visit_counts), min(visit_counts.values()),
@@ -1075,9 +1111,32 @@ def extract_patches(
                         records.append(rec)
                         continue
 
-                    # `coadd[box]` is a VIEW; copy or the whole parent patch stays
-                    # pinned in memory, which defeats the point of a stamp.
-                    stamp = coadd[_stamp_box(x, y, native_size)].copy()
+                    # One read of just these pixels.  Falling back to slicing a
+                    # whole patch, `coadd[box]` is a VIEW, so it must be copied or
+                    # the parent stays pinned in memory and the stamp saves
+                    # nothing.
+                    box = _stamp_box(x, y, native_size)
+                    if coadd is not None or bbox_reads_failed:
+                        stamp = _whole_patch()[box].copy()
+                    else:
+                        try:
+                            stamp = butler.get(ref, parameters={"bbox": box})
+                            # A subset that has dropped a plane would be caught
+                            # later as a confusing AttributeError, hours in.
+                            missing = [r for r in ("image", "variance", "mask")
+                                       if not hasattr(stamp, DP2_ATTRS[r])]
+                            if missing:
+                                raise AttributeError(
+                                    f"bbox read returned no {missing}"
+                                )
+                        except Exception as exc:
+                            if not bbox_reads_failed:
+                                log.warning(
+                                    "bbox read failed (%r); reading whole patches "
+                                    "instead, which is ~100x the I/O", exc,
+                                )
+                                bbox_reads_failed = True
+                            stamp = _whole_patch()[box].copy()
                     image = np.asarray(_attr(stamp, "image").array, dtype=np.float32)
                     if image.shape != (native_size, native_size):
                         rec.update(status="rejected", reasons=f"clipped:{image.shape}")
@@ -1092,7 +1151,7 @@ def extract_patches(
                         records.append(rec)
                         continue
 
-                    cells = cells_in_stamp(coadd, x, y, native_size)
+                    cells = cells_in_stamp(grid_src, x, y, native_size)
                     if visit_counts and cells and not depth_checked:
                         # The grid's (i, j) and the provenance table's cell columns
                         # are two independent conventions, and nothing guarantees
@@ -1207,7 +1266,7 @@ def extract_patches(
                     records.append(rec)
                     seen.add((int(host_id[h]), band_name))
                     n_accepted += 1
-                del coadd
+                coadd = None
 
     host_tables = []
     batch = n_hosts

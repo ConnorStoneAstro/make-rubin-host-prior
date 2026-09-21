@@ -486,10 +486,20 @@ Candidates for a patch are the hosts the catalogue assigned to it — testing ev
 host against every patch is quadratic and unaffordable once the list spans the
 sky.
 
-The cost that remains is one patch read per host per band, because the hosts are
-spread thinly. If that dominates, the thing to look for is whether the butler can
-serve a sub-region of a `deep_coadd` rather than the whole patch; this code does
-not assume it can.
+**Only the stamp's pixels are read.** `butler.get(ref, parameters={'bbox': box})`
+returns a `CellCoadd` of just that region without loading the patch (DP2 tutorial
+104.5). A patch is ~4100 px square and a stamp is 416, so that is about two
+orders of magnitude less I/O — and with a 3″ cut the hosts are thin enough that
+there is rarely a second stamp in a patch to amortise a whole read against.
+
+Everything else about a patch comes from **component reads**, which move no
+pixels either: `sky_projection`, `bbox`, `psf`, `grid` and `provenance`. So a
+patch that turns out to hold no usable host costs no pixel I/O at all.
+
+Both paths fall back. If components are refused the patch is read whole and its
+attributes used; if a bbox read is refused, or comes back missing a plane —
+checked on the spot, because an absent `variance` would otherwise surface as an
+`AttributeError` hours in — the run switches to whole patches and says so once.
 
 `--n-patches` is the number to ask for when you want a training set of a given
 size. Extraction then works towards it: draw a batch of hosts, sweep every coadd

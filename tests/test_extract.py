@@ -24,6 +24,7 @@ from rubin_host_prior.rubin.extract import (
     BANDS,
     build_host_catalogue,
     coadd_refs_for_tract,
+    read_component,
     _within_radius,
     _write_manifest,
     cell_visit_counts,
@@ -757,3 +758,65 @@ def test_the_flux_ceiling_is_high_enough_for_the_size_cut(caplog):
     with caplog.at_level("WARNING"):
         select_hosts(t, band="r", min_reff_arcsec=3.0, flux_range=(360.0, 36000.0))
     assert "fighting the size cut" in caplog.text
+
+
+# -- reading only the stamp ------------------------------------------------
+
+
+class _Components:
+    """A butler that serves components and bbox reads, and counts both."""
+
+    def __init__(self, serve_components=True, serve_bbox=True):
+        self.serve_components = serve_components
+        self.serve_bbox = serve_bbox
+        self.component_reads = []
+        self.whole_reads = 0
+        self.bbox_reads = 0
+
+    def get(self, what, dataId=None, parameters=None):
+        if isinstance(what, str) and "." in what:
+            if not self.serve_components:
+                raise RuntimeError("components not served here")
+            self.component_reads.append(what.split(".", 1)[1])
+            return SimpleNamespace(name=what)
+        if parameters and "bbox" in parameters:
+            if not self.serve_bbox:
+                raise RuntimeError("bbox reads not served here")
+            self.bbox_reads += 1
+            return SimpleNamespace(bbox=parameters["bbox"])
+        self.whole_reads += 1
+        return SimpleNamespace(whole=True)
+
+
+def test_components_are_read_without_touching_pixels():
+    """A patch is 4100 px square and a stamp is 416, so characterising a patch
+    through components and then reading only the stamp is two orders of
+    magnitude less I/O -- and hosts are too thinly spread for a second stamp to
+    amortise a whole read against."""
+    butler = _Components()
+    ref = _Ref(5063, patch=12, band="r")
+    for role in ("wcs", "bbox", "psf", "grid", "provenance"):
+        assert read_component(butler, ref, role) is not None
+    assert butler.component_reads == ["sky_projection", "bbox", "psf", "grid",
+                                      "provenance"]
+    assert butler.whole_reads == 0
+
+
+def test_a_refused_component_is_none_rather_than_an_exception():
+    """The caller falls back to the whole patch; it must not have to catch."""
+    butler = _Components(serve_components=False)
+    assert read_component(butler, _Ref(5063, patch=12, band="r"), "wcs") is None
+
+
+def test_visit_counts_work_off_a_component_or_a_coadd():
+    """provenance can come from a component read or off a patch read whole."""
+    rows = [(0, 0, 10, 1), (0, 0, 11, 1)]
+    prov = SimpleNamespace(contributions=_contributions(rows))
+    assert cell_visit_counts(prov) == {(0, 0): 2}
+    assert cell_visit_counts(SimpleNamespace(provenance=prov)) == {(0, 0): 2}
+
+
+def test_cells_work_off_a_grid_or_a_coadd():
+    grid = _Grid()
+    assert cells_in_stamp(grid, 225, 225, 416) == \
+        cells_in_stamp(SimpleNamespace(grid=grid), 225, 225, 416)
