@@ -23,7 +23,7 @@ dependencies = [
 extract = ["pandas", "pyarrow", "astropy"]
 # Diagnostic figures. matplotlib is imported lazily, so the package works without it.
 plots = ["matplotlib>=3.5", "pandas", "pyarrow"]
-dev = ["pytest", "matplotlib", "pandas", "pyarrow"]
+dev = ["pytest", "matplotlib", "pandas", "pyarrow", "astropy"]
 
 [tool.setuptools.packages.find]
 where = ["src"]

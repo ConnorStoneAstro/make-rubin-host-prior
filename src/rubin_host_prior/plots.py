@@ -251,16 +251,27 @@ def plot_hosts(shards, hosts=None, band: str = "r", out: Path | None = None):
 
     if hosts is not None and len(hosts):
         cols = set(getattr(hosts, "columns", getattr(hosts, "colnames", [])))
-        ixx, iyy, ixy = (np.asarray(hosts[c], dtype=float)
-                         for c in ("shape_xx", "shape_yy", "shape_xy")
-                         ) if {"shape_xx", "shape_yy", "shape_xy"} <= cols else (None,) * 3
+        # DP2 second moments are per band -- there is no band-independent
+        # shape_xx -- and only ugri carry them.
+        mom = [f"{band}_ixx", f"{band}_iyy", f"{band}_ixy"]
         scale = float(np.nanmedian(meta["pixel_scale"])) if len(meta["pixel_scale"]) else 0.2
-        if ixx is not None:
-            size = np.sqrt(np.maximum(0.5 * (ixx + iyy), 0)) * scale
-            panels.append(("host size", size, 40,
-                           "trace radius (arcsec)", False))
+        if set(mom) <= cols:
+            ixx, iyy, ixy = (np.asarray(hosts[c], dtype=float) for c in mom)
             panels.append(("host distortion", _distortion(ixx, iyy, ixy), 40,
                            "$|e| = (1-q^2)/(1+q^2)$", False))
+            # Prefer the half-light radius, which DP2 gives directly in arcsec;
+            # fall back to the moments trace converted with the pixel scale.
+            reff = [f"{band}_cModel_exp_reff_major", f"{band}_cModel_dev_reff_major"]
+            present = [c for c in reff if c in cols]
+            if present:
+                size = np.nanmean(
+                    [np.asarray(hosts[c], dtype=float) for c in present], axis=0
+                )
+                label = "half-light major axis (arcsec)"
+            else:
+                size = np.sqrt(np.maximum(0.5 * (ixx + iyy), 0)) * scale
+                label = "trace radius (arcsec)"
+            panels.append(("host size", size, 40, label, False))
         fcol = f"{band}_cModelFlux"
         if fcol in cols:
             flux = np.asarray(hosts[fcol], dtype=float)
@@ -283,6 +294,12 @@ def plot_hosts(shards, hosts=None, band: str = "r", out: Path | None = None):
                    30, "count within search radius", False))
     panels.append(("host offset from centre", meta["host_offset_arcsec"], 30,
                    "arcsec (extraction jitter)", False))
+    if "n_cells_spanned" in meta:
+        # Each 150 px coadd cell has its own input visits, so depth and PSF step
+        # at cell edges.  Anything above 1 means the stamp contains such a step.
+        panels.append(("coadd cells spanned", np.asarray(meta["n_cells_spanned"],
+                                                         dtype=float),
+                       20, "150 px cells per stamp", False))
     # DP2 covariates: recorded, never gated on.  Worth looking at, because if
     # INEXACT_PSF or REJECTED covers most of the accepted stamps then the PSF
     # the forward model relies on is approximate over most of the training set.

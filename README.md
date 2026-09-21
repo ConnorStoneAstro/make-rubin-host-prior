@@ -451,6 +451,38 @@ galaxies and the background is recoverable via `apply_background`. The images ar
 taken **as delivered**, without restoration, and every shard records
 `background_restored=0` so a set made the other way is distinguishable.
 
+### Host selection on DP2
+
+The DP2 Object table differs from DP1 in ways that break code silently rather
+than loudly, so `select_hosts` is built to fail loudly instead:
+
+- **There is no band-independent `shape_xx`.** Second moments are per band
+  (`{band}_ixx`, `{band}_iyy`, `{band}_ixy`, in pixel²). `host_trace_radius_px`
+  raises if they are absent rather than returning NaN, because every caller uses
+  it to avoid a sample dominated by the smallest, faintest galaxies.
+- **Only `ugri` carry photometry and shapes.** Coadd *images* exist in all six
+  bands, so z and y stamps are extractable; only the catalogue quantities are
+  missing, costing neighbour fluxes and host magnitudes there. Requesting a
+  column that does not exist fails the whole read, so the request is intersected
+  with `PHOTOMETRY_BANDS` and the shortfall is logged.
+- **There are no `detect_*` columns at all**, so `detect_isPrimary` is not
+  available for dropping duplicates — and tracts and patches overlap, so a
+  source in an overlap region appears twice, across two tracts under two
+  *different* `objectId`s. `dedupe_hosts` therefore collapses near coincidences
+  on the sky (0.5″) as well as repeated ids.
+- DP2 also offers continuous `{band}_sizeExtendedness` and
+  `{band}_model_extendedness`, either a better primary cut than the hard 0/1
+  `refExtendedness` if the sample turns out to need one, and
+  `{band}_cModel_exp_reff_major` — a half-light radius directly in arcsec, which
+  the diagnostic plots prefer over the moments trace.
+
+**Size stratification draws from equal-width bins in log size, not quantiles.**
+This matters and was wrong until recently: quantile bins hold equal numbers by
+construction, so drawing equally from each is *exactly* a uniform sample and
+stratifies nothing. With equal-width bins the sample carries ~9× more
+well-resolved hosts than a uniform draw, falling to 1× as the request approaches
+the whole population — you cannot over-sample galaxies that are not there.
+
 ### Cell structure: a real caveat
 
 DP2 coadds are cell-based — a 22×22 grid of **150-pixel** cells, each coadded
@@ -498,11 +530,12 @@ than guessed, so the list is short:
 - [ ] **`grid.index_of(x=, y=)` returning `.i`/`.j`.** Used only for the
       `n_cells_spanned` covariate, and degrades to `-1` if the attribute names
       differ.
-- [ ] **Object-table columns** assumed unchanged from DP1 (`coord_ra`,
-      `shape_xx`, `refExtendedness`, `{b}_cModelFlux`, `detect_isPrimary`).
 - [ ] **Field choice.** ECDFS (tract 5063) is the best-characterised DP2 field
       and the one the tutorials use; check dp2.lsst.io before choosing on cadence
       grounds.
+- [ ] **`min_trace_px = 1.75`** in `select_hosts` is a DP1-era ComCam PSF size.
+      Check it against the DP2 PSF before relying on the point-source
+      cross-check.
 - [ ] **`centre_mismatch` count in the manifest should be zero.** Every stamp
       centre is projected back to the sky and compared against the position
       asked for. DP2 has two pixel-origin conventions — `sky_projection` is

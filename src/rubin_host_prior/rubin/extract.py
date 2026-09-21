@@ -115,19 +115,44 @@ PIXEL_ORIGIN = "tract"
 #: asked for, in arcsec.  A pixel-origin mix-up is off by far more than this.
 CENTRE_TOLERANCE_ARCSEC = 1.0
 
-#: Minimal column subset of the per-tract ``object`` table.  WARN: DP2 column
-#: names assumed unchanged from DP1.
+#: Minimal column subset of the per-tract ``object`` table (1248 columns, so
+#: always subset).  Verified against the DP2 SDM schema.
+#:
+#: Note what is *absent* relative to DP1: there are no band-independent
+#: ``shape_xx``/``shape_yy``/``shape_xy`` columns -- second moments are per band
+#: -- and there are no ``detect_*`` columns at all, so ``detect_isPrimary`` is
+#: not available for dropping deblend and overlap duplicates.  See
+#: ``dedupe_hosts``.
 OBJECT_COLUMNS = [
     "objectId",
     "coord_ra",
     "coord_dec",
-    "shape_xx",
-    "shape_yy",
-    "shape_xy",
     "refExtendedness",
+    "refBand",
+    "tract",
+    "patch",
 ]
-#: Added per band.
-OBJECT_BAND_COLUMNS = ["{b}_cModelFlux", "{b}_cModelFluxErr", "{b}_blendedness"]
+
+#: Bands for which the DP2 Object table carries photometry and shapes.  Coadd
+#: *images* exist in all six, so z and y stamps are extractable; only the
+#: catalogue quantities are missing there, which costs neighbour fluxes and host
+#: magnitudes in those bands.  Requesting a column that does not exist fails the
+#: whole read, so the request is intersected with this list.
+PHOTOMETRY_BANDS = ("u", "g", "r", "i")
+
+#: Added per band in ``PHOTOMETRY_BANDS``.  ``_ixx``/``_iyy``/``_ixy`` are
+#: Gaussian-weighted adaptive moments in pixel^2; the ``reff`` columns are
+#: half-light major axes in arcsec.
+OBJECT_BAND_COLUMNS = [
+    "{b}_cModelFlux",
+    "{b}_cModelFluxErr",
+    "{b}_blendedness",
+    "{b}_ixx",
+    "{b}_iyy",
+    "{b}_ixy",
+    "{b}_cModel_dev_reff_major",
+    "{b}_cModel_exp_reff_major",
+]
 
 #: ECDFS, still in tract 5063 as on DP1, and the field the DP2 tutorials use
 #: throughout.  ELAISS1 (10.26, -44.49) and EDFS (59.10, -48.73) also appear.
@@ -220,7 +245,13 @@ def load_object_table(
     bands: Sequence[str] = BANDS,
     extra_columns: Sequence[str] = (),
 ):
-    """The per-tract ``object`` table covering ``(ra, dec)``, column-subset."""
+    """The per-tract ``object`` table covering ``(ra, dec)``, column-subset.
+
+    The table has 1248 columns and returns every object in the tract, so the
+    ``columns`` parameter is not optional.  Band columns are requested only for
+    ``PHOTOMETRY_BANDS`` -- asking for a column that does not exist fails the
+    whole read, and DP2 carries no ``z``/``y`` photometry.
+    """
     refs = butler.query_datasets(
         "object",
         where="tract.region OVERLAPS POINT(:ra, :dec)",
@@ -228,22 +259,88 @@ def load_object_table(
     )
     if not refs:
         raise RuntimeError(f"no object table covers ({ra}, {dec})")
+
+    usable = [b for b in bands if b in PHOTOMETRY_BANDS]
+    missing = [b for b in bands if b not in PHOTOMETRY_BANDS]
+    if missing:
+        log.warning(
+            "DP2 Object has no photometry or shapes for band(s) %s; stamps are "
+            "still extractable there, but neighbour fluxes and host magnitudes "
+            "will be absent", missing,
+        )
     columns = list(OBJECT_COLUMNS)
-    for b in bands:
+    for b in usable:
         columns += [c.format(b=b) for c in OBJECT_BAND_COLUMNS]
     columns += list(extra_columns)
-    tables = []
-    for ref in refs:
-        try:
-            t = butler.get(ref, parameters={"columns": columns + ["detect_isPrimary"]})
-        except Exception:
-            log.warning("detect_isPrimary unavailable; duplicates not filtered")
-            t = butler.get(ref, parameters={"columns": columns})
-        t["tract"] = ref.dataId.get("tract", -1)
-        tables.append(t)
+
+    tables = [butler.get(ref, parameters={"columns": columns}) for ref in refs]
+    if len(tables) == 1:
+        return tables[0]
     from astropy.table import vstack
 
-    return vstack(tables, metadata_conflicts="silent") if len(tables) > 1 else tables[0]
+    return vstack(tables, metadata_conflicts="silent")
+
+
+def dedupe_hosts(table, radius_arcsec: float = 0.5):
+    """Drop objects that are the same source seen twice.
+
+    DP2 has no ``detect_isPrimary`` -- no ``detect_*`` columns at all -- and
+    tracts and patches overlap at their edges, so a source in an overlap region
+    appears more than once and, across two tracts, under two different
+    ``objectId``s.  Deduplicating on id alone would not catch that, so near
+    coincidences on the sky are collapsed too.  Without this a galaxy in an
+    overlap region is silently weighted up in the training set.
+    """
+    ra = np.asarray(table["coord_ra"], dtype=float)
+    dec = np.asarray(table["coord_dec"], dtype=float)
+    ids = np.asarray(table["objectId"])
+    keep = np.zeros(len(table), dtype=bool)
+    seen_ids: set = set()
+    # Sort by declination so the sky search only has to look at a local window.
+    order = np.argsort(dec)
+    kept_ra: list[float] = []
+    kept_dec: list[float] = []
+    r_deg = radius_arcsec / 3600.0
+    for i in order:
+        if ids[i] in seen_ids:
+            continue
+        duplicate = False
+        for j in range(len(kept_dec) - 1, -1, -1):
+            if kept_dec[j] < dec[i] - r_deg:
+                break
+            cosd = max(np.cos(np.deg2rad(dec[i])), 1e-6)
+            if np.hypot((kept_ra[j] - ra[i]) * cosd, kept_dec[j] - dec[i]) < r_deg:
+                duplicate = True
+                break
+        if duplicate:
+            continue
+        keep[i] = True
+        seen_ids.add(ids[i])
+        kept_ra.append(ra[i])
+        kept_dec.append(dec[i])
+    return table[keep]
+
+
+def host_trace_radius_px(table, band: str) -> np.ndarray:
+    """Trace radius in pixels from the per-band adaptive moments.
+
+    DP2 has no band-independent ``shape_xx``; second moments live in
+    ``{band}_ixx`` / ``{band}_iyy``, in pixel^2.  Raises rather than returning
+    NaN if they are absent, because every caller uses this to avoid a sample
+    dominated by the smallest, faintest galaxies, and silently losing that is
+    worse than stopping.
+    """
+    needed = [f"{band}_ixx", f"{band}_iyy"]
+    have = set(table.colnames)
+    if not set(needed) <= have:
+        raise KeyError(
+            f"{needed} not in the object table. DP2 second moments are per band "
+            f"(there is no shape_xx), and only {PHOTOMETRY_BANDS} carry them. "
+            f"Columns present: {sorted(c for c in have if '_i' in c)[:12]}"
+        )
+    ixx = np.asarray(table[needed[0]], dtype=float)
+    iyy = np.asarray(table[needed[1]], dtype=float)
+    return np.sqrt(np.maximum(0.5 * (ixx + iyy), 0.0))
 
 
 def select_hosts(
@@ -254,33 +351,42 @@ def select_hosts(
     n_hosts: int | None = None,
     seed: int = 0,
     size_stratified: bool = True,
+    min_trace_px: float = 1.75,
+    dedupe_radius_arcsec: float = 0.5,
+    n_size_bins: int = 5,
 ):
-    """Extended objects in a flux range, optionally stratified by apparent size.
+    """Extended objects in a flux range, stratified by apparent size.
 
     ``flux_range`` bounds are 360 nJy (r = 25.0) to 36000 nJy (r = 20.0).
 
-    ``extendedness`` is a hard threshold on a flux ratio, so it is unreliable
-    near the faint limit -- a cut on it alone at r > 23 admits a lot of faint
-    stars.  The size cross-check below is not a substitute for inspecting the
-    sample, but it does drop the point-like contaminants.
+    ``refExtendedness`` is a hard 0/1 threshold on a flux ratio, so it is
+    unreliable near the faint limit -- a cut on it alone at r > 23 admits a lot
+    of faint stars.  The size cross-check drops the point-like contaminants.
+    (DP2 also offers continuous ``{band}_sizeExtendedness`` and
+    ``{band}_model_extendedness``, either of which would be a better primary cut
+    if the sample turns out to need one.)
 
-    ``size_stratified`` samples uniformly across size quintiles rather than
-    uniformly over the catalogue.  Without it the sample is dominated by the
-    smallest, faintest galaxies (there are far more of them) and the prior never
-    sees a well-resolved host.
+    ``size_stratified`` draws equally from bins of equal *width* in log size, so
+    the sample is spread over size rather than following the catalogue, in which
+    small faint galaxies vastly outnumber well-resolved ones.  Note this must be
+    equal-width bins: drawing equally from quantile bins is exactly a uniform
+    sample, since quantile bins hold equal numbers by construction.  If the size
+    columns are missing this **raises** rather than quietly falling back to a
+    uniform draw.
+
+    ``min_trace_px`` is a DP1-era ComCam PSF size; check it against the DP2
+    PSF before relying on the cross-check.
     """
     rng = np.random.default_rng(seed)
+    if band not in PHOTOMETRY_BANDS:
+        raise ValueError(
+            f"band {band!r} has no DP2 Object photometry; choose from "
+            f"{PHOTOMETRY_BANDS}"
+        )
     flux_col = f"{band}_cModelFlux"
-    t = table
+    t = dedupe_hosts(table, dedupe_radius_arcsec)
 
     keep = np.ones(len(t), dtype=bool)
-    if "detect_isPrimary" in t.colnames:
-        keep &= np.asarray(t["detect_isPrimary"], dtype=bool)
-    else:
-        _, first = np.unique(np.asarray(t["objectId"]), return_index=True)
-        dedup = np.zeros(len(t), dtype=bool)
-        dedup[first] = True
-        keep &= dedup
     if "refExtendedness" in t.colnames:
         ext = np.asarray(t["refExtendedness"], dtype=float)
         keep &= np.isfinite(ext) & (ext > 0.5)
@@ -289,33 +395,42 @@ def select_hosts(
     if max_blendedness is not None and f"{band}_blendedness" in t.colnames:
         bl = np.asarray(t[f"{band}_blendedness"], dtype=float)
         keep &= ~(np.isfinite(bl) & (bl > max_blendedness))
-    if {"shape_xx", "shape_yy"} <= set(t.colnames):
-        trace = 0.5 * (
-            np.asarray(t["shape_xx"], dtype=float)
-            + np.asarray(t["shape_yy"], dtype=float)
-        )
-        keep &= np.isfinite(trace) & (trace > 1.75**2)
+
+    trace = host_trace_radius_px(t, band)
+    keep &= np.isfinite(trace) & (trace > min_trace_px)
 
     t = t[keep]
+    trace = trace[keep]
     if n_hosts is None or n_hosts >= len(t):
         return t
-
-    if not size_stratified or "shape_xx" not in t.colnames:
+    if not size_stratified:
         return t[rng.choice(len(t), size=n_hosts, replace=False)]
 
-    trace = 0.5 * (
-        np.asarray(t["shape_xx"], dtype=float) + np.asarray(t["shape_yy"], dtype=float)
-    )
-    edges = np.percentile(trace, [0, 20, 40, 60, 80, 100])
-    per_bin = max(n_hosts // 5, 1)
+    # Bins equally spaced in log size, NOT quantiles.  Quantile bins hold equal
+    # numbers by construction, so drawing equally from each is exactly a uniform
+    # sample and stratifies nothing -- which is what this used to do.  Equal-width
+    # bins hold wildly unequal numbers, so an equal draw from each is what
+    # actually flattens the size distribution and gets well-resolved hosts into
+    # the sample.
+    log_trace = np.log10(np.maximum(trace, 1e-6))
+    edges = np.linspace(log_trace.min(), log_trace.max(), n_size_bins + 1)
+    edges[-1] += 1e-9
+    per_bin = max(n_hosts // n_size_bins, 1)
     picks: list[int] = []
     for lo, hi in zip(edges[:-1], edges[1:]):
-        idx = np.where((trace >= lo) & (trace <= hi))[0]
+        idx = np.where((log_trace >= lo) & (log_trace < hi))[0]
         if len(idx) == 0:
             continue
         picks += list(rng.choice(idx, size=min(per_bin, len(idx)), replace=False))
-    picks = list(dict.fromkeys(picks))[:n_hosts]
-    return t[np.array(picks)]
+    # Sparse bins at the large end leave the quota unfilled; top up uniformly
+    # from whatever is left rather than returning fewer hosts than asked for.
+    picks = list(dict.fromkeys(picks))
+    if len(picks) < n_hosts:
+        rest = np.setdiff1d(np.arange(len(t)), np.array(picks, dtype=int))
+        extra = min(n_hosts - len(picks), len(rest))
+        if extra:
+            picks += list(rng.choice(rest, size=extra, replace=False))
+    return t[np.array(picks[:n_hosts])]
 
 
 # -- image discovery -------------------------------------------------------
