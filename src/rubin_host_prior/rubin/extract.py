@@ -276,47 +276,123 @@ def pack_mask(mask, max_planes: int = 32) -> tuple[np.ndarray, dict[str, int]]:
 # -- host selection --------------------------------------------------------
 
 
-def load_object_table(
-    butler,
-    ra: float,
-    dec: float,
-    bands: Sequence[str] = BANDS,
-    extra_columns: Sequence[str] = (),
-):
-    """The per-tract ``object`` table covering ``(ra, dec)``, column-subset.
-
-    The table has 1248 columns and returns every object in the tract, so the
-    ``columns`` parameter is not optional.  Band columns are requested only for
-    ``PHOTOMETRY_BANDS`` -- asking for a column that does not exist fails the
-    whole read, and DP2 carries no ``z``/``y`` photometry.
-    """
-    refs = butler.query_datasets(
-        "object",
-        where="tract.region OVERLAPS POINT(:ra, :dec)",
-        bind={"ra": float(ra), "dec": float(dec)},
-    )
-    if not refs:
-        raise RuntimeError(f"no object table covers ({ra}, {dec})")
-
+def host_columns(bands: Sequence[str] = BANDS,
+                 extra: Sequence[str] = ()) -> list[str]:
+    """The column subset to read.  The table has 1248 columns, so this is not
+    optional, and asking for one that does not exist fails the whole read."""
     usable = [b for b in bands if b in PHOTOMETRY_BANDS]
-    missing = [b for b in bands if b not in PHOTOMETRY_BANDS]
-    if missing:
-        log.warning(
-            "DP2 Object has no photometry or shapes for band(s) %s; stamps are "
-            "still extractable there, but neighbour fluxes and host magnitudes "
-            "will be absent", missing,
+    unknown = [b for b in bands if b not in PHOTOMETRY_BANDS]
+    if unknown:
+        raise ValueError(
+            f"band(s) {unknown} are not DP2 bands; choose from {PHOTOMETRY_BANDS}"
         )
     columns = list(OBJECT_COLUMNS)
     for b in usable:
         columns += [c.format(b=b) for c in OBJECT_BAND_COLUMNS]
-    columns += list(extra_columns)
+    return columns + list(extra)
 
-    tables = [butler.get(ref, parameters={"columns": columns}) for ref in refs]
-    if len(tables) == 1:
-        return tables[0]
+
+def find_object_refs(butler, ra: float | None = None, dec: float | None = None,
+                     radius_deg: float | None = None, limit: int | None = None):
+    """``object`` table refs: every one in the repo, or those near a position.
+
+    One per tract.  With no position this is the whole DP2 footprint, which is
+    around a thousand tables -- see ``build_host_catalogue`` for what that costs.
+    """
+    if radius_deg is None or ra is None or dec is None:
+        refs = list(butler.query_datasets("object", limit=limit))
+        if not refs:
+            raise RuntimeError("no object tables in this repo")
+        return refs
+    region = _lsst().sphgeom.Region.from_ivoa_pos(
+        f"CIRCLE {float(ra)} {float(dec)} {float(radius_deg)}"
+    )
+    refs = list(butler.query_datasets(
+        "object", where="tract.region OVERLAPS :region",
+        bind={"region": region}, limit=limit,
+    ))
+    if not refs:
+        raise RuntimeError(
+            f"no object table within {radius_deg} deg of ({ra}, {dec})"
+        )
+    return refs
+
+
+def build_host_catalogue(
+    butler,
+    bands: Sequence[str] = BANDS,
+    band: str = "r",
+    ra: float | None = None,
+    dec: float | None = None,
+    radius_deg: float | None = None,
+    limit_tracts: int | None = None,
+    cache: str | Path | None = None,
+    report_every: int = 25,
+    **cuts,
+):
+    """Host candidates from every object table in reach, cut but not sampled.
+
+    The cuts run per tract and only the survivors are kept, so what is held in
+    memory is the host list rather than the footprint.  That matters: an object
+    table is ~700k rows, and the whole DP2 coadd footprint is around a thousand
+    of them.  Sampling deliberately does *not* happen here -- a stratified draw
+    has to see the whole pool, or it stratifies within tracts and not across
+    them.
+
+    Reading a thousand tables is minutes to tens of minutes even with column
+    pruning, so pass ``cache`` and it is done once.  The cache is keyed by
+    nothing: if the cuts change, delete it.
+    """
     from astropy.table import vstack
 
-    return vstack(tables, metadata_conflicts="silent")
+    if cache is not None:
+        cache = Path(cache)
+        if cache.exists():
+            table = _read_table(cache)
+            log.info("host catalogue: %d candidates from cache %s",
+                     len(table), cache)
+            return table
+
+    refs = find_object_refs(butler, ra, dec, radius_deg, limit=limit_tracts)
+    columns = host_columns(bands)
+    log.info("building host catalogue from %d object table(s)%s", len(refs),
+             "" if radius_deg is None else f" within {radius_deg} deg")
+
+    kept: list = []
+    n_rows = 0
+    for i, ref in enumerate(refs, start=1):
+        try:
+            table = butler.get(ref, parameters={"columns": columns})
+        except Exception as exc:
+            log.warning("object table %s unreadable (%r); skipping", ref.dataId, exc)
+            continue
+        n_rows += len(table)
+        if radius_deg is not None and ra is not None:
+            table = _within_radius(table, ra, dec, radius_deg)
+        if not len(table):
+            continue
+        survivors = select_hosts(table, band=band, n_hosts=None, **cuts)
+        if len(survivors):
+            kept.append(survivors)
+        if i % report_every == 0 or i == len(refs):
+            log.info("  %d/%d tables, %d rows scanned, %d candidates so far",
+                     i, len(refs), n_rows, sum(len(t) for t in kept))
+
+    if not kept:
+        raise RuntimeError(
+            f"no host passed the cuts in {len(refs)} object table(s) covering "
+            f"{n_rows} rows; loosen min_reff_arcsec or host_flux_range"
+        )
+    pool = vstack(kept, metadata_conflicts="silent") if len(kept) > 1 else kept[0]
+    # Tracts overlap, so a host in an overlap appears in two tables under two
+    # different objectIds.  The per-tract dedupe cannot see that; this can.
+    pool = dedupe_hosts(pool)
+    log.info("host catalogue: %d candidates from %d rows across %d tables",
+             len(pool), n_rows, len(refs))
+    if cache is not None:
+        _write_table(cache.with_suffix(""), pool)
+        log.info("cached the host catalogue at %s", cache)
+    return pool
 
 
 def dedupe_hosts(table, radius_arcsec: float = 0.5):
@@ -423,7 +499,7 @@ def host_half_light_arcsec(table, axis: str = "major") -> np.ndarray:
 def select_hosts(
     table,
     band: str = "r",
-    flux_range: tuple[float, float] = (360.0, 36000.0),
+    flux_range: tuple[float, float] = (360.0, 3.0e6),
     max_blendedness: float | None = None,
     n_hosts: int | None = None,
     seed: int = 0,
@@ -436,7 +512,12 @@ def select_hosts(
 ):
     """Extended objects in a flux range, stratified by apparent size.
 
-    ``flux_range`` bounds are 360 nJy (r = 25.0) to 36000 nJy (r = 20.0).
+    ``flux_range`` bounds are 360 nJy (r = 25.0) to 3e6 nJy (r = 15.2).  The
+    ceiling is high because it has to be: a galaxy with a 3" half-light radius
+    and an ordinary effective surface brightness of 22 mag/arcsec^2 has r ~ 17.6,
+    nine times brighter than the 36000 nJy ceiling this used to carry.  That
+    ceiling was set for a 1" population and would have annihilated the size cut.
+    Saturated cores are the gate's job, not this one's.
 
     ``min_reff_arcsec`` is the real size cut, on ``sersic_reff_major`` from the
     multiband Sersic fit.  The catalogue is dominated by galaxies a pixel or two
@@ -493,7 +574,8 @@ def select_hosts(
         ext = np.asarray(t["refExtendedness"], dtype=float)
         keep &= np.isfinite(ext) & (ext > 0.5)
     flux = np.asarray(t[flux_col], dtype=float)
-    keep &= np.isfinite(flux) & (flux > flux_range[0]) & (flux <= flux_range[1])
+    in_flux = np.isfinite(flux) & (flux > flux_range[0]) & (flux <= flux_range[1])
+    keep &= in_flux
     if max_blendedness is not None and f"{band}_blendedness" in t.colnames:
         bl = np.asarray(t[f"{band}_blendedness"], dtype=float)
         keep &= ~(np.isfinite(bl) & (bl > max_blendedness))
@@ -513,6 +595,21 @@ def select_hosts(
             int((keep & np.isfinite(reff) & ~big_enough).sum()),
             int((keep & ~np.isfinite(reff)).sum()),
         )
+        # Size and flux are not independent: a galaxy with a 3" half-light
+        # radius and any ordinary surface brightness is bright, so a ceiling set
+        # for small galaxies quietly annihilates a large size cut.  Rather than
+        # assume a surface brightness, notice when the two cuts are nearly
+        # disjoint and say so.
+        n_size_only = int((big_enough & ~in_flux).sum())
+        n_both = int((keep & big_enough).sum())
+        if n_size_only and n_both < 0.2 * n_size_only:
+            log.warning(
+                "%d objects pass the %.2f\" size cut but fail the flux range "
+                "%s, against %d that pass both: the flux ceiling is fighting the "
+                "size cut. Galaxies this large are bright -- raise "
+                "host_flux_range[1]",
+                n_size_only, min_reff_arcsec, flux_range, n_both,
+            )
         keep &= big_enough
 
     t = t[keep]
@@ -552,32 +649,36 @@ def select_hosts(
 # -- image discovery -------------------------------------------------------
 
 
-def find_coadd_refs(
-    butler,
-    ra: float,
-    dec: float,
-    radius_deg: float,
-    bands: Sequence[str] = BANDS,
-    limit: int | None = None,
-):
-    """Every ``deep_coadd`` patch overlapping a disc on the sky.
+def coadd_refs_for_tract(butler, tract: int, patches: Iterable[int],
+                         bands: Sequence[str] = BANDS) -> list:
+    """``deep_coadd`` refs for the patches of one tract that hold a host.
 
-    One query for the whole field rather than one per host: the loop below loads
-    each patch once and slices every stamp that falls in it.
+    Driven by the host list rather than by a disc on the sky.  With a size cut
+    this selective a patch holds one or two hosts, so sweeping every patch that
+    overlaps a field loads a great many that hold none; asking for the patches
+    the hosts are actually in does not.
     """
-    sphgeom = _lsst().sphgeom
-    region = sphgeom.Region.from_ivoa_pos(
-        f"CIRCLE {float(ra)} {float(dec)} {float(radius_deg)}"
-    )
-    where = COADD_REGION
+    patches = {int(p) for p in patches}
+    if not patches:
+        return []
+    where = "skymap = :skymap AND tract = :tract"
     if bands is not None and len(bands) < len(BANDS):
         where += " AND band.name IN (" + ", ".join(f"'{b}'" for b in bands) + ")"
-    return list(
-        butler.query_datasets(
-            DATASET_TYPE, where=where, bind={"region": region},
-            order_by=["band.name"], limit=limit,
-        )
+    refs = butler.query_datasets(
+        DATASET_TYPE, where=where,
+        bind={"skymap": SKYMAP, "tract": int(tract)},
+        explain=False,
     )
+    return [r for r in refs
+            if int(_data_id_dict(r.dataId).get("patch", -1)) in patches]
+
+
+def object_refs_for_tract(butler, tract: int) -> list:
+    """The ``object`` table of one tract."""
+    return list(butler.query_datasets(
+        "object", where="skymap = :skymap AND tract = :tract",
+        bind={"skymap": SKYMAP, "tract": int(tract)}, explain=False,
+    ))
 
 
 # -- geometry --------------------------------------------------------------
@@ -772,14 +873,16 @@ def extract_patches(
     out_dir: str | Path,
     ra: float = ECDFS[0],
     dec: float = ECDFS[1],
-    radius_deg: float = 0.3,
+    radius_deg: float | None = None,
     bands: Sequence[str] = BANDS,
     native_size: int = 416,
     n_hosts: int | None = 8000,
     n_patches: int | None = None,
     max_rounds: int = 8,
+    host_cache: str | Path | None = None,
+    limit_tracts: int | None = None,
     jitter_arcsec: float = 4.0,
-    host_flux_range: tuple[float, float] = (360.0, 36000.0),
+    host_flux_range: tuple[float, float] = (360.0, 3.0e6),
     max_blendedness: float | None = None,
     min_reff_arcsec: float = 3.0,
     patches_per_shard: int = 1024,
@@ -826,26 +929,13 @@ def extract_patches(
     # Both end the sweep at the same place, only ``n_patches`` tops up.
     target = n_patches if n_patches is not None else max_patches
 
-    log.info("loading object table near (%.4f, %.4f)", ra, dec)
-    catalogue = load_object_table(butler, ra, dec, bands=bands)
-    # Neighbours come from the whole tract: a host at the edge of the field still
-    # has neighbours outside it.
-    neighbours = _NeighbourIndex(catalogue, bands)
-    # Hosts do not.  ``load_object_table`` returns an entire tract, ~1.7 deg on a
-    # side, while the sweep covers a disc of ``radius_deg`` -- under a tenth of
-    # it at the default 0.3.  Selecting hosts from the tract sends most of them
-    # to patches that are never loaded, where they vanish without so much as a
-    # rejection record, and the run quietly delivers a fraction of what was
-    # asked for.  A host inside the disc is always inside a patch that overlaps
-    # it, so no margin is needed.
-    field = _within_radius(catalogue, ra, dec, radius_deg)
-    log.info("%d of %d catalogue rows lie within %.3f deg of (%.4f, %.4f)",
-             len(field), len(catalogue), radius_deg, ra, dec)
-    if not len(field):
-        raise RuntimeError(
-            f"no catalogue rows within {radius_deg} deg of ({ra}, {dec}); the "
-            f"field centre and the object table do not overlap"
-        )
+    field = build_host_catalogue(
+        butler, bands=bands, band="r" if "r" in bands else bands[0],
+        ra=ra, dec=dec, radius_deg=radius_deg, limit_tracts=limit_tracts,
+        cache=host_cache,
+        flux_range=host_flux_range, max_blendedness=max_blendedness,
+        min_reff_arcsec=min_reff_arcsec,
+    )
 
     records: list[dict] = []
     neighbour_rows: list[dict] = []
@@ -863,240 +953,261 @@ def extract_patches(
     depth_checked = False
     depth_usable = True
 
-    refs = list(find_coadd_refs(butler, ra, dec, radius_deg, bands))
-    log.info("%d coadd patches overlap the field", len(refs))
-    # Shuffled, because the sweep stops the moment the target is reached and the
-    # query returns patches ordered by band: left in order, a run that stops
-    # early would be entirely g-band and entirely one corner of the field.
-    rng.shuffle(refs)
+    n_refs = 0
+    neighbour_columns = host_columns(bands)
 
     def _sweep(hosts, host_id, tgt_ra, tgt_dec, r_jit):
-        """One pass over every coadd patch for one batch of hosts."""
+        """One pass for one batch of hosts, tract by tract.
+
+        Tract-major, not patch-major: the object table is per tract, so the
+        neighbour index can be built once per tract and thrown away, which is
+        what makes a footprint-wide host list affordable.  Within a tract only
+        the patches that actually hold a host are asked for.
+        """
         nonlocal writer, mask_mapping, n_accepted, component_reads_failed
-        nonlocal depth_logged, depth_checked, depth_usable
-        for ref in refs:
-            data_id = ref.dataId
-            fields = _data_id_dict(data_id)
-            band_name = str(fields.get("band", "?"))
-            base = {
-                "dataId": json.dumps({k: str(v) for k, v in fields.items()}),
-                "band": band_name,
-                "tract": int(fields.get("tract", -1)),
-                "patch": int(fields.get("patch", -1)),
-            }
+        nonlocal depth_logged, depth_checked, depth_usable, n_refs
 
-            # Component reads move no pixels, so the patch is only loaded if a
-            # host actually lands in it.  With ~10^6 coadds that matters.  If
-            # this repo will not serve components, fall back to whole patches:
-            # slower, but the alternative is rejecting every ref in the field
-            # and finding out at the end of the run.
-            coadd = None
-            try:
-                wcs = butler.get(f"{DATASET_TYPE}.sky_projection", dataId=data_id)
-            except Exception as exc:
-                if not component_reads_failed:
-                    log.warning(
-                        "component read of %s.sky_projection failed (%r); loading "
-                        "whole patches instead, which is slower but equivalent",
-                        DATASET_TYPE, exc,
-                    )
-                    component_reads_failed = True
+        by_patch: dict[tuple[int, int], list[int]] = {}
+        for h, (t, pa) in enumerate(zip(np.asarray(hosts["tract"], dtype=int),
+                                        np.asarray(hosts["patch"], dtype=int))):
+            by_patch.setdefault((int(t), int(pa)), []).append(h)
+        tracts = sorted({t for t, _ in by_patch})
+        # Shuffled, because the sweep stops the moment the target is reached;
+        # left in order it would fill the set from one corner of the footprint.
+        rng.shuffle(tracts)
+
+        for tract in tracts:
+            want = [pa for (t, pa) in by_patch if t == tract]
+            refs = coadd_refs_for_tract(butler, tract, want, bands)
+            rng.shuffle(refs)
+            n_refs += len(refs)
+            neighbours = _neighbour_index(butler, tract, neighbour_columns, bands)
+            for ref in refs:
+                data_id = ref.dataId
+                fields = _data_id_dict(data_id)
+                band_name = str(fields.get("band", "?"))
+                base = {
+                    "dataId": json.dumps({k: str(v) for k, v in fields.items()}),
+                    "band": band_name,
+                    "tract": int(fields.get("tract", -1)),
+                    "patch": int(fields.get("patch", -1)),
+                }
+
+                # Component reads move no pixels, so the patch is only loaded if a
+                # host actually lands in it.  With ~10^6 coadds that matters.  If
+                # this repo will not serve components, fall back to whole patches:
+                # slower, but the alternative is rejecting every ref in the field
+                # and finding out at the end of the run.
+                coadd = None
                 try:
-                    coadd = butler.get(ref)
-                except Exception as exc2:
-                    records.append({**base, "status": "rejected",
-                                    "reasons": f"read_failed:{exc2!r}"[:120]})
-                    continue
-                wcs = _attr(coadd, "wcs")
-
-            candidates = [
-                h for h in range(len(hosts))
-                if (int(host_id[h]), band_name) not in seen
-            ]
-            if not candidates:
-                continue
-            xs, ys = _sky_to_pixel(wcs, tgt_ra[candidates], tgt_dec[candidates])
-
-            if coadd is not None:
-                bbox = _attr(coadd, "bbox")
-            else:
-                try:
-                    bbox = butler.get(f"{DATASET_TYPE}.bbox", dataId=data_id)
-                except Exception:
-                    coadd = butler.get(ref)
-                    bbox = _attr(coadd, "bbox")
-
-            inside = [
-                (h, x, y) for h, x, y in zip(candidates, xs, ys)
-                if _fits_in_patch(bbox, x, y, native_size)
-            ]
-            if not inside:
-                continue
-            if coadd is None:
-                try:
-                    coadd = butler.get(ref)
+                    wcs = butler.get(f"{DATASET_TYPE}.sky_projection", dataId=data_id)
                 except Exception as exc:
-                    records.append({**base, "status": "rejected",
-                                    "reasons": f"read_failed:{exc!r}"[:120]})
-                    continue
-            psf_model = _attr(coadd, "psf")
-            # Once per patch: which visits went into which cell.  This is the
-            # depth step stated exactly, rather than inferred from the noise.
-            visit_counts = cell_visit_counts(coadd)
-            if visit_counts and not depth_logged:
-                log.info("per-cell visit counts available: %d cells, %d-%d visits",
-                         len(visit_counts), min(visit_counts.values()),
-                         max(visit_counts.values()))
-                depth_logged = True
-            log.debug("patch %s band %s: %d hosts", base["patch"], band_name,
-                      len(inside))
-
-            for h, x, y in inside:
-                if target is not None and n_accepted >= target:
-                    raise _Done
-                rec = {**base, "host_id": int(host_id[h]),
-                       "host_offset_arcsec": float(r_jit[h])}
-
-                sep = _verify_centre(wcs, x, y, float(tgt_ra[h]), float(tgt_dec[h]))
-                rec["centre_sep_arcsec"] = sep
-                if not np.isfinite(sep) or sep > CENTRE_TOLERANCE_ARCSEC:
-                    rec.update(status="rejected", reasons=f"centre_mismatch:{sep:.2f}")
-                    records.append(rec)
-                    continue
-
-                # `coadd[box]` is a VIEW; copy or the whole parent patch stays
-                # pinned in memory, which defeats the point of a stamp.
-                stamp = coadd[_stamp_box(x, y, native_size)].copy()
-                image = np.asarray(_attr(stamp, "image").array, dtype=np.float32)
-                if image.shape != (native_size, native_size):
-                    rec.update(status="rejected", reasons=f"clipped:{image.shape}")
-                    records.append(rec)
-                    continue
-                variance = np.asarray(_attr(stamp, "variance").array, dtype=np.float32)
-                packed, mapping = pack_mask(_attr(stamp, "mask"))
-                if mask_mapping is None:
-                    mask_mapping = mapping
-                elif mapping != mask_mapping:
-                    rec.update(status="rejected", reasons="mask_schema_changed")
-                    records.append(rec)
-                    continue
-
-                cells = cells_in_stamp(coadd, x, y, native_size)
-                if visit_counts and cells and not depth_checked:
-                    # The grid's (i, j) and the provenance table's cell columns
-                    # are two independent conventions, and nothing guarantees
-                    # they agree on which one is x.  If they are transposed every
-                    # lookup misses, every stamp reads as zero-visit, and the run
-                    # rejects everything for the most confusing possible reason.
-                    depth_checked = True
-                    depth_usable = any(c in visit_counts for c in cells)
-                    if not depth_usable:
+                    if not component_reads_failed:
                         log.warning(
-                            "none of the cells a stamp covers %s appear in "
-                            "provenance.contributions (which has e.g. %s): the "
-                            "cell index conventions do not match, so per-cell "
-                            "depth is ignored for this run and only the measured "
-                            "variance step will catch depth boundaries",
-                            cells[:4], sorted(visit_counts)[:4],
+                            "component read of %s.sky_projection failed (%r); loading "
+                            "whole patches instead, which is slower but equivalent",
+                            DATASET_TYPE, exc,
                         )
-                n_lo, n_hi = stamp_depth(visit_counts if depth_usable else {}, cells)
-                if n_lo > 0:
-                    depth_ratio = n_hi / n_lo
-                elif n_lo == 0:
-                    depth_ratio = np.inf  # a cell with no visits at all
-                else:
-                    depth_ratio = None  # provenance unavailable
-                reasons, diag = gate(image, variance, packed, mask_mapping,
-                                     cell_depth_ratio=depth_ratio, **gate_kwargs)
-                rec.update({f"diag_{k}": v for k, v in diag.items()})
-                psf = psf_bundle(psf_model, x, y)
-                if psf is None:
-                    reasons = list(reasons) + ["psf_unavailable"]
-                if reasons:
-                    rec.update(status="rejected", reasons=";".join(reasons))
-                    records.append(rec)
-                    continue
+                        component_reads_failed = True
+                    try:
+                        coadd = butler.get(ref)
+                    except Exception as exc2:
+                        records.append({**base, "status": "rejected",
+                                        "reasons": f"read_failed:{exc2!r}"[:120]})
+                        continue
+                    wcs = _attr(coadd, "wcs")
 
-                if writer is None:
-                    writer = ShardWriter(
-                        out_dir / "shards",
-                        native_size=native_size,
-                        psf_size=psf["psf"].shape[0],
-                        mask_plane_dict=mask_mapping,
-                        prefix=prefix,
-                        patches_per_shard=patches_per_shard,
-                        dataset_type=DATASET_TYPE,
-                        attrs={
-                            "release": "DP2",
-                            "skymap": SKYMAP,
-                            "field_ra": ra,
-                            "field_dec": dec,
-                            "bands": json.dumps(list(bands)),
-                            "jitter_arcsec": jitter_arcsec,
-                            "flux_units": "nJy",
-                            "correlated_noise": 1,  # coadds are warped
-                            "pixel_origin": PIXEL_ORIGIN,
-                            # DP2 coadds get a final background subtraction that
-                            # over-subtracts around extended galaxies, and it can
-                            # be restored with apply_background('pretty').  These
-                            # are as delivered.
-                            "background_restored": 0,
+                # Only the hosts the catalogue assigned to this patch.  Testing
+                # every host against every patch is quadratic and unaffordable once
+                # the host list spans the footprint rather than one field.
+                candidates = [
+                    h for h in by_patch.get((tract, base["patch"]), [])
+                    if (int(host_id[h]), band_name) not in seen
+                ]
+                if not candidates:
+                    continue
+                xs, ys = _sky_to_pixel(wcs, tgt_ra[candidates], tgt_dec[candidates])
+
+                if coadd is not None:
+                    bbox = _attr(coadd, "bbox")
+                else:
+                    try:
+                        bbox = butler.get(f"{DATASET_TYPE}.bbox", dataId=data_id)
+                    except Exception:
+                        coadd = butler.get(ref)
+                        bbox = _attr(coadd, "bbox")
+
+                inside = [
+                    (h, x, y) for h, x, y in zip(candidates, xs, ys)
+                    if _fits_in_patch(bbox, x, y, native_size)
+                ]
+                if not inside:
+                    continue
+                if coadd is None:
+                    try:
+                        coadd = butler.get(ref)
+                    except Exception as exc:
+                        records.append({**base, "status": "rejected",
+                                        "reasons": f"read_failed:{exc!r}"[:120]})
+                        continue
+                psf_model = _attr(coadd, "psf")
+                # Once per patch: which visits went into which cell.  This is the
+                # depth step stated exactly, rather than inferred from the noise.
+                visit_counts = cell_visit_counts(coadd)
+                if visit_counts and not depth_logged:
+                    log.info("per-cell visit counts available: %d cells, %d-%d visits",
+                             len(visit_counts), min(visit_counts.values()),
+                             max(visit_counts.values()))
+                    depth_logged = True
+                log.debug("patch %s band %s: %d hosts", base["patch"], band_name,
+                          len(inside))
+
+                for h, x, y in inside:
+                    if target is not None and n_accepted >= target:
+                        raise _Done
+                    rec = {**base, "host_id": int(host_id[h]),
+                           "host_offset_arcsec": float(r_jit[h])}
+
+                    sep = _verify_centre(wcs, x, y, float(tgt_ra[h]), float(tgt_dec[h]))
+                    rec["centre_sep_arcsec"] = sep
+                    if not np.isfinite(sep) or sep > CENTRE_TOLERANCE_ARCSEC:
+                        rec.update(status="rejected", reasons=f"centre_mismatch:{sep:.2f}")
+                        records.append(rec)
+                        continue
+
+                    # `coadd[box]` is a VIEW; copy or the whole parent patch stays
+                    # pinned in memory, which defeats the point of a stamp.
+                    stamp = coadd[_stamp_box(x, y, native_size)].copy()
+                    image = np.asarray(_attr(stamp, "image").array, dtype=np.float32)
+                    if image.shape != (native_size, native_size):
+                        rec.update(status="rejected", reasons=f"clipped:{image.shape}")
+                        records.append(rec)
+                        continue
+                    variance = np.asarray(_attr(stamp, "variance").array, dtype=np.float32)
+                    packed, mapping = pack_mask(_attr(stamp, "mask"))
+                    if mask_mapping is None:
+                        mask_mapping = mapping
+                    elif mapping != mask_mapping:
+                        rec.update(status="rejected", reasons="mask_schema_changed")
+                        records.append(rec)
+                        continue
+
+                    cells = cells_in_stamp(coadd, x, y, native_size)
+                    if visit_counts and cells and not depth_checked:
+                        # The grid's (i, j) and the provenance table's cell columns
+                        # are two independent conventions, and nothing guarantees
+                        # they agree on which one is x.  If they are transposed every
+                        # lookup misses, every stamp reads as zero-visit, and the run
+                        # rejects everything for the most confusing possible reason.
+                        depth_checked = True
+                        depth_usable = any(c in visit_counts for c in cells)
+                        if not depth_usable:
+                            log.warning(
+                                "none of the cells a stamp covers %s appear in "
+                                "provenance.contributions (which has e.g. %s): the "
+                                "cell index conventions do not match, so per-cell "
+                                "depth is ignored for this run and only the measured "
+                                "variance step will catch depth boundaries",
+                                cells[:4], sorted(visit_counts)[:4],
+                            )
+                    n_lo, n_hi = stamp_depth(visit_counts if depth_usable else {}, cells)
+                    if n_lo > 0:
+                        depth_ratio = n_hi / n_lo
+                    elif n_lo == 0:
+                        depth_ratio = np.inf  # a cell with no visits at all
+                    else:
+                        depth_ratio = None  # provenance unavailable
+                    reasons, diag = gate(image, variance, packed, mask_mapping,
+                                         cell_depth_ratio=depth_ratio, **gate_kwargs)
+                    rec.update({f"diag_{k}": v for k, v in diag.items()})
+                    psf = psf_bundle(psf_model, x, y)
+                    if psf is None:
+                        reasons = list(reasons) + ["psf_unavailable"]
+                    if reasons:
+                        rec.update(status="rejected", reasons=";".join(reasons))
+                        records.append(rec)
+                        continue
+
+                    if writer is None:
+                        writer = ShardWriter(
+                            out_dir / "shards",
+                            native_size=native_size,
+                            psf_size=psf["psf"].shape[0],
+                            mask_plane_dict=mask_mapping,
+                            prefix=prefix,
+                            patches_per_shard=patches_per_shard,
+                            dataset_type=DATASET_TYPE,
+                            attrs={
+                                "release": "DP2",
+                                "skymap": SKYMAP,
+                                "field_ra": ra,
+                                "field_dec": dec,
+                                "bands": json.dumps(list(bands)),
+                                "jitter_arcsec": jitter_arcsec,
+                                "flux_units": "nJy",
+                                "correlated_noise": 1,  # coadds are warped
+                                "pixel_origin": PIXEL_ORIGIN,
+                                # DP2 coadds get a final background subtraction that
+                                # over-subtracts around extended galaxies, and it can
+                                # be restored with apply_background('pretty').  These
+                                # are as delivered.
+                                "background_restored": 0,
+                            },
+                        )
+
+                    nb = [] if neighbours is None else neighbours.near(
+                        float(tgt_ra[h]), float(tgt_dec[h]), neighbour_radius_arcsec,
+                        band_name, host_id=int(host_id[h]),
+                    )
+                    others = [n for n in nb if not n["is_host"]]
+                    gal = [n["sep_arcsec"] for n in others if n["extendedness"] > 0.5]
+                    star = [n["sep_arcsec"] for n in others if n["extendedness"] <= 0.5]
+                    y0, x0 = _origin(stamp)
+                    acf.add(image)
+                    writer.add(
+                        image, variance, packed, psf["psf"],
+                        meta={
+                            "band_idx": BANDS.index(band_name) if band_name in BANDS else 255,
+                            "x0": x0,
+                            "y0": y0,
+                            "center_x": x,
+                            "center_y": y,
+                            "ra": float(tgt_ra[h]),
+                            "dec": float(tgt_dec[h]),
+                            "psf_sigma": psf["psf_sigma"],
+                            "psf_fwhm": psf["psf_fwhm"],
+                            "psf_ixx": psf["psf_ixx"],
+                            "psf_iyy": psf["psf_iyy"],
+                            "psf_ixy": psf["psf_ixy"],
+                            "pixel_scale": _pixel_scale(wcs, x, y),
+                            "sky_noise": diag.get("sky_noise", np.nan),
+                            "host_id": int(host_id[h]),
+                            "host_offset_arcsec": float(r_jit[h]),
+                            "tract": base["tract"],
+                            "patch": base["patch"],
+                            "n_cells_spanned": len(cells) if cells else -1,
+                            "n_visits_min": n_lo,
+                            "n_visits_max": n_hi,
+                            "n_neighbours": len(others),
+                            "neighbour_flux_max": float(
+                                max([n["flux"] for n in others], default=np.nan)
+                            ),
+                            "nearest_galaxy_arcsec": float(min(gal, default=np.nan)),
+                            "nearest_star_arcsec": float(min(star, default=np.nan)),
+                            "frac_no_data": diag.get("frac_no_data", np.nan),
+                            "variance_step": diag.get("variance_step", np.nan),
+                            "cell_depth_ratio": diag.get("cell_depth_ratio", np.nan),
+                            "frac_inexact_psf": diag.get("frac_INEXACT_PSF", np.nan),
+                            "frac_rejected": diag.get("frac_REJECTED", np.nan),
                         },
                     )
-
-                nb = neighbours.near(
-                    float(tgt_ra[h]), float(tgt_dec[h]), neighbour_radius_arcsec,
-                    band_name, host_id=int(host_id[h]),
-                )
-                others = [n for n in nb if not n["is_host"]]
-                gal = [n["sep_arcsec"] for n in others if n["extendedness"] > 0.5]
-                star = [n["sep_arcsec"] for n in others if n["extendedness"] <= 0.5]
-                y0, x0 = _origin(stamp)
-                acf.add(image)
-                writer.add(
-                    image, variance, packed, psf["psf"],
-                    meta={
-                        "band_idx": BANDS.index(band_name) if band_name in BANDS else 255,
-                        "x0": x0,
-                        "y0": y0,
-                        "center_x": x,
-                        "center_y": y,
-                        "ra": float(tgt_ra[h]),
-                        "dec": float(tgt_dec[h]),
-                        "psf_sigma": psf["psf_sigma"],
-                        "psf_fwhm": psf["psf_fwhm"],
-                        "psf_ixx": psf["psf_ixx"],
-                        "psf_iyy": psf["psf_iyy"],
-                        "psf_ixy": psf["psf_ixy"],
-                        "pixel_scale": _pixel_scale(wcs, x, y),
-                        "sky_noise": diag.get("sky_noise", np.nan),
-                        "host_id": int(host_id[h]),
-                        "host_offset_arcsec": float(r_jit[h]),
-                        "tract": base["tract"],
-                        "patch": base["patch"],
-                        "n_cells_spanned": len(cells) if cells else -1,
-                        "n_visits_min": n_lo,
-                        "n_visits_max": n_hi,
-                        "n_neighbours": len(others),
-                        "neighbour_flux_max": float(
-                            max([n["flux"] for n in others], default=np.nan)
-                        ),
-                        "nearest_galaxy_arcsec": float(min(gal, default=np.nan)),
-                        "nearest_star_arcsec": float(min(star, default=np.nan)),
-                        "frac_no_data": diag.get("frac_no_data", np.nan),
-                        "variance_step": diag.get("variance_step", np.nan),
-                        "cell_depth_ratio": diag.get("cell_depth_ratio", np.nan),
-                        "frac_inexact_psf": diag.get("frac_INEXACT_PSF", np.nan),
-                        "frac_rejected": diag.get("frac_REJECTED", np.nan),
-                    },
-                )
-                for n in others:
-                    neighbour_rows.append({"patch_index": n_accepted, **n})
-                rec.update(status="accepted", patch_index=n_accepted)
-                records.append(rec)
-                seen.add((int(host_id[h]), band_name))
-                n_accepted += 1
-            del coadd
+                    for n in others:
+                        neighbour_rows.append({"patch_index": n_accepted, **n})
+                    rec.update(status="accepted", patch_index=n_accepted)
+                    records.append(rec)
+                    seen.add((int(host_id[h]), band_name))
+                    n_accepted += 1
+                del coadd
 
     host_tables = []
     batch = n_hosts
@@ -1119,7 +1230,7 @@ def extract_patches(
             break
         tried.update(int(i) for i in hosts["objectId"])
         host_tables.append(hosts)
-        log.info("round %d: %d hosts selected from %d rows in the field",
+        log.info("round %d: %d hosts selected from %d candidates",
                  rounds, len(hosts), len(field))
 
         host_ra = np.asarray(hosts["coord_ra"], dtype=float)
@@ -1180,10 +1291,9 @@ def extract_patches(
         n_hosts_attempted=len(attempted),
         n_hosts_no_stamp_fitted=never,
         field_radius_deg=radius_deg,
-        n_catalogue_rows=len(catalogue),
-        n_field_rows=len(field),
+        n_host_candidates=len(field),
         n_hosts=len(hosts),
-        n_coadd_patches=len(refs),
+        n_coadd_patches=n_refs,
         dataset_type=DATASET_TYPE,
         mask_plane_dict=mask_mapping,
         correlation_length_native_flux_px=acf_result["xi"],
@@ -1325,6 +1435,29 @@ class _Done(Exception):
     """Internal: stop the nested extraction loops at max_patches."""
 
 
+def _neighbour_index(butler, tract: int, columns: Sequence[str],
+                     bands: Sequence[str]):
+    """Neighbour index for one tract, or ``None`` if its table will not read.
+
+    Neighbours must come from the *whole* tract, not from the host pool: a host
+    is interesting precisely because of what sits near it, and almost nothing
+    near it passed the host cuts.  One table per tract, held only while that
+    tract is being swept.
+    """
+    refs = object_refs_for_tract(butler, tract)
+    if not refs:
+        log.warning("no object table for tract %d; neighbour covariates will be "
+                    "missing for its stamps", tract)
+        return None
+    try:
+        table = butler.get(refs[0], parameters={"columns": list(columns)})
+    except Exception as exc:
+        log.warning("object table for tract %d unreadable (%r); neighbour "
+                    "covariates will be missing", tract, exc)
+        return None
+    return _NeighbourIndex(table, bands)
+
+
 class _NeighbourIndex:
     """Catalogue neighbours around a position, indexed once and searched in memory."""
 
@@ -1390,6 +1523,19 @@ def _write_table(stem: Path, table) -> None:
             table.write(stem.with_suffix(".csv"), format="ascii.csv", overwrite=True)
         except Exception as exc2:
             log.warning("could not write host table at all: %s", exc2)
+
+
+def _read_table(path: Path):
+    """Read back a table written by ``_write_table``."""
+    from astropy.table import Table
+
+    path = Path(path)
+    for candidate in (path, path.with_suffix(".parquet"), path.with_suffix(".csv")):
+        if candidate.exists() and candidate.is_file():
+            if candidate.suffix == ".csv":
+                return Table.read(candidate, format="ascii.csv")
+            return Table.read(candidate)
+    raise FileNotFoundError(path)
 
 
 def _write_manifest(

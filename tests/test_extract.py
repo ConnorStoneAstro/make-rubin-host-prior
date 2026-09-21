@@ -21,6 +21,9 @@ from rubin_host_prior.rubin.extract import (
     SIGMA_TO_FWHM,
     _adaptive_moments,
     _data_id_dict,
+    BANDS,
+    build_host_catalogue,
+    coadd_refs_for_tract,
     _within_radius,
     _write_manifest,
     cell_visit_counts,
@@ -36,7 +39,19 @@ from rubin_host_prior.rubin.extract import (
 Table = pytest.importorskip("astropy.table").Table
 
 
-def _catalogue(n=3000, seed=0, band="r"):
+def _flux_for(reff_arcsec, rng, mu_e=22.0):
+    """Total flux of a galaxy of this size at an ordinary surface brightness.
+
+    Size and flux are not independent on the sky, and a fixture that pretends
+    they are hides the fact that a flux ceiling set for small galaxies wipes out
+    a large size cut.  m = mu_e - 2.5 log10(2 pi reff^2), then nJy at zp 31.4.
+    """
+    mu = rng.normal(mu_e, 0.7, len(reff_arcsec))
+    mag = mu - 2.5 * np.log10(2 * np.pi * np.maximum(reff_arcsec, 1e-3) ** 2)
+    return 10 ** ((31.4 - mag) / 2.5)
+
+
+def _catalogue(n=3000, seed=0, band="r", tract=5063):
     rng = np.random.default_rng(seed)
     ixx = 10 ** rng.uniform(0.4, 3.2, n)
     iyy = 10 ** rng.uniform(0.4, 3.2, n)
@@ -47,23 +62,21 @@ def _catalogue(n=3000, seed=0, band="r"):
         "coord_dec": -28.10 + rng.normal(0, 0.1, n),
         "refExtendedness": np.ones(n),
         "refBand": [band] * n,
-        f"{band}_cModelFlux": 10 ** rng.uniform(2.6, 4.5, n),
+        "tract": np.full(n, tract),
+        "patch": rng.integers(0, 100, n),
+        f"{band}_cModelFlux": _flux_for(reff, rng),
         f"{band}_blendedness": rng.beta(1.2, 8, n),
         f"{band}_ixx": ixx,
         f"{band}_iyy": iyy,
         f"{band}_ixy": rng.normal(0, 5, n),
         # The multiband Sersic fit: one morphology for all six bands, so these
-        # carry no band prefix. Size tracks the moments trace, as it does on the
-        # sky, so the two size cuts stay consistent with each other.
+        # carry no band prefix.
         "sersic_reff_major": reff,
         "sersic_reff_minor": 0.7 * reff,
         "sersic_index": rng.uniform(0.5, 6.0, n),
         "sersic_unknown_flag": np.zeros(n, bool),
         "sersic_no_data_flag": np.zeros(n, bool),
     })
-
-
-# -- object table columns --------------------------------------------------
 
 
 def test_object_columns_do_not_ask_for_dp1_only_names():
@@ -140,7 +153,7 @@ def test_select_hosts_dedupes_before_selecting():
     assert len(select_hosts(doubled, band="r")) == len(select_hosts(t, band="r"))
 
 
-def _sized_catalogue(n, scale=0.25, seed=1, size_mult=25.0):
+def _sized_catalogue(n, scale=0.25, seed=1, size_mult=25.0, tract=5063):
     """A catalogue with a steep size distribution, as a real one has."""
     rng = np.random.default_rng(seed)
     trace_sq = size_mult * 10 ** rng.exponential(scale, n)
@@ -150,7 +163,9 @@ def _sized_catalogue(n, scale=0.25, seed=1, size_mult=25.0):
         "coord_ra": 53.13 + rng.normal(0, 0.3, n),
         "coord_dec": -28.10 + rng.normal(0, 0.3, n),
         "refExtendedness": np.ones(n),
-        "r_cModelFlux": 10 ** rng.uniform(2.6, 4.5, n),
+        "tract": np.full(n, tract),
+        "patch": rng.integers(0, 100, n),
+        "r_cModelFlux": _flux_for(reff, rng),
         "r_ixx": trace_sq, "r_iyy": trace_sq, "r_ixy": np.zeros(n),
         "sersic_reff_major": reff,
         "sersic_reff_minor": 0.7 * reff,
@@ -212,10 +227,13 @@ def test_point_like_objects_are_dropped():
 
 
 def test_flux_range_is_respected():
+    # Size cut off: these fluxes belong to small galaxies, and with both cuts on
+    # the sample is empty -- which is the interaction the warning above is for.
     t = _catalogue(2000)
-    out = select_hosts(t, band="r", flux_range=(1000.0, 5000.0))
+    out = select_hosts(t, band="r", flux_range=(1000.0, 5000.0),
+                       min_reff_arcsec=None)
     flux = np.asarray(out["r_cModelFlux"])
-    assert flux.min() > 1000.0 and flux.max() <= 5000.0
+    assert len(out) and flux.min() > 1000.0 and flux.max() <= 5000.0
 
 
 # -- PSF moments -----------------------------------------------------------
@@ -602,3 +620,140 @@ def test_hosts_are_restricted_to_the_field_being_swept():
 def test_the_field_cut_keeps_everything_when_the_radius_is_generous():
     t = _sized_catalogue(500, seed=22)
     assert len(_within_radius(t, 53.13, -28.10, 10.0)) == len(t)
+
+
+# -- the whole footprint ---------------------------------------------------
+#
+# Big galaxies are rare per square degree, so a 3" cut on a 0.3 deg field finds
+# almost nothing. Hosts come from every object table instead, cut per tract so
+# that what is held is the host list rather than the footprint.
+
+
+class _Ref:
+    def __init__(self, tract, patch=None, band=None):
+        d = {"skymap": "lsst_cells_v2", "tract": tract}
+        if patch is not None:
+            d["patch"] = patch
+        if band is not None:
+            d["band"] = band
+        self.dataId = _LegacyDataCoordinate(d)
+
+
+class _Butler:
+    """Enough butler to drive the catalogue scan."""
+
+    def __init__(self, tables, coadds=None):
+        self.tables = tables  # {tract: Table}
+        self.coadds = coadds or {}
+        self.reads = []
+
+    def query_datasets(self, kind, where="", bind=None, limit=None, **kw):
+        bind = bind or {}
+        if kind == "object":
+            tracts = ([bind["tract"]] if "tract" in bind else sorted(self.tables))
+            refs = [_Ref(t) for t in tracts if t in self.tables]
+            return refs[:limit] if limit else refs
+        return list(self.coadds.get(bind.get("tract"), []))
+
+    def get(self, ref, parameters=None):
+        tract = _data_id_dict(ref.dataId)["tract"]
+        self.reads.append(tract)
+        t = self.tables[tract]
+        cols = (parameters or {}).get("columns")
+        return t[[c for c in cols if c in t.colnames]] if cols else t
+
+
+def _footprint(n_tracts=4, per_tract=300, seed=30):
+    return {1000 + i: _sized_catalogue(per_tract, scale=0.6, seed=seed + i,
+                                      tract=1000 + i)
+            for i in range(n_tracts)}
+
+
+def test_the_catalogue_is_built_from_every_object_table():
+    tables = _footprint()
+    butler = _Butler(tables)
+    pool = build_host_catalogue(butler, min_reff_arcsec=3.0)
+    assert set(butler.reads) == set(tables)
+    assert len(pool) and np.all(host_half_light_arcsec(pool) >= 3.0)
+
+
+def test_only_survivors_are_kept_in_memory():
+    """An object table is ~700k rows and the footprint is ~1000 of them, so the
+    cuts have to run per tract rather than on a concatenation of all of them."""
+    tables = _footprint()
+    pool = build_host_catalogue(_Butler(tables), min_reff_arcsec=3.0)
+    assert len(pool) < sum(len(t) for t in tables.values())
+
+
+def test_sampling_does_not_happen_during_the_scan():
+    """A stratified draw has to see the whole pool; drawing per tract would
+    stratify within tracts and not across them. Asking for a sample during the
+    scan is refused rather than quietly applied per tract."""
+    with pytest.raises(TypeError):
+        build_host_catalogue(_Butler(_footprint()), min_reff_arcsec=None, n_hosts=5)
+
+
+def test_limit_tracts_bounds_a_test_run():
+    tables = _footprint(n_tracts=6)
+    butler = _Butler(tables)
+    build_host_catalogue(butler, min_reff_arcsec=None, limit_tracts=2)
+    assert len(set(butler.reads)) == 2
+
+
+def test_a_tract_that_will_not_read_does_not_end_the_scan():
+    tables = _footprint(n_tracts=3)
+    butler = _Butler(tables)
+    bad = sorted(tables)[1]
+    real_get = butler.get
+
+    def get(ref, parameters=None):
+        if _data_id_dict(ref.dataId)["tract"] == bad:
+            raise RuntimeError("corrupt")
+        return real_get(ref, parameters)
+
+    butler.get = get
+    pool = build_host_catalogue(butler, min_reff_arcsec=3.0)
+    assert len(pool) and bad not in set(np.asarray(pool["tract"], dtype=int))
+
+
+def test_the_catalogue_is_cached_and_reused(tmp_path):
+    """Scanning a thousand object tables takes minutes; it should happen once."""
+    tables = _footprint()
+    butler = _Butler(tables)
+    first = build_host_catalogue(butler, min_reff_arcsec=3.0,
+                                 cache=tmp_path / "hosts.parquet")
+    n_reads = len(butler.reads)
+    second = build_host_catalogue(butler, min_reff_arcsec=3.0,
+                                  cache=tmp_path / "hosts.parquet")
+    assert len(butler.reads) == n_reads  # nothing re-read
+    assert len(second) == len(first)
+
+
+def test_nothing_surviving_anywhere_is_an_error_not_an_empty_run():
+    tables = _footprint()
+    with pytest.raises(RuntimeError, match="min_reff_arcsec"):
+        build_host_catalogue(_Butler(tables), min_reff_arcsec=1e6)
+
+
+def test_coadd_refs_come_from_the_patches_hosts_are_in():
+    """A patch holds one or two hosts under a cut this selective, so sweeping
+    every patch overlapping a field loads a great many that hold none."""
+    coadds = {7: [_Ref(7, patch=p, band="r") for p in range(20)]}
+    butler = _Butler({}, coadds)
+    got = coadd_refs_for_tract(butler, 7, [3, 11], bands=BANDS)
+    assert sorted(int(_data_id_dict(r.dataId)["patch"]) for r in got) == [3, 11]
+
+
+def test_asking_for_no_patches_queries_nothing():
+    butler = _Butler({}, {7: [_Ref(7, patch=0, band="r")]})
+    assert coadd_refs_for_tract(butler, 7, [], bands=BANDS) == []
+
+
+def test_the_flux_ceiling_is_high_enough_for_the_size_cut(caplog):
+    """A 3" half-light radius at an ordinary 22 mag/arcsec^2 is r ~ 17.6, nine
+    times brighter than the old 36000 nJy ceiling. A ceiling set for a 1"
+    population annihilates the size cut, so the conflict is called out."""
+    t = _sized_catalogue(2000, scale=0.6, seed=31)
+    with caplog.at_level("WARNING"):
+        select_hosts(t, band="r", min_reff_arcsec=3.0, flux_range=(360.0, 36000.0))
+    assert "fighting the size cut" in caplog.text

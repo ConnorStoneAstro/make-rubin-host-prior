@@ -462,11 +462,34 @@ gives the first reason only, which is what the figure and the summary used to
 disagree about. `diagnostic_percentiles` gives the distribution of every gated
 quantity over every attempt, which is what a threshold should be chosen from.
 
-Hosts are drawn from **the field being swept**, not the whole object table. The
-table is a tract, ~1.7° on a side; the default 0.3° sweep is under a tenth of it,
-so drawing hosts from the tract sends most of them to patches that are never
-loaded, where they vanish without even a rejection record. `n_field_rows` and
-`n_catalogue_rows` in the summary show the difference.
+Hosts are drawn from **the whole DP2 footprint** by default, not from a disc
+around a field centre. With a 3″ size cut that is the difference between a
+workable sample and almost nothing: big galaxies are rare per square degree, so
+the way to get more of them is more sky, not more draws from the same 0.3°.
+`--radius-deg` still restricts to a field if you want one.
+
+`build_host_catalogue` streams the object tables one tract at a time, applies the
+cuts, and keeps only the survivors, so what is held in memory is the host list
+and not the footprint — an object table is ~700k rows and there are around a
+thousand of them. Sampling deliberately does *not* happen during the scan: a
+stratified draw has to see the whole pool or it stratifies within tracts instead
+of across them, and asking for one during the scan is refused rather than quietly
+applied per tract. Pass `--host-cache` so the scan happens once; delete the file
+if the cuts change. `--limit-tracts` bounds a test run.
+
+The sweep is then **tract-major**, which is what makes the footprint affordable.
+The object table is per tract, so the neighbour index is built once per tract and
+thrown away; and within a tract only the patches that actually hold a host are
+asked for, since under a cut this selective a patch holds one or two hosts and
+sweeping every patch that overlaps a field loads a great many that hold none.
+Candidates for a patch are the hosts the catalogue assigned to it — testing every
+host against every patch is quadratic and unaffordable once the list spans the
+sky.
+
+The cost that remains is one patch read per host per band, because the hosts are
+spread thinly. If that dominates, the thing to look for is whether the butler can
+serve a sub-region of a `deep_coadd` rather than the whole patch; this code does
+not assume it can.
 
 `--n-patches` is the number to ask for when you want a training set of a given
 size. Extraction then works towards it: draw a batch of hosts, sweep every coadd
@@ -540,6 +563,15 @@ logged, split by whether the object was too small or had no usable fit.
 
 `min_trace_px` stays as a second, non-parametric floor from the adaptive moments,
 a cross-check against a runaway fit.
+
+**The flux ceiling had to move with it.** Size and flux are not independent: a
+galaxy with a 3″ half-light radius and an ordinary effective surface brightness
+of 22 mag/arcsec² has r ≈ 17.6, nine times brighter than the 36000 nJy ceiling
+this used to carry. That ceiling was set for a 1″ population and would have
+annihilated the size cut. It is now 3e6 nJy (r ≈ 15.2); saturated cores are the
+gate's job rather than this one's. `select_hosts` also notices when a size cut
+and a flux range are nearly disjoint and says so, rather than silently returning
+nothing.
 
 **Size stratification draws from equal-width bins in log half-light radius, not
 quantiles.**

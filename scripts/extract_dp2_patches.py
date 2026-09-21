@@ -15,6 +15,9 @@ the gate rejects a share of those, so 128 hosts is nowhere near 128 cutouts.  Us
 ``--n-patches`` to ask for a number of cutouts and let extraction keep drawing
 hosts until it has them.
 
+Hosts are drawn from the whole DP2 footprint by default.  Pass ``--host-cache``
+so the scan over the footprint's object tables happens once.
+
 Early DP2 publishes ``deep_coadd`` and nothing else -- no ``visit_image``, no
 ``difference_image`` -- which suits this project, since the prior trains on
 coadds anyway.
@@ -44,8 +47,22 @@ def main() -> None:
     p.add_argument("--collection", default=COLLECTION)
     p.add_argument("--ra", type=float, default=ECDFS[0])
     p.add_argument("--dec", type=float, default=ECDFS[1])
-    p.add_argument("--radius-deg", type=float, default=0.3,
-                   help="field radius searched for coadd patches")
+    p.add_argument(
+        "--radius-deg", type=float, default=None,
+        help="restrict host selection to this many degrees of --ra/--dec. "
+             "Omit to use the whole DP2 footprint, which is what you want for a "
+             "selective size cut: big galaxies are rare per square degree",
+    )
+    p.add_argument(
+        "--host-cache", default=None,
+        help="path to cache the host catalogue. Scanning the footprint's object "
+             "tables takes minutes; with this it happens once. Delete the file "
+             "if the host cuts change",
+    )
+    p.add_argument(
+        "--limit-tracts", type=int, default=None,
+        help="scan only this many object tables. For a quick test run",
+    )
     p.add_argument("--bands", nargs="+", default=["u", "g", "r", "i", "z", "y"])
     p.add_argument(
         "--native-size",
@@ -107,6 +124,8 @@ def main() -> None:
         ra=args.ra,
         dec=args.dec,
         radius_deg=args.radius_deg,
+        host_cache=args.host_cache,
+        limit_tracts=args.limit_tracts,
         bands=args.bands,
         native_size=args.native_size,
         n_hosts=args.n_hosts,
