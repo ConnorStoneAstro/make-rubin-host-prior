@@ -116,6 +116,12 @@ def main() -> None:
              "--radius-deg rather than raising --n-hosts if the yield is short",
     )
     p.add_argument(
+        "--min-visits", type=int, default=None,
+        help="reject a stamp whose shallowest cell has fewer than this many "
+             "visits. Early DP2 outside the deep fields is 1-3 visits per cell, "
+             "which is a different sky from a deep coadd; off by default",
+    )
+    p.add_argument(
         "--max-variance-step", type=float, default=MAX_VARIANCE_STEP,
         help="reject a stamp whose block variance floors differ by more than "
              "this ratio. Cell-based coadds step in depth at cell edges and no "
@@ -154,7 +160,8 @@ def main() -> None:
         n_patches=args.n_patches,
         max_rounds=args.max_rounds,
         min_reff_arcsec=args.min_reff_arcsec,
-        gate_kwargs={"max_variance_step": args.max_variance_step},
+        gate_kwargs={"max_variance_step": args.max_variance_step,
+                     "min_visits": args.min_visits},
         jitter_arcsec=args.jitter_arcsec,
         patches_per_shard=args.patches_per_shard,
         max_patches=args.max_patches,

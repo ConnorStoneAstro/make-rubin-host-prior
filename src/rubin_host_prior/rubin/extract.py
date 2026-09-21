@@ -992,6 +992,42 @@ def select_hosts(
 # -- image discovery -------------------------------------------------------
 
 
+def _tract_refs(butler, dataset_type: str, tract: int, bands=None) -> list:
+    """Every ``dataset_type`` in one tract, constrained by data id, not by text.
+
+    By data id because the expression language bit once and silently: in
+    ``where="tract = :tract"`` the bind key shadows the dimension of the same
+    name, so it resolved as ``tract = tract`` -- true for every row.  The query
+    then returned the whole repo, truncated at the default 20000, and hosts were
+    matched against same-numbered patches in other tracts, which projected a
+    couple of hundred thousand pixels away.  ``data_id`` takes key-value equality
+    constraints and cannot be read as anything else.
+    """
+    refs = butler.query_datasets(
+        dataset_type,
+        data_id={"skymap": SKYMAP, "tract": int(tract)},
+        limit=None, explain=False,
+    )
+    kept, wrong = [], 0
+    want = set(bands) if bands else None
+    for ref in refs:
+        fields = _data_id_dict(ref.dataId)
+        if int(fields.get("tract", -1)) != int(tract):
+            wrong += 1
+            continue
+        if want is not None and str(fields.get("band", "?")) not in want:
+            continue
+        kept.append(ref)
+    if wrong:
+        # Belt and braces: if a server-side constraint ever stops applying
+        # again, this is the line that says so instead of a run of empty
+        # patches and a confusing projection.
+        log.warning("%d %s refs came back for tracts other than %d and were "
+                    "dropped here; the query is not constraining tract",
+                    wrong, dataset_type, tract)
+    return kept
+
+
 def coadd_refs_for_tract(butler, tract: int, patches: Iterable[int],
                          bands: Sequence[str] = BANDS) -> list:
     """``deep_coadd`` refs for the patches of one tract that hold a host.
@@ -1004,24 +1040,13 @@ def coadd_refs_for_tract(butler, tract: int, patches: Iterable[int],
     patches = {int(p) for p in patches}
     if not patches:
         return []
-    where = "skymap = :skymap AND tract = :tract"
-    if bands is not None and len(bands) < len(BANDS):
-        where += " AND band.name IN (" + ", ".join(f"'{b}'" for b in bands) + ")"
-    refs = butler.query_datasets(
-        DATASET_TYPE, where=where,
-        bind={"skymap": SKYMAP, "tract": int(tract)},
-        explain=False,
-    )
-    return [r for r in refs
+    return [r for r in _tract_refs(butler, DATASET_TYPE, tract, bands)
             if int(_data_id_dict(r.dataId).get("patch", -1)) in patches]
 
 
 def object_refs_for_tract(butler, tract: int) -> list:
     """The ``object`` table of one tract."""
-    return list(butler.query_datasets(
-        "object", where="skymap = :skymap AND tract = :tract",
-        bind={"skymap": SKYMAP, "tract": int(tract)}, explain=False,
-    ))
+    return _tract_refs(butler, "object", tract)
 
 
 # -- geometry --------------------------------------------------------------
@@ -1545,7 +1570,8 @@ def extract_patches(
                     else:
                         depth_ratio = None  # provenance unavailable
                     reasons, diag = gate(image, variance, packed, mask_mapping,
-                                         cell_depth_ratio=depth_ratio, **gate_kwargs)
+                                         cell_depth_ratio=depth_ratio,
+                                         n_visits=n_lo, **gate_kwargs)
                     rec.update({f"diag_{k}": v for k, v in diag.items()})
                     psf = psf_bundle(psf_model, x, y)
                     if psf is None:

@@ -439,3 +439,25 @@ def test_a_cell_with_no_visits_at_all_is_rejected():
     reasons, _ = gate(_scene(), _var(1.0), np.zeros((SIZE, SIZE), np.uint32),
                       PLANES, cell_depth_ratio=np.inf)
     assert any(r.startswith("cell_depth") for r in reasons)
+
+
+def test_absolute_depth_is_recorded_and_optionally_gated():
+    """Early DP2 outside the deep fields is 1-3 visits per cell, which is a
+    different sky from a deep coadd. Whether that is too shallow is a judgement
+    about the prior, so it is recorded always and gated only on request."""
+    mask = np.zeros((SIZE, SIZE), np.uint32)
+    reasons, diag = gate(_scene(), _var(1.0), mask, PLANES, n_visits=2)
+    assert diag["n_visits_min"] == 2 and not reasons
+
+    reasons, _ = gate(_scene(), _var(1.0), mask, PLANES, n_visits=2, min_visits=10)
+    assert any(r.startswith("too_shallow") for r in reasons)
+
+    reasons, _ = gate(_scene(), _var(1.0), mask, PLANES, n_visits=30, min_visits=10)
+    assert not reasons
+
+
+def test_unknown_depth_is_neither_recorded_nor_gated():
+    """-1 is 'provenance unavailable'; it must not read as a shallow stamp."""
+    _, diag = gate(_scene(), _var(1.0), np.zeros((SIZE, SIZE), np.uint32), PLANES,
+                   n_visits=-1, min_visits=10)
+    assert "n_visits_min" not in diag

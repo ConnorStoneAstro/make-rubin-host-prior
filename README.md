@@ -542,6 +542,16 @@ are not the same numbering rather than a run of unlucky edges.
 `n_patches_with_hosts` / `n_patches_without_hosts` in the summary is the same
 thing after the fact.
 
+Per-tract queries are constrained with `data_id=`, not with a `where` string.
+The expression language bit once and silently: in `where="tract = :tract"` the
+bind key **shadows the dimension of the same name**, so it resolved as
+`tract = tract` — true for every row. The query returned the whole repo,
+truncated at the default 20000, and since patch indices repeat across tracts the
+client-side patch filter let refs from anywhere through. Hosts were matched
+against same-numbered patches in other tracts and projected ~200 000 pixels away.
+Refs are now filtered on tract client-side as well, and a ref from the wrong
+tract is reported rather than dropped quietly.
+
 The sweep is then **tract-major**, which is what makes the footprint affordable.
 The object table is per tract, so the neighbour index is built once per tract and
 thrown away; and within a tract only the patches that actually hold a host are
@@ -717,6 +727,14 @@ table at all and, if they do not, says so and falls back rather than rejecting
 every stamp for the most confusing possible reason.
 
 `n_cells_spanned` is still recorded as the footprint.
+
+**Absolute depth is a separate question from depth *variation*.** Early DP2
+outside the deep fields runs 1–3 visits per cell, which is a different sky from a
+deep coadd — and at 1–3 visits a single-visit difference between neighbouring
+cells is a `cell_depth_ratio` of 2 or 3, so the 1.5 default rejects nearly
+everything there. `n_visits_min` is recorded for every stamp and `--min-visits`
+gates on it, off by default: whether a shallow coadd belongs in this prior is a
+judgement about the prior, not about the pixels.
 
 ### Storage
 

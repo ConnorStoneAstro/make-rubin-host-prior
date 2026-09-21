@@ -24,6 +24,8 @@ from rubin_host_prior.rubin.extract import (
     BANDS,
     build_host_catalogue,
     coadd_refs_for_tract,
+    SKYMAP,
+    object_refs_for_tract,
     read_component,
     _fits_in_patch,
     _sky_to_pixel,
@@ -663,13 +665,15 @@ class _Butler:
         self.coadds = coadds or {}
         self.reads = []
 
-    def query_datasets(self, kind, where="", bind=None, limit=None, **kw):
-        bind = bind or {}
+    def query_datasets(self, kind, data_id=None, where="", bind=None,
+                       limit=None, **kw):
+        data_id = data_id or {}
+        tract = data_id.get("tract")
         if kind == "object":
-            tracts = ([bind["tract"]] if "tract" in bind else sorted(self.tables))
+            tracts = [tract] if tract is not None else sorted(self.tables)
             refs = [_Ref(t) for t in tracts if t in self.tables]
             return refs[:limit] if limit else refs
-        return list(self.coadds.get(bind.get("tract"), []))
+        return list(self.coadds.get(tract, []))
 
     def get(self, ref, parameters=None):
         tract = _data_id_dict(ref.dataId)["tract"]
@@ -1168,3 +1172,51 @@ def test_rows_without_a_position_are_dropped_with_a_count(caplog):
     with caplog.at_level("WARNING"):
         out = with_positions(t)
     assert len(out) == 1 and "2 host candidate" in caplog.text
+
+
+def test_refs_are_constrained_by_data_id_not_by_a_where_clause():
+    """The expression language bit once and silently: in `where="tract = :tract"`
+    the bind key shadows the dimension of the same name, so it resolved as
+    `tract = tract` -- true for every row. The query returned the whole repo,
+    truncated at 20000, and hosts were matched against same-numbered patches in
+    other tracts, which projected ~200000 px away."""
+    seen = {}
+
+    class _Recording(_Butler):
+        def query_datasets(self, kind, data_id=None, **kw):
+            seen.update(kind=kind, data_id=data_id, kw=kw)
+            return []
+
+    _Recording({}, {}).query_datasets  # keep the class used
+    b = _Recording({}, {})
+    coadd_refs_for_tract(b, 5063, [1, 2], bands=BANDS)
+    assert seen["data_id"] == {"skymap": SKYMAP, "tract": 5063}
+    assert not seen["kw"].get("where")
+    assert seen["kw"].get("limit") is None
+
+
+def test_refs_from_the_wrong_tract_are_dropped_and_reported(caplog):
+    """Patch indices repeat across tracts, so a patch filter alone lets a ref
+    from anywhere through -- which is exactly how the bug showed up."""
+    coadds = {5063: [_Ref(5063, patch=3, band="r"), _Ref(99, patch=3, band="r")]}
+
+    class _Leaky(_Butler):
+        def query_datasets(self, kind, data_id=None, **kw):
+            return list(coadds[5063])
+
+    with caplog.at_level("WARNING"):
+        got = coadd_refs_for_tract(_Leaky({}, {}), 5063, [3], bands=BANDS)
+    assert len(got) == 1
+    assert int(_data_id_dict(got[0].dataId)["tract"]) == 5063
+    assert "not constraining tract" in caplog.text
+
+
+def test_bands_are_filtered_client_side_too():
+    coadds = {7: [_Ref(7, patch=1, band=b) for b in ("u", "r", "z")]}
+
+    class _All(_Butler):
+        def query_datasets(self, kind, data_id=None, **kw):
+            return list(coadds[7])
+
+    got = coadd_refs_for_tract(_All({}, {}), 7, [1], bands=("r", "z"))
+    assert sorted(str(_data_id_dict(r.dataId)["band"]) for r in got) == ["r", "z"]

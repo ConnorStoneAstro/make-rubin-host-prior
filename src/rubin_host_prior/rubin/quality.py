@@ -256,6 +256,8 @@ def gate(
     variance_floor_percentile: float = VARIANCE_FLOOR_PERCENTILE,
     cell_depth_ratio: float | None = None,
     max_cell_depth_ratio: float = MAX_VARIANCE_STEP,
+    n_visits: int | None = None,
+    min_visits: int | None = None,
     require_known_planes: bool = True,
 ) -> tuple[list[str], dict[str, float]]:
     """Return ``(rejection_reasons, diagnostics)``.  Empty reasons means accept.
@@ -318,6 +320,15 @@ def gate(
     # still differ by whatever the seeing and sky did -- so both run.
     # NaN is "not measured"; inf is a cell with no visits at all, which is the
     # worst case and must not be excused by a finiteness check.
+    # Absolute depth, as opposed to how much it varies across the stamp.  Early
+    # DP2 outside the deep fields is 1-3 visits per cell, which is a different
+    # sky from a deep coadd; off by default, because whether that is too shallow
+    # is a judgement about the prior and not about the pixels.
+    if n_visits is not None and n_visits >= 0:
+        diag["n_visits_min"] = float(n_visits)
+        if min_visits is not None and n_visits < min_visits:
+            reasons.append(f"too_shallow:{n_visits}<{min_visits}")
+
     if cell_depth_ratio is not None and not np.isnan(cell_depth_ratio):
         diag["cell_depth_ratio"] = float(cell_depth_ratio)
         if cell_depth_ratio > max_cell_depth_ratio:
