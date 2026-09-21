@@ -7,7 +7,7 @@ PSF moments, which DP2's PSF object cannot compute for you.
 """
 
 from collections.abc import Mapping
-from types import MappingProxyType
+from types import MappingProxyType, SimpleNamespace
 
 import numpy as np
 import pytest
@@ -18,10 +18,13 @@ from rubin_host_prior.rubin.extract import (
     SIGMA_TO_FWHM,
     _adaptive_moments,
     _data_id_dict,
+    cell_visit_counts,
+    cells_in_stamp,
     dedupe_hosts,
     host_half_light_arcsec,
     host_trace_radius_px,
     select_hosts,
+    stamp_depth,
 )
 
 Table = pytest.importorskip("astropy.table").Table
@@ -402,3 +405,91 @@ def test_hosts_without_a_cmodel_fit_do_not_pass_the_size_cut():
         t[col][:200] = np.nan
     out = select_hosts(t, band="r", min_reff_arcsec=1.0)
     assert len(out) and np.all(np.asarray(out["objectId"]) >= 200)
+
+
+# -- per-cell depth --------------------------------------------------------
+#
+# DP2 exposures share an integration time, so the number of visits in a cell is
+# the depth of that cell, and the ratio across the cells a stamp covers is the
+# step -- exactly, and without reading a pixel.  provenance.contributions is the
+# only route: deep_coadd_input_summary is documented as patch-level and says
+# outright that it does not record which visits went into each cell.
+
+
+class _Grid:
+    def __init__(self, cell=150):
+        self.cell = cell
+
+    def index_of(self, x, y):
+        return SimpleNamespace(i=int(x) // self.cell, j=int(y) // self.cell)
+
+
+def _coadd(contributions=None, grid=True):
+    prov = None if contributions is None else SimpleNamespace(contributions=contributions)
+    return SimpleNamespace(grid=_Grid() if grid else None, provenance=prov)
+
+
+def _contributions(rows, cols=("cell_i", "cell_j")):
+    """rows: (i, j, visit, detector) tuples."""
+    a = np.asarray(rows, dtype=np.int64)
+    return Table({cols[0]: a[:, 0], cols[1]: a[:, 1],
+                  "visit": a[:, 2], "detector": a[:, 3]})
+
+
+def test_visits_are_counted_per_cell():
+    t = _contributions([(0, 0, 10, 1), (0, 0, 11, 1), (0, 0, 12, 1), (1, 0, 10, 1)])
+    assert cell_visit_counts(_coadd(t)) == {(0, 0): 3, (1, 0): 1}
+
+
+def test_a_visit_split_across_detectors_counts_once():
+    """One row per (visit, detector, cell), so a visit whose detector boundary
+    crosses a cell appears twice. It is still one visit of depth."""
+    t = _contributions([(0, 0, 10, 1), (0, 0, 10, 2), (0, 0, 11, 1)])
+    assert cell_visit_counts(_coadd(t)) == {(0, 0): 2}
+
+
+@pytest.mark.parametrize("cols", [("cell_i", "cell_j"), ("cell_x", "cell_y"), ("i", "j")])
+def test_the_cell_columns_are_resolved_by_trial(cols):
+    """The API documents the table as {visit, detector, cell} without pinning the
+    column names, and CellIJ does not survive into an astropy column as one
+    object."""
+    t = _contributions([(0, 0, 10, 1), (0, 0, 11, 1)], cols=cols)
+    assert cell_visit_counts(_coadd(t)) == {(0, 0): 2}
+
+
+def test_unrecognised_columns_degrade_rather_than_crash(caplog):
+    t = Table({"cell_index": [0, 0], "visit": [10, 11]})
+    with caplog.at_level("WARNING"):
+        assert cell_visit_counts(_coadd(t)) == {}
+    assert "cell_index" in caplog.text
+
+
+def test_missing_provenance_is_not_an_error():
+    assert cell_visit_counts(_coadd(None)) == {}
+    assert cell_visit_counts(_coadd(Table({"visit": []}))) == {}
+
+
+def test_cells_in_stamp_covers_the_rectangle_not_just_the_corners():
+    """A 416 px stamp spans 3x3 cells of 150 px; the middle one has no corner in
+    it and would be missed by a corner-only span."""
+    cells = cells_in_stamp(_coadd(), x=225, y=225, size=416)
+    assert len(cells) == 9 and (1, 1) in cells
+
+
+def test_a_stamp_inside_one_cell_spans_one():
+    assert cells_in_stamp(_coadd(), x=75, y=75, size=64) == [(0, 0)]
+
+
+def test_stamp_depth_is_the_range_over_the_cells_covered():
+    counts = {(0, 0): 30, (0, 1): 12, (1, 0): 28}
+    assert stamp_depth(counts, [(0, 0), (0, 1), (1, 0)]) == (12, 30)
+
+
+def test_a_cell_absent_from_the_table_contributed_nothing():
+    assert stamp_depth({(0, 0): 30}, [(0, 0), (9, 9)]) == (0, 30)
+
+
+def test_depth_is_unknown_rather_than_zero_without_provenance():
+    """-1 is 'not measured'; 0 would claim a cell with no visits in it."""
+    assert stamp_depth({}, [(0, 0)]) == (-1, -1)
+    assert stamp_depth({(0, 0): 30}, []) == (-1, -1)

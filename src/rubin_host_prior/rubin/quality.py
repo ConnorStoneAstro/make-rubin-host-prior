@@ -36,8 +36,14 @@ at a visit edge, a dither boundary, the rim of the field -- the noise level step
 across a straight cell edge, and a stamp larger than a cell straddles it.  It is
 most obvious in y, which has the fewest visits and so the largest fractional
 step.  Rubin does not mark this: it is not a defect, the pixels are all real, they
-are just not equally deep.  What records it is the *variance plane*, which is
-where depth lives, so ``variance_step`` measures it directly -- the ratio between
+are just not equally deep.  Two things record it.  The coadd's own
+``provenance.contributions`` says which visits went into which cell, and since
+DP2 exposures share an integration time the ratio of counts across the cells a
+stamp covers *is* the step, exactly, before any pixel is read; extraction passes
+it in as ``cell_depth_ratio``.  That is not the whole story, because coaddition
+is inverse-variance weighted and cells with equal counts still differ by whatever
+the seeing and the sky did, so the *variance plane* is measured as well --
+``variance_step`` -- the ratio between
 the highest and lowest block-wise variance floor across the stamp.  The floor is
 a low percentile within each block so that a source, which only ever pushes
 variance up, cannot fake a step, and pixels the image shows to be source are dropped
@@ -232,6 +238,8 @@ def gate(
     max_variance_step: float = MAX_VARIANCE_STEP,
     variance_block: int | None = None,
     variance_floor_percentile: float = VARIANCE_FLOOR_PERCENTILE,
+    cell_depth_ratio: float | None = None,
+    max_cell_depth_ratio: float = MAX_VARIANCE_STEP,
     require_known_planes: bool = True,
 ) -> tuple[list[str], dict[str, float]]:
     """Return ``(rejection_reasons, diagnostics)``.  Empty reasons means accept.
@@ -285,6 +293,21 @@ def gate(
     diag["inner_frac_no_data"] = inner_no_data
     if inner_no_data > max_inner_no_data:
         reasons.append(f"inner_no_data:{inner_no_data:.4f}>{max_inner_no_data}")
+
+    # The exact statement of the same thing, when extraction could get it from
+    # the coadd's provenance: visits share an integration time, so the ratio of
+    # visit counts across the cells a stamp covers *is* the depth step, known
+    # without looking at a pixel.  It is not a replacement for the measured
+    # version -- coadds are inverse-variance weighted, so cells with equal counts
+    # still differ by whatever the seeing and sky did -- so both run.
+    # NaN is "not measured"; inf is a cell with no visits at all, which is the
+    # worst case and must not be excused by a finiteness check.
+    if cell_depth_ratio is not None and not np.isnan(cell_depth_ratio):
+        diag["cell_depth_ratio"] = float(cell_depth_ratio)
+        if cell_depth_ratio > max_cell_depth_ratio:
+            reasons.append(
+                f"cell_depth:{cell_depth_ratio:.2f}>{max_cell_depth_ratio}"
+            )
 
     # Cell-based coadds step in depth at cell edges and nothing flags it; see the
     # module docstring.  Gate on it, because a stamp with a straight noise

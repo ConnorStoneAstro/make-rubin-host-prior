@@ -644,14 +644,8 @@ def _fits_in_patch(bbox, x: float, y: float, size: int) -> bool:
     )
 
 
-def _cells_spanned(coadd, x: float, y: float, size: int) -> int:
-    """How many 150-pixel cells the stamp touches.
-
-    Each cell is coadded from its own set of input visits, so depth and PSF step
-    at cell edges.  Any stamp bigger than 150 native pixels straddles them, and a
-    generative prior would happily learn those steps as real structure -- so
-    record the span rather than pretend it is not there.
-    """
+def cells_in_stamp(coadd, x: float, y: float, size: int) -> list[tuple[int, int]]:
+    """Every ``(i, j)`` cell index the stamp covers.  Empty if the grid is absent."""
     try:
         grid = _attr(coadd, "grid")
         half = size // 2
@@ -660,12 +654,86 @@ def _cells_spanned(coadd, x: float, y: float, size: int) -> int:
             for dx in (-half, half - 1)
             for dy in (-half, half - 1)
         ]
-        ii = {c.i for c in corners}
-        jj = {c.j for c in corners}
-        return int((max(ii) - min(ii) + 1) * (max(jj) - min(jj) + 1))
+        ii = [c.i for c in corners]
+        jj = [c.j for c in corners]
+        return [(i, j)
+                for i in range(min(ii), max(ii) + 1)
+                for j in range(min(jj), max(jj) + 1)]
     except Exception as exc:
         log.debug("cell grid unavailable: %s", exc)
-        return -1
+        return []
+
+
+#: Candidate spellings of the cell index in ``provenance.contributions``.  The
+#: API documents the table as ``{visit, detector, cell}`` without pinning the
+#: column names, and ``CellIJ`` does not survive into an astropy column as one
+#: object, so the pair is resolved by trial and the real names are logged if none
+#: of these match.
+CONTRIB_CELL_COLUMNS: tuple[tuple[str, str], ...] = (
+    ("cell_i", "cell_j"),
+    ("cell_x", "cell_y"),
+    ("i", "j"),
+    ("x", "y"),
+)
+
+
+def cell_visit_counts(coadd) -> dict[tuple[int, int], int]:
+    """Distinct visits contributing to each ``(i, j)`` cell.
+
+    This is the quantity that makes a depth step, and it is exact: DP2 exposures
+    share an integration time, so a cell built from 12 visits is simply shallower
+    than its neighbour built from 30, and the noise steps across the edge between
+    them.  No mask plane says so, but ``CellCoadd.provenance.contributions`` is a
+    table of ``{visit, detector, cell}`` -- which observation went into which
+    cell -- so counting it gives the step before a single pixel is examined.
+
+    Note ``deep_coadd_input_summary`` is *not* an alternative: Rubin documents it
+    as patch-level and says outright that it does not record which visit-detector
+    images contributed to each cell.
+
+    Empty if provenance is missing or its columns are not what is expected, which
+    leaves the measured ``variance_step`` as the only detector rather than
+    failing the run.
+    """
+    prov = getattr(coadd, "provenance", None)
+    contributions = getattr(prov, "contributions", None) if prov is not None else None
+    if contributions is None or len(contributions) == 0:
+        log.debug("no coadd provenance; falling back to the measured variance step")
+        return {}
+
+    names = list(getattr(contributions, "colnames", None)
+                 or getattr(contributions, "columns", []))
+    cell_cols = next((c for c in CONTRIB_CELL_COLUMNS if set(c) <= set(names)), None)
+    if cell_cols is None or "visit" not in names:
+        log.warning(
+            "provenance.contributions has columns %s; expected a visit column and "
+            "one of %s. Per-cell depth is unavailable and only the measured "
+            "variance step will catch depth boundaries. Add the real spelling to "
+            "CONTRIB_CELL_COLUMNS in rubin/extract.py.",
+            names, [list(c) for c in CONTRIB_CELL_COLUMNS],
+        )
+        return {}
+
+    # One row per (visit, detector, cell), so a visit crossing a detector
+    # boundary inside a cell appears twice; count distinct visits, not rows.
+    keys = np.stack([
+        np.asarray(contributions[cell_cols[0]], dtype=np.int64),
+        np.asarray(contributions[cell_cols[1]], dtype=np.int64),
+        np.asarray(contributions["visit"], dtype=np.int64),
+    ], axis=1)
+    cells, counts = np.unique(np.unique(keys, axis=0)[:, :2], axis=0,
+                              return_counts=True)
+    return {(int(i), int(j)): int(n) for (i, j), n in zip(cells, counts)}
+
+
+def stamp_depth(counts: dict[tuple[int, int], int],
+                cells: list[tuple[int, int]]) -> tuple[int, int]:
+    """``(min, max)`` visit count over the cells a stamp covers; ``(-1, -1)`` if
+    unknown.  Cells missing from the table contributed nothing and count as 0."""
+    if not counts or not cells:
+        return -1, -1
+    n = [counts.get(c, 0) for c in cells]
+    return min(n), max(n)
 
 
 # -- the driver ------------------------------------------------------------
@@ -752,6 +820,9 @@ def extract_patches(
     # the same band -- duplicates that a training set would silently weight up.
     seen: set[tuple[int, str]] = set()
     component_reads_failed = False
+    depth_logged = False
+    depth_checked = False
+    depth_usable = True
 
     try:
         for ref in refs:
@@ -820,6 +891,14 @@ def extract_patches(
                                     "reasons": f"read_failed:{exc!r}"[:120]})
                     continue
             psf_model = _attr(coadd, "psf")
+            # Once per patch: which visits went into which cell.  This is the
+            # depth step stated exactly, rather than inferred from the noise.
+            visit_counts = cell_visit_counts(coadd)
+            if visit_counts and not depth_logged:
+                log.info("per-cell visit counts available: %d cells, %d-%d visits",
+                         len(visit_counts), min(visit_counts.values()),
+                         max(visit_counts.values()))
+                depth_logged = True
             log.debug("patch %s band %s: %d hosts", base["patch"], band_name,
                       len(inside))
 
@@ -853,8 +932,33 @@ def extract_patches(
                     records.append(rec)
                     continue
 
+                cells = cells_in_stamp(coadd, x, y, native_size)
+                if visit_counts and cells and not depth_checked:
+                    # The grid's (i, j) and the provenance table's cell columns
+                    # are two independent conventions, and nothing guarantees
+                    # they agree on which one is x.  If they are transposed every
+                    # lookup misses, every stamp reads as zero-visit, and the run
+                    # rejects everything for the most confusing possible reason.
+                    depth_checked = True
+                    depth_usable = any(c in visit_counts for c in cells)
+                    if not depth_usable:
+                        log.warning(
+                            "none of the cells a stamp covers %s appear in "
+                            "provenance.contributions (which has e.g. %s): the "
+                            "cell index conventions do not match, so per-cell "
+                            "depth is ignored for this run and only the measured "
+                            "variance step will catch depth boundaries",
+                            cells[:4], sorted(visit_counts)[:4],
+                        )
+                n_lo, n_hi = stamp_depth(visit_counts if depth_usable else {}, cells)
+                if n_lo > 0:
+                    depth_ratio = n_hi / n_lo
+                elif n_lo == 0:
+                    depth_ratio = np.inf  # a cell with no visits at all
+                else:
+                    depth_ratio = None  # provenance unavailable
                 reasons, diag = gate(image, variance, packed, mask_mapping,
-                                     **gate_kwargs)
+                                     cell_depth_ratio=depth_ratio, **gate_kwargs)
                 rec.update({f"diag_{k}": v for k, v in diag.items()})
                 psf = psf_bundle(psf_model, x, y)
                 if psf is None:
@@ -921,7 +1025,9 @@ def extract_patches(
                         "host_offset_arcsec": float(r_jit[h]),
                         "tract": base["tract"],
                         "patch": base["patch"],
-                        "n_cells_spanned": _cells_spanned(coadd, x, y, native_size),
+                        "n_cells_spanned": len(cells) if cells else -1,
+                        "n_visits_min": n_lo,
+                        "n_visits_max": n_hi,
                         "n_neighbours": len(others),
                         "neighbour_flux_max": float(
                             max([n["flux"] for n in others], default=np.nan)
@@ -930,6 +1036,7 @@ def extract_patches(
                         "nearest_star_arcsec": float(min(star, default=np.nan)),
                         "frac_no_data": diag.get("frac_no_data", np.nan),
                         "variance_step": diag.get("variance_step", np.nan),
+                        "cell_depth_ratio": diag.get("cell_depth_ratio", np.nan),
                         "frac_inexact_psf": diag.get("frac_INEXACT_PSF", np.nan),
                         "frac_rejected": diag.get("frac_REJECTED", np.nan),
                     },

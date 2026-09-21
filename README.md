@@ -545,8 +545,29 @@ noise σ; the ratio goes into the manifest whether the stamp passes or not, so i
 can be retuned from `variance_step` without re-reading pixels. `--max-variance-step
 inf` keeps everything.
 
-`n_cells_spanned` is still recorded, and `provenance.contributions` offers
-per-cell input counts if you want the depth itself rather than its footprint.
+**And the coadd states the step exactly, before any pixel is read.**
+`CellCoadd.provenance.contributions` is a table of `{visit, detector, cell}` —
+which observation went into which cell. DP2 exposures share an integration time,
+so the number of distinct visits in a cell *is* its depth, and the ratio across
+the cells a stamp covers is the step. `cell_visit_counts` reads it once per
+patch; the ratio is gated as `cell_depth_ratio` and `n_visits_min` /
+`n_visits_max` go into the manifest.
+
+`deep_coadd_input_summary` is not an alternative: Rubin documents it as
+patch-level and states outright that it does not record which visit-detector
+images contributed to each cell.
+
+The two measures are kept because neither subsumes the other. Coaddition is
+inverse-variance weighted, so cells with equal visit counts still differ by
+whatever the seeing and the sky did — the counts cannot see that and the variance
+can; and provenance can be absent or spelled differently, in which case the
+variance is all there is. Two independent conventions meet here — the grid's
+`(i, j)` and the provenance table's cell columns — and nothing guarantees they
+agree on which one is x, so the first stamp checks that its cells appear in the
+table at all and, if they do not, says so and falls back rather than rejecting
+every stamp for the most confusing possible reason.
+
+`n_cells_spanned` is still recorded as the footprint.
 
 ### Storage
 
@@ -590,6 +611,11 @@ than guessed, so the list is short:
 - [ ] **`min_trace_px = 1.75`** in `select_hosts` is a DP1-era ComCam PSF size.
       It is now only a cross-check behind the 1″ half-light cut, so it matters
       less, but check it against the DP2 PSF before leaning on it.
+- [ ] **`provenance.contributions` column names.** The API documents the table
+      as `{visit, detector, cell}` without pinning the spellings, and `CellIJ`
+      cannot survive into an astropy column as one object, so
+      `CONTRIB_CELL_COLUMNS` tries `cell_i/cell_j`, `cell_x/cell_y`, `i/j`,
+      `x/y` and logs the real names if none match. One run says which it is.
 - [ ] **`--max-variance-step 1.5`** was chosen from what a depth step looks like,
       not from DP2 statistics. Look at the `variance step` panel in `hosts.png`
       and the rejection counts after a real run: if it is rejecting a large

@@ -359,3 +359,44 @@ def test_too_few_blocks_is_a_pass_not_a_rejection():
     assert np.isnan(variance_step(small))
     reasons, _ = gate(np.zeros((10, 10)), small, np.zeros((10, 10), np.uint32), PLANES)
     assert not any(r.startswith("variance_step") for r in reasons)
+
+
+def test_the_exact_depth_ratio_rejects_without_looking_at_pixels():
+    """Visits share an integration time, so the ratio of visit counts across the
+    cells a stamp covers is the depth step -- known from provenance before a
+    pixel is read."""
+    clean = _var(1.0)
+    mask = np.zeros((SIZE, SIZE), np.uint32)
+    reasons, diag = gate(_scene(), clean, mask, PLANES, cell_depth_ratio=30 / 12)
+    assert any(r.startswith("cell_depth") for r in reasons)
+    assert diag["cell_depth_ratio"] == pytest.approx(2.5)
+
+
+def test_equal_depth_cells_pass():
+    reasons, diag = gate(_scene(), _var(1.0), np.zeros((SIZE, SIZE), np.uint32),
+                         PLANES, cell_depth_ratio=30 / 29)
+    assert not reasons and diag["cell_depth_ratio"] == pytest.approx(30 / 29)
+
+
+def test_the_two_depth_measures_are_independent():
+    """Coaddition is inverse-variance weighted, so cells with equal visit counts
+    still differ by whatever the seeing and sky did. The counts cannot see that;
+    the variance can. Neither subsumes the other, so both run."""
+    mask = np.zeros((SIZE, SIZE), np.uint32)
+    reasons, _ = gate(_scene(), _var(2.5), mask, PLANES, cell_depth_ratio=1.0)
+    assert any(r.startswith("variance_step") for r in reasons)
+    assert not any(r.startswith("cell_depth") for r in reasons)
+
+
+def test_unknown_depth_is_not_recorded_and_not_gated():
+    """Absence of provenance must not read as a depth of zero."""
+    reasons, diag = gate(_scene(), _var(1.0), np.zeros((SIZE, SIZE), np.uint32),
+                         PLANES, cell_depth_ratio=None)
+    assert "cell_depth_ratio" not in diag
+    assert not reasons
+
+
+def test_a_cell_with_no_visits_at_all_is_rejected():
+    reasons, _ = gate(_scene(), _var(1.0), np.zeros((SIZE, SIZE), np.uint32),
+                      PLANES, cell_depth_ratio=np.inf)
+    assert any(r.startswith("cell_depth") for r in reasons)

@@ -298,6 +298,13 @@ def plot_hosts(shards, hosts=None, band: str = "r", out: Path | None = None):
                    30, "count within search radius", False))
     panels.append(("host offset from centre", meta["host_offset_arcsec"], 30,
                    "arcsec (extraction jitter)", False))
+    if "n_visits_min" in meta:
+        # Exposure times are equal, so this is the depth of the shallowest cell
+        # the stamp covers, straight from the coadd provenance.
+        n_lo = np.asarray(meta["n_visits_min"], dtype=float)
+        if np.any(n_lo > 0):
+            panels.append(("visits in shallowest cell", n_lo[n_lo > 0], 30,
+                           "distinct visits", False))
     if "n_cells_spanned" in meta:
         # Each 150 px coadd cell has its own input visits, so depth and PSF step
         # at cell edges.  Anything above 1 means the stamp contains such a step.

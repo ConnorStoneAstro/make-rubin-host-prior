@@ -61,6 +61,12 @@ META_DTYPES: dict[str, str] = {
     # Cells are coadded from different input visits, so depth and PSF step at
     # cell edges; any stamp over 150 native px straddles them.
     "n_cells_spanned": "i2",
+    # Distinct visits contributing to the shallowest and deepest cell the stamp
+    # covers, from the coadd provenance.  -1 where provenance was unavailable.
+    # Exposure times are equal, so their ratio is the depth step exactly.
+    "n_visits_min": "i2",
+    "n_visits_max": "i2",
+    "cell_depth_ratio": "f4",
     # Ratio of the highest to the lowest block variance floor: 1.0 is a uniform
     # stamp, more than that is a depth step between cells.  Nothing flags this,
     # so it is measured from the variance plane.
