@@ -487,9 +487,25 @@ no `ORDER BY` — the tutorial is explicit that sorting burdens a shared service
 and the stratified draw happens locally regardless. The job is submitted async
 and deleted afterwards, including on failure.
 
-TAP needs network and an RSP token, which a batch node may not have. That is what
-`--host-cache` is for: query once where there is a network, cache, and extraction
-then runs with no service at all. `--limit-hosts` puts a `TOP N` on the query.
+**You do not need to be on the RSP.** TAP is an IVOA standard and the Rubin
+endpoint is an ordinary TAP service behind a bearer token, so `pyvo` talks to it
+from anywhere — `lsst.rsp` exists only on the RSP itself, where it wraps exactly
+this. The endpoint comes from Rubin's own public discovery document
+(`https://data.lsst.cloud/repertoire/discovery`, no auth needed), which for DP2
+gives `https://data.lsst.cloud/api/tap`; `--tap-url` overrides it.
+
+The token is read from `ACCESS_TOKEN`, `NUBLADO_TOKEN` or `RSP_TOKEN`, then from
+`/etc/nublado/secrets/token`, `~/.rsp-token`, `~/.rsp_token` — the same
+precedence `lsst.rsp` uses, so a notebook and a login node behave alike. Make one
+at data.lsst.cloud under *Security tokens* with the `read:tap` scope. It is
+deliberately **not** a command-line argument: that would put it in shell history
+and in every process listing on a shared machine. It is attached only to requests
+whose URL is under the TAP endpoint, because a session-wide header follows
+redirects and one redirect off-host hands the token to whoever answered.
+
+TAP needs network, which a batch node may not have. That is what `--host-cache`
+is for: query once where there is a network, cache, and extraction then runs with
+no service at all. `--limit-hosts` puts a `TOP N` on the query.
 
 **`--host-source butler`** is the offline route: scan the object tables through
 the repo instead, one tract at a time, applying the cuts before anything is

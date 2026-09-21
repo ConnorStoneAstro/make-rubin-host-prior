@@ -20,10 +20,10 @@ dependencies = [
 [project.optional-dependencies]
 # The extraction side needs the LSST stack, which is not pip-installable.
 # On NERSC these come from the stack environment; listed here for documentation only.
-extract = ["pandas", "pyarrow", "astropy"]
+extract = ["pandas", "pyarrow", "astropy", "requests", "pyvo"]
 # Diagnostic figures. matplotlib is imported lazily, so the package works without it.
 plots = ["matplotlib>=3.5", "pandas", "pyarrow"]
-dev = ["pytest", "matplotlib", "pandas", "pyarrow", "astropy"]
+dev = ["pytest", "matplotlib", "pandas", "pyarrow", "astropy", "requests"]
 
 [tool.setuptools.packages.find]
 where = ["src"]

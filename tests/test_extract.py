@@ -26,6 +26,11 @@ from rubin_host_prior.rubin.extract import (
     coadd_refs_for_tract,
     read_component,
     host_adql,
+    TAP_URL_FALLBACK,
+    TOKEN_ENV_VARS,
+    _BearerForPrefix,
+    discover_tap_url,
+    rsp_token,
     run_adql,
     _within_radius,
     _write_manifest,
@@ -942,3 +947,78 @@ def test_an_unknown_source_is_refused():
 def test_the_butler_scan_needs_a_butler():
     with pytest.raises(ValueError, match="butler"):
         build_host_catalogue(source="butler")
+
+
+# -- reaching TAP from off the RSP -----------------------------------------
+#
+# TAP is an IVOA standard and the RSP endpoint is an ordinary TAP service behind
+# a bearer token, so pyvo speaks to it directly. lsst.rsp exists only on the RSP
+# itself, where it wraps exactly this.
+
+
+def test_the_token_comes_from_the_environment(monkeypatch):
+    for var in TOKEN_ENV_VARS:
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setenv("ACCESS_TOKEN", "gt-secret")
+    assert rsp_token() == "gt-secret"
+
+
+def test_the_token_can_come_from_a_file(monkeypatch, tmp_path):
+    for var in TOKEN_ENV_VARS:
+        monkeypatch.delenv(var, raising=False)
+    path = tmp_path / "tok"
+    path.write_text("gt-from-disk\n")
+    monkeypatch.setattr("rubin_host_prior.rubin.extract.TOKEN_PATHS", (str(path),))
+    assert rsp_token() == "gt-from-disk"
+
+
+def test_a_missing_token_says_how_to_get_one(monkeypatch):
+    for var in TOKEN_ENV_VARS:
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setattr("rubin_host_prior.rubin.extract.TOKEN_PATHS", ())
+    with pytest.raises(RuntimeError, match="data.lsst.cloud"):
+        rsp_token()
+
+
+def test_the_token_goes_only_to_the_service():
+    """A session header follows redirects: one redirect off-host and the token
+    has been handed to whoever answered."""
+    auth = _BearerForPrefix("gt-secret", ["https://data.lsst.cloud/api/tap"])
+
+    def header_for(url):
+        req = SimpleNamespace(url=url, headers={})
+        return auth(req).headers.get("Authorization")
+
+    assert header_for("https://data.lsst.cloud/api/tap") == "Bearer gt-secret"
+    assert header_for("https://data.lsst.cloud/api/tap/async?x=1") == "Bearer gt-secret"
+    assert header_for("https://data.lsst.cloud/api/other") is None
+    assert header_for("https://elsewhere.example/api/tap") is None
+    # A prefix match must not be a string-prefix match on a different host.
+    assert header_for("https://data.lsst.cloud/api/tap-evil") is None
+
+
+def test_the_endpoint_is_discovered(monkeypatch):
+    doc = {"datasets": {"dp2": {"services": {"tap": {"url": "https://x/api/tap"}}}}}
+    monkeypatch.setattr(
+        "rubin_host_prior.rubin.extract.requests.get",
+        lambda *a, **k: SimpleNamespace(raise_for_status=lambda: None,
+                                        json=lambda: doc),
+    )
+    assert discover_tap_url("dp2") == "https://x/api/tap"
+
+
+def test_discovery_failure_falls_back_to_a_known_endpoint(monkeypatch):
+    def boom(*a, **k):
+        raise OSError("no network")
+
+    monkeypatch.setattr("rubin_host_prior.rubin.extract.requests.get", boom)
+    assert discover_tap_url("dp2") == TAP_URL_FALLBACK
+
+
+def test_an_unlisted_release_falls_back_rather_than_crashing(monkeypatch):
+    monkeypatch.setattr(
+        "rubin_host_prior.rubin.extract.requests.get",
+        lambda *a, **k: SimpleNamespace(raise_for_status=lambda: None,
+                                        json=lambda: {"datasets": {}}),
+    )
+    assert discover_tap_url("dp7") == TAP_URL_FALLBACK

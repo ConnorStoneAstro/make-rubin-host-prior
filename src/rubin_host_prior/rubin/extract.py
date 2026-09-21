@@ -66,6 +66,7 @@ from types import SimpleNamespace
 from typing import Iterable, Sequence
 
 import numpy as np
+import requests
 
 from ..config import BANDS
 from ..data.diagnostics import AutocorrelationAccumulator
@@ -380,21 +381,107 @@ def host_adql(
     return f"{select} {columns}\nFROM {TAP_TABLE}\nWHERE " + "\n  AND ".join(where)
 
 
-def tap_client(release: str = "dp2"):
-    """The RSP TAP client, with an error that says what to do if it is absent."""
+#: Public, unauthenticated: it is how the RSP itself finds its service URLs, and
+#: it means the endpoint below does not have to be hard-coded forever.
+RSP_DISCOVERY_URL = "https://data.lsst.cloud/repertoire/discovery"
+
+#: What discovery returned for DP2 when this was written.  Used only if
+#: discovery cannot be reached.
+TAP_URL_FALLBACK = "https://data.lsst.cloud/api/tap"
+
+#: Where a Gafaelfawr token is looked for, in order.  Same precedence as
+#: ``lsst.rsp`` uses, so a notebook and a login node behave the same.  Never a
+#: command-line argument: that would put the token in shell history and in every
+#: process listing on a shared machine.
+TOKEN_ENV_VARS = ("ACCESS_TOKEN", "NUBLADO_TOKEN", "RSP_TOKEN")
+TOKEN_PATHS = ("/etc/nublado/secrets/token", "~/.rsp-token", "~/.rsp_token")
+
+
+class _BearerForPrefix(requests.auth.AuthBase):
+    """Attach a bearer token, but only to URLs under the service.
+
+    Restricting by prefix rather than setting a session header outright, because
+    a session header follows redirects: one redirect off-host and the token has
+    been handed to whoever answered.
+    """
+
+    def __init__(self, token: str, prefixes: Sequence[str]) -> None:
+        self._token = token
+        self._prefixes = tuple(p.rstrip("/") for p in prefixes)
+
+    def __call__(self, request):
+        from urllib.parse import urlparse, urlunparse
+
+        url = urlunparse(urlparse(request.url or "")._replace(query="", fragment=""))
+        if any(url == p or url.startswith(p + "/") for p in self._prefixes):
+            request.headers["Authorization"] = f"Bearer {self._token}"
+        return request
+
+
+def rsp_token(token: str | None = None) -> str:
+    """A Gafaelfawr token from the environment or from disk."""
+    if token:
+        return token
+    import os
+
+    for var in TOKEN_ENV_VARS:
+        if value := os.environ.get(var):
+            return value.strip()
+    for path in TOKEN_PATHS:
+        candidate = Path(path).expanduser()
+        try:
+            if candidate.is_file() and (value := candidate.read_text().strip()):
+                return value
+        except OSError:
+            continue
+    raise RuntimeError(
+        "No RSP token found. Make one at https://data.lsst.cloud under Security "
+        "tokens with the 'read:tap' scope, then either export it as ACCESS_TOKEN "
+        f"or save it to ~/.rsp-token (chmod 600). Looked in {TOKEN_ENV_VARS} and "
+        f"{TOKEN_PATHS}. To avoid TAP entirely, use source='butler'."
+    )
+
+
+def discover_tap_url(release: str = "dp2",
+                     discovery_url: str = RSP_DISCOVERY_URL) -> str:
+    """The TAP endpoint for a release, from the RSP's own discovery document."""
     try:
-        from lsst.rsp import RSPDiscovery
+        response = requests.get(discovery_url, timeout=15)
+        response.raise_for_status()
+        url = (response.json().get("datasets", {}).get(release, {})
+               .get("services", {}).get("tap", {}).get("url"))
+    except Exception as exc:
+        log.warning("RSP discovery at %s failed (%r); falling back to %s",
+                    discovery_url, exc, TAP_URL_FALLBACK)
+        return TAP_URL_FALLBACK
+    if not url:
+        log.warning("RSP discovery lists no TAP service for %r; falling back to %s",
+                    release, TAP_URL_FALLBACK)
+        return TAP_URL_FALLBACK
+    return url
+
+
+def tap_client(release: str = "dp2", url: str | None = None,
+               token: str | None = None):
+    """A TAP client for the RSP, from anywhere -- no ``lsst.rsp`` needed.
+
+    TAP is an IVOA standard and the RSP's endpoint is an ordinary TAP service
+    behind a bearer token, so ``pyvo`` speaks to it directly.  ``lsst.rsp`` only
+    exists on the RSP itself, where it wraps exactly this.
+    """
+    try:
+        import pyvo
     except ImportError as exc:
         raise RuntimeError(
-            "lsst.rsp is not importable, so the TAP service cannot be reached. "
-            "Run the host query where it is (an RSP notebook or a machine with "
-            "an RSP token), cache the result, and point extraction at the cache; "
-            "or pass source='butler' to scan the object tables instead."
+            "pyvo is needed to reach the TAP service (pip install pyvo), or use "
+            "source='butler' to scan the object tables through the repo instead."
         ) from exc
-    service = RSPDiscovery(release).get_tap_client()
-    if service is None:
-        raise RuntimeError(f"RSPDiscovery({release!r}) returned no TAP client")
-    return service
+
+    url = url or discover_tap_url(release)
+    session = requests.Session()
+    session.auth = _BearerForPrefix(rsp_token(token), [url])
+    log.info("TAP service at %s", url)
+    return pyvo.dal.TAPService(url, session=session)
 
 
 def run_adql(service, query: str, timeout: float | None = None):
@@ -431,6 +518,7 @@ def build_host_catalogue(
     report_every: int = 25,
     source: str = "tap",
     tap_service=None,
+    tap_url: str | None = None,
     top: int | None = None,
     **cuts,
 ):
@@ -481,7 +569,7 @@ def build_host_catalogue(
                if k in ("flux_range", "min_reff_arcsec", "max_blendedness")},
         )
         log.info("querying %s:\n%s", TAP_TABLE, query)
-        pool = run_adql(tap_service or tap_client(), query)
+        pool = run_adql(tap_service or tap_client(url=tap_url), query)
         log.info("TAP returned %d rows", len(pool))
         # The service applied the numeric cuts; these are the rest -- the Sersic
         # failure flags, the point-source cross-check, and the dedupe across
@@ -1029,6 +1117,7 @@ def extract_patches(
     host_cache: str | Path | None = None,
     host_source: str = "tap",
     tap_service=None,
+    tap_url: str | None = None,
     limit_tracts: int | None = None,
     limit_hosts: int | None = None,
     jitter_arcsec: float = 4.0,
@@ -1083,6 +1172,7 @@ def extract_patches(
         butler, bands=bands, band="r" if "r" in bands else bands[0],
         ra=ra, dec=dec, radius_deg=radius_deg, limit_tracts=limit_tracts,
         cache=host_cache, source=host_source, tap_service=tap_service,
+        tap_url=tap_url,
         top=limit_hosts,
         flux_range=host_flux_range, max_blendedness=max_blendedness,
         min_reff_arcsec=min_reff_arcsec,

@@ -68,6 +68,12 @@ def main() -> None:
              "result and a later run needs neither",
     )
     p.add_argument(
+        "--tap-url", default=None,
+        help="TAP endpoint. Found from the RSP discovery document by default. "
+             "The token is NOT an argument: export ACCESS_TOKEN or put it in "
+             "~/.rsp-token, so it stays out of shell history and process lists",
+    )
+    p.add_argument(
         "--limit-hosts", type=int, default=None,
         help="TOP N on the TAP query. For a quick test run",
     )
@@ -139,6 +145,7 @@ def main() -> None:
         radius_deg=args.radius_deg,
         host_cache=args.host_cache,
         host_source=args.host_source,
+        tap_url=args.tap_url,
         limit_tracts=args.limit_tracts,
         limit_hosts=args.limit_hosts,
         bands=args.bands,
