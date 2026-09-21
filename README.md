@@ -456,7 +456,17 @@ taken **as delivered**, without restoration, and every shard records
 A host yields at most one cutout per band, and the gate rejects a share of those,
 so `--n-hosts 128` produces nowhere near 128 cutouts — `n_accepted` in the
 summary is the number that actually got written, and the first thing to read
-beside it is `rejection_counts`, which says where the rest went.
+beside it is `rejection_counts`, which says where the rest went. A stamp can fail several
+gates at once, so those counts sum to more than `n_rejected`; `first_rejection_counts`
+gives the first reason only, which is what the figure and the summary used to
+disagree about. `diagnostic_percentiles` gives the distribution of every gated
+quantity over every attempt, which is what a threshold should be chosen from.
+
+Hosts are drawn from **the field being swept**, not the whole object table. The
+table is a tract, ~1.7° on a side; the default 0.3° sweep is under a tenth of it,
+so drawing hosts from the tract sends most of them to patches that are never
+loaded, where they vanish without even a rejection record. `n_field_rows` and
+`n_catalogue_rows` in the summary show the difference.
 
 `--n-patches` is the number to ask for when you want a training set of a given
 size. Extraction then works towards it: draw a batch of hosts, sweep every coadd

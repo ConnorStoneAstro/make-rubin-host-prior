@@ -830,7 +830,24 @@ def extract_patches(
 
     log.info("loading object table near (%.4f, %.4f)", ra, dec)
     catalogue = load_object_table(butler, ra, dec, bands=bands)
+    # Neighbours come from the whole tract: a host at the edge of the field still
+    # has neighbours outside it.
     neighbours = _NeighbourIndex(catalogue, bands)
+    # Hosts do not.  ``load_object_table`` returns an entire tract, ~1.7 deg on a
+    # side, while the sweep covers a disc of ``radius_deg`` -- under a tenth of
+    # it at the default 0.3.  Selecting hosts from the tract sends most of them
+    # to patches that are never loaded, where they vanish without so much as a
+    # rejection record, and the run quietly delivers a fraction of what was
+    # asked for.  A host inside the disc is always inside a patch that overlaps
+    # it, so no margin is needed.
+    field = _within_radius(catalogue, ra, dec, radius_deg)
+    log.info("%d of %d catalogue rows lie within %.3f deg of (%.4f, %.4f)",
+             len(field), len(catalogue), radius_deg, ra, dec)
+    if not len(field):
+        raise RuntimeError(
+            f"no catalogue rows within {radius_deg} deg of ({ra}, {dec}); the "
+            f"field centre and the object table do not overlap"
+        )
 
     records: list[dict] = []
     neighbour_rows: list[dict] = []
@@ -1089,7 +1106,7 @@ def extract_patches(
     while True:
         rounds += 1
         hosts = select_hosts(
-            catalogue,
+            field,
             band="r" if "r" in bands else bands[0],
             flux_range=host_flux_range,
             max_blendedness=max_blendedness,
@@ -1104,8 +1121,8 @@ def extract_patches(
             break
         tried.update(int(i) for i in hosts["objectId"])
         host_tables.append(hosts)
-        log.info("round %d: %d hosts selected from %d catalogue rows",
-                 rounds, len(hosts), len(catalogue))
+        log.info("round %d: %d hosts selected from %d rows in the field",
+                 rounds, len(hosts), len(field))
 
         host_ra = np.asarray(hosts["coord_ra"], dtype=float)
         host_dec = np.asarray(hosts["coord_dec"], dtype=float)
@@ -1144,6 +1161,12 @@ def extract_patches(
     if target is not None and n_accepted < target:
         log.warning("produced %d of the %d cutouts asked for", n_accepted, target)
 
+    # A host inside the field can still produce no attempt at all: its stamp may
+    # not fit inside any one patch.  That is part of the selection function too,
+    # and it is invisible in the manifest, which only has rows for attempts.
+    attempted = {int(r["host_id"]) for r in records if r.get("host_id") is not None}
+    never = len(tried) - len(attempted)
+
     paths = writer.close() if writer is not None else []
     acf_result = acf.result()
     _write_table(out_dir / "hosts", hosts)
@@ -1155,6 +1178,12 @@ def extract_patches(
         shards=[str(p) for p in paths],
         n_requested=target,
         n_rounds=rounds,
+        n_hosts_tried=len(tried),
+        n_hosts_attempted=len(attempted),
+        n_hosts_no_stamp_fitted=never,
+        field_radius_deg=radius_deg,
+        n_catalogue_rows=len(catalogue),
+        n_field_rows=len(field),
         n_hosts=len(hosts),
         n_coadd_patches=len(refs),
         dataset_type=DATASET_TYPE,
@@ -1166,6 +1195,15 @@ def extract_patches(
     )
     (out_dir / "summary.json").write_text(json.dumps(summary, indent=2, default=str))
     return summary
+
+
+def _within_radius(table, ra: float, dec: float, radius_deg: float):
+    """Catalogue rows inside a disc on the sky.  Flat-sky; exact enough under a
+    degree, where the error is a part in 10^5."""
+    r = np.asarray(table["coord_ra"], dtype=float)
+    d = np.asarray(table["coord_dec"], dtype=float)
+    cosd = np.maximum(np.cos(np.deg2rad(dec)), 1e-6)
+    return table[np.hypot((r - ra) * cosd, d - dec) <= radius_deg]
 
 
 def _stack_tables(tables):
@@ -1361,11 +1399,25 @@ def _write_manifest(
 ) -> dict:
     """Parquet if pandas is available, CSV otherwise.  Never lose the records."""
     records = list(records)
+    # A stamp can fail several gates at once, and ``gate`` returns them in a
+    # fixed order.  Counting only the first blames whichever check happens to run
+    # early -- which is why the summary used to disagree with the figure, and why
+    # a plane gated last could account for a quarter of the rejections without
+    # appearing in the counts at all.  Count every reason; the totals therefore
+    # exceed the number of rejected stamps, which ``n_rejected`` gives.
     reasons: dict[str, int] = {}
+    primary: dict[str, int] = {}
+    n_rejected = 0
     for r in records:
-        if r.get("status") != "accepted":
-            key = str(r.get("reasons", "unknown")).split(":")[0]
+        if r.get("status") == "accepted":
+            continue
+        n_rejected += 1
+        parts = [p.split(":")[0] for p in str(r.get("reasons", "unknown")).split(";")]
+        parts = [p for p in parts if p and p != "nan"]
+        for key in dict.fromkeys(parts):
             reasons[key] = reasons.get(key, 0) + 1
+        if parts:
+            primary[parts[0]] = primary.get(parts[0], 0) + 1
     try:
         import pandas as pd
 
@@ -1388,6 +1440,49 @@ def _write_manifest(
                 w.writerows(records)
     return {
         "n_attempts": len(records),
+        "n_rejected": n_rejected,
         "manifest_format": fmt,
+        # Every reason a stamp failed for; a stamp failing three gates appears
+        # three times, so these sum to more than n_rejected.
         "rejection_counts": dict(sorted(reasons.items(), key=lambda kv: -kv[1])),
+        # The first reason only, which is what the old counts were.  Kept so a
+        # single blame can be assigned, but do not read it as "the cause".
+        "first_rejection_counts": dict(sorted(primary.items(), key=lambda kv: -kv[1])),
+        "diagnostic_percentiles": _diagnostic_percentiles(records),
     }
+
+
+#: Diagnostics whose distribution over *every* attempt, accepted or not, is what
+#: a threshold should be chosen from.
+PERCENTILE_DIAGNOSTICS = (
+    "diag_cell_depth_ratio",
+    "diag_variance_step",
+    "diag_frac_no_data",
+    "diag_inner_frac_no_data",
+    "diag_frac_COSMIC_RAY",
+    "diag_inner_frac_COSMIC_RAY",
+    "diag_frac_INTERPOLATED",
+    "diag_inner_frac_INTERPOLATED",
+    "diag_frac_SATURATED",
+    "diag_inner_frac_SATURATED",
+)
+
+
+def _diagnostic_percentiles(records: list[dict]) -> dict[str, dict[str, float]]:
+    """Percentiles of each gated diagnostic across every attempt.
+
+    Thresholds should come from what the field actually looks like rather than
+    from a guess, and this puts the numbers in the summary so choosing one does
+    not mean writing code against the manifest.
+    """
+    out: dict[str, dict[str, float]] = {}
+    for key in PERCENTILE_DIAGNOSTICS:
+        vals = np.asarray([r[key] for r in records if key in r], dtype=float)
+        vals = vals[np.isfinite(vals)]
+        if vals.size < 2:
+            continue
+        pcts = np.percentile(vals, [5, 25, 50, 75, 90, 95, 99])
+        out[key.removeprefix("diag_")] = {
+            f"p{p}": float(v) for p, v in zip((5, 25, 50, 75, 90, 95, 99), pcts)
+        }
+    return out

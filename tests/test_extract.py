@@ -6,7 +6,9 @@ object-table columns (DP2 moved second moments per band and dropped
 PSF moments, which DP2's PSF object cannot compute for you.
 """
 
+import tempfile
 from collections.abc import Mapping
+from pathlib import Path
 from types import MappingProxyType, SimpleNamespace
 
 import numpy as np
@@ -18,6 +20,8 @@ from rubin_host_prior.rubin.extract import (
     SIGMA_TO_FWHM,
     _adaptive_moments,
     _data_id_dict,
+    _within_radius,
+    _write_manifest,
     cell_visit_counts,
     cells_in_stamp,
     dedupe_hosts,
@@ -540,3 +544,60 @@ def test_the_batch_never_collapses_to_nothing():
     """A shortfall of one must not ask for zero hosts and spin."""
     assert next_batch(100, 100, 100, 1) >= 16
     assert next_batch(100, 100, 100, 0) >= 16
+
+
+# -- accounting ------------------------------------------------------------
+
+
+def test_every_reason_is_counted_not_just_the_first():
+    """gate returns reasons in a fixed order, so counting only the first blames
+    whichever check runs early. A plane gated last accounted for a quarter of a
+    real run's rejections without appearing in the counts at all."""
+    records = [
+        {"status": "rejected", "reasons": "cell_depth:2.1>1.5;inner_INTERPOLATED:0.3>0.0"},
+        {"status": "rejected", "reasons": "inner_INTERPOLATED:0.4>0.0"},
+        {"status": "accepted"},
+    ]
+    out = _write_manifest(Path(tempfile.mkdtemp()), records, [])
+    assert out["rejection_counts"] == {"inner_INTERPOLATED": 2, "cell_depth": 1}
+    assert out["first_rejection_counts"] == {"cell_depth": 1, "inner_INTERPOLATED": 1}
+    assert out["n_rejected"] == 2 and out["n_attempts"] == 3
+
+
+def test_a_reason_is_not_double_counted_within_one_stamp():
+    records = [{"status": "rejected", "reasons": "no_data:0.1>0.02;no_data:0.1>0.02"}]
+    out = _write_manifest(Path(tempfile.mkdtemp()), records, [])
+    assert out["rejection_counts"] == {"no_data": 1}
+
+
+def test_diagnostic_percentiles_come_from_every_attempt():
+    """Thresholds should be chosen from what the field looks like, accepted
+    stamps included, not from the rejected tail alone."""
+    records = [{"status": "accepted", "diag_cell_depth_ratio": 1.0 + i / 100}
+               for i in range(100)]
+    out = _write_manifest(Path(tempfile.mkdtemp()), records, [])
+    pct = out["diagnostic_percentiles"]["cell_depth_ratio"]
+    assert pct["p50"] == pytest.approx(1.495, abs=0.01)
+    assert pct["p95"] == pytest.approx(1.94, abs=0.02)
+
+
+def test_percentiles_skip_diagnostics_that_were_never_measured():
+    out = _write_manifest(Path(tempfile.mkdtemp()), [{"status": "accepted"}], [])
+    assert out["diagnostic_percentiles"] == {}
+
+
+def test_hosts_are_restricted_to_the_field_being_swept():
+    """The object table is a whole tract, ~1.7 deg across; a 0.3 deg sweep covers
+    under a tenth of it. Hosts outside the disc land in patches that are never
+    loaded and vanish without even a rejection record."""
+    t = _sized_catalogue(2000, seed=21)  # spread over ~0.3 deg in each axis
+    field = _within_radius(t, 53.13, -28.10, 0.1)
+    assert 0 < len(field) < len(t)
+    r = np.asarray(field["coord_ra"]); d = np.asarray(field["coord_dec"])
+    cosd = np.cos(np.deg2rad(-28.10))
+    assert np.all(np.hypot((r - 53.13) * cosd, d + 28.10) <= 0.1 + 1e-12)
+
+
+def test_the_field_cut_keeps_everything_when_the_radius_is_generous():
+    t = _sized_catalogue(500, seed=22)
+    assert len(_within_radius(t, 53.13, -28.10, 10.0)) == len(t)

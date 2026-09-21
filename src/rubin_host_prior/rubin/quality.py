@@ -54,7 +54,8 @@ Tolerances for ``COSMIC_RAY`` and ``INTERPOLATED`` are tighter than the
 documentation recommends, deliberately.  That guidance is written for
 *measurement*, where an interpolated pixel barely perturbs a flux.  Here the
 model is learning a distribution over pixel values, and an interpolated pixel is
-a smooth synthetic patch teaching structure that is not in the sky.
+a smooth synthetic patch teaching structure that is not in the sky.  Tight is not
+the same as zero, though: see ``INNER_FRAC_TOL``.
 """
 
 from __future__ import annotations
@@ -97,10 +98,25 @@ COVARIATE_PLANES: tuple[str, ...] = (
 )
 
 #: Same planes, applied to the central region, where structure matters most.
+#:
+#: Not all zero, which is what these were and what made ``inner_COSMIC_RAY``
+#: reject a quarter of a real run on its own.  The inner region of a 416 px stamp
+#: is about 20 000 pixels, so zero tolerance means one flagged pixel anywhere
+#: near the middle disqualifies the stamp -- far stricter than intended, and
+#: strictest against the crowded fields where flags are densest.
+#:
+#: The three planes are also not equally harmful, which the old uniform zero
+#: ignored.  A ``COSMIC_RAY`` pixel on a *coadd* is real data: the affected
+#: inputs were rejected during coaddition and the pixel was built from the rest,
+#: so it is shallower, not invented.  An ``INTERPOLATED`` pixel is invented --
+#: smooth synthetic fill, exactly the kind of false structure a generative model
+#: will learn -- so it stays tight.  ``SATURATED`` stays at zero: the centre is
+#: where the transient goes, and a saturated core there makes the stamp useless
+#: for the thing it is being collected for.
 INNER_FRAC_TOL: dict[str, float] = {
     "SATURATED": 0.0,
-    "COSMIC_RAY": 0.0,
-    "INTERPOLATED": 0.0,
+    "COSMIC_RAY": 0.005,
+    "INTERPOLATED": 0.001,
 }
 
 #: Never gate on these: they mark real sources, or cover so much of the coadd

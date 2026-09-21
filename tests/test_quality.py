@@ -209,14 +209,53 @@ def test_gating_on_detected_is_refused_loudly():
         _gate(_scene(), frac_tol={"DETECTED": 0.5})
 
 
+def _centred(plane, n_px):
+    """A square of ``n_px`` flagged pixels at the middle of the stamp."""
+    mask = np.zeros((SIZE, SIZE), np.uint32)
+    side = int(np.ceil(np.sqrt(n_px)))
+    c = SIZE // 2
+    mask[c:c + side, c:c + side] |= 1 << PLANES[plane]
+    return mask
+
+
 def test_inner_region_is_stricter_than_the_whole_patch():
-    """A cosmic ray 80 px from the host matters far less than one on top of it."""
+    """A cosmic ray 80 px from the host matters less than one on top of it: the
+    inner tolerance is 4x tighter for INTERPOLATED and 20x for SATURATED."""
     off_centre = np.zeros((SIZE, SIZE), np.uint32)
-    off_centre[2:4, 2:4] |= 1 << PLANES["COSMIC_RAY"]
-    centred = np.zeros((SIZE, SIZE), np.uint32)
-    centred[SIZE // 2, SIZE // 2] |= 1 << PLANES["COSMIC_RAY"]
+    off_centre[2:6, 2:6] |= 1 << PLANES["INTERPOLATED"]
     assert _gate(_scene(), off_centre)[0] == []
-    assert any("inner_COSMIC_RAY" in r for r in _gate(_scene(), centred)[0])
+    assert any("inner_INTERPOLATED" in r
+               for r in _gate(_scene(), _centred("INTERPOLATED", 16))[0])
+
+
+def test_a_single_flagged_pixel_does_not_disqualify_a_stamp():
+    """Regression: the inner tolerances were all zero, so one flagged pixel
+    anywhere near the middle of ~20 000 rejected the stamp, and inner_COSMIC_RAY
+    alone accounted for a quarter of the rejections on a real run."""
+    for plane in ("COSMIC_RAY", "INTERPOLATED"):
+        assert _gate(_scene(), _centred(plane, 1))[0] == []
+
+
+def test_cosmic_rays_are_tolerated_where_interpolation_is_not():
+    """On a coadd a COSMIC_RAY pixel is real data: the affected inputs were
+    rejected during coaddition and the pixel was built from the rest, so it is
+    shallower, not invented. An INTERPOLATED pixel is invented -- smooth
+    synthetic fill, exactly the false structure a generative model will learn."""
+    n = 10  # 0.24% of the inner region
+    assert _gate(_scene(), _centred("COSMIC_RAY", n))[0] == []
+    assert any("inner_INTERPOLATED" in r for r in _gate(_scene(), _centred("INTERPOLATED", n))[0])
+
+
+def test_enough_cosmic_rays_still_reject():
+    """Tolerated is not ignored."""
+    assert any("inner_COSMIC_RAY" in r
+               for r in _gate(_scene(), _centred("COSMIC_RAY", 400))[0])
+
+
+def test_saturation_at_the_centre_is_never_tolerated():
+    """The centre is where the transient goes; a saturated core there makes the
+    stamp useless for the thing it is being collected for."""
+    assert any("inner_SATURATED" in r for r in _gate(_scene(), _centred("SATURATED", 1))[0])
 
 
 def test_diagnostics_are_returned_for_rejected_patches_too():
