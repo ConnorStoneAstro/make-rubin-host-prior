@@ -54,7 +54,6 @@ def main() -> None:
         "patches (56%% of each clears the loss crop) with slack left for "
         "translation augmentation",
     )
-    p.add_argument("--psf-size", type=int, default=41)
     p.add_argument("--n-hosts", type=int, default=8000)
     p.add_argument("--jitter-arcsec", type=float, default=4.0)
     p.add_argument("--patches-per-shard", type=int, default=1024)
@@ -79,7 +78,6 @@ def main() -> None:
         radius_deg=args.radius_deg,
         bands=args.bands,
         native_size=args.native_size,
-        psf_size=args.psf_size,
         n_hosts=args.n_hosts,
         jitter_arcsec=args.jitter_arcsec,
         patches_per_shard=args.patches_per_shard,

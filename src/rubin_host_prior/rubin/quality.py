@@ -12,12 +12,13 @@ every stamp.  Nothing here hard-codes a bit: the packing is recorded per shard b
 extraction from the coadd's own ``mask.schema``, and every plane name absent from
 that mapping contributes nothing.
 
-**No-data is carried by the variance, not by a plane.**  DP2 variance holds
-``inf`` where there were no contributing exposures -- including the cores of
-saturated stars.  Rejecting a stamp merely because non-finite variance is
-*present* would throw away every patch containing a bright neighbour, which is
-the regime this project exists to model.  The fraction is measured instead, with
-a tolerance, and a stricter one at the centre.
+**No-data is carried twice over.**  DP2 has a ``NO_DATA`` plane *and* holds
+``inf`` in the variance where there were no contributing exposures -- including
+the cores of saturated stars.  The plane is gated at zero tolerance, following
+Rubin's own guidance.  The variance is handled separately and more gently: its
+fraction is measured, with a tolerance and a stricter one at the centre, because
+rejecting merely because non-finite variance is *present* would throw away every
+stamp containing a bright neighbour, which is the regime this project models.
 
 **``INEXACT_PSF`` and ``REJECTED`` are not quality cuts.**  They cover a large
 fraction of the DP2 coadd, so gating on them discards almost everything.  They
@@ -40,18 +41,23 @@ from __future__ import annotations
 
 import numpy as np
 
-#: Any pixel set in these planes disqualifies the patch.
-ZERO_TOL: tuple[str, ...] = ("DETECTION_EDGE",)
+#: Any pixel set in these planes disqualifies the patch.  ``NO_DATA`` is one of
+#: the two Rubin says to exclude outright (tutorial 202.5): no input covered the
+#: pixel, so it is not sky, it is nothing.  ``DETECTION_EDGE`` means too near the
+#: patch edge for the detection kernel.
+ZERO_TOL: tuple[str, ...] = ("NO_DATA", "DETECTION_EDGE")
 
 #: Maximum allowed fraction of the patch, per plane.  Stricter than the DP1
 #: measurement recommendations for CR/INTRP -- see the module docstring.
 FRAC_TOL: dict[str, float] = {
-    # A *fraction*, not zero.  DP1 excluded any saturation outright, but on a
-    # DP2 coadd the saturated core of a bright neighbour lands in a great many
-    # stamps -- and a scene with a bright neighbour is precisely the regime this
-    # project exists to model.  Zero tolerance here would reproduce the same
-    # selection bias the rejection statistics are meant to expose.  The inner
-    # region stays at zero, since that is where the transient goes.
+    # Rubin's guidance is to exclude SATURATED outright, which for *pixels* in a
+    # measurement is right.  For whole training stamps it is not: on a coadd the
+    # saturated core of a bright neighbour lands in a great many stamps, and a
+    # scene with a bright neighbour is precisely the regime this project models,
+    # so a blanket cut would reproduce the selection bias the rejection
+    # statistics exist to expose.  A small fraction is kept away from the centre,
+    # zero is kept at the centre where the transient goes, and the fraction is
+    # recorded either way.  Tighten to 0.0 to follow the guidance literally.
     "SATURATED": 0.005,
     "COSMIC_RAY": 0.005,  # mostly rejected during coaddition; a safety net
     "INTERPOLATED": 0.02,  # smooth synthetic fill; bad for a generative model

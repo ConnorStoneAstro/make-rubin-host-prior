@@ -13,12 +13,20 @@ misbehaves quietly.  The three places that bite:
 
 * **Two pixel origins.**  ``sky_projection`` works in *tract* coordinates,
   ``astropy_wcs`` in *patch-local*.  Mixing them misplaces a position by up to a
-  patch -- far enough to land on the wrong galaxy, close enough to look
-  plausible.  This module commits to one convention (``PIXEL_ORIGIN``) and then
-  **verifies every stamp** by projecting its centre back to the sky and
-  comparing against the position asked for; see ``_verify_centre``.  If the
-  convention is wrong the first stamp fails loudly instead of quietly producing a
-  mis-centred training set.
+  full patch (~4000 px) -- far enough to land on the wrong galaxy, close enough
+  to look plausible.  Tract coordinates are used throughout, which is what
+  ``Box.factory`` and ``bbox.contains`` expect, and every stamp centre is
+  additionally projected back to the sky and compared against the position asked
+  for (``_verify_centre``).  That guard costs nothing and turns a whole class of
+  silent geometry error into a loud one.
+* **Tracts and patches overlap at their edges**, so a host near a boundary is
+  covered by two patches and would otherwise be extracted twice in the same
+  band.  Accepted ``(host, band)`` pairs are tracked and repeats skipped.
+* **Coadds are cell-based** -- a 22x22 grid of 150-pixel cells, each built from a
+  different set of input visits.  Depth and PSF are therefore piecewise constant
+  with steps at cell edges, and a stamp larger than 150 native pixels *will*
+  straddle them.  ``n_cells_spanned`` is recorded per stamp so the effect stays
+  measurable.
 * **Mask planes are dynamic.**  Bit numbers are not stable across releases, so
   the mask is repacked into a ``uint32`` using a mapping derived from the
   coadd's own ``mask.schema`` and that mapping is stored with every shard.
@@ -68,33 +76,40 @@ log = logging.getLogger(__name__)
 
 _STACK: SimpleNamespace | None = None
 
-#: WARN: the DP2 repo alias and collection are unverified.  Check with
-#: ``Butler.get_known_repos()`` / ``$DAF_BUTLER_REPOSITORY_INDEX`` and
-#: ``butler.collections.query("*")``.
+#: Both are literally ``"dp2"`` -- simpler than DP1's ``LSSTComCam/DP1``.
+#: Off-platform, confirm the alias with ``Butler.get_known_repos()`` or
+#: ``$DAF_BUTLER_REPOSITORY_INDEX``.
 REPO = "dp2"
-COLLECTION = "LSSTCam/DP2"
+COLLECTION = "dp2"
+SKYMAP = "lsst_cells_v2"
 
 DATASET_TYPE = "deep_coadd"
 #: Coadds are tiled by patch, so this is the predicate that finds one.
 COADD_REGION = "patch.region OVERLAPS :region"
 
-#: Attribute names on a ``CellCoadd`` / its stamps.  DP2 turned DP1's getters
-#: into attributes; WARN, these spellings are unverified, and every access goes
-#: through ``_attr`` so a wrong one reports what the object really has.
+#: Attribute names on a ``CellCoadd``.  DP2 turned DP1's getters into attributes
+#: and camelCase into snake_case.  Access goes through ``_attr``, which reports
+#: what the object actually offers if a name is ever wrong.
 DP2_ATTRS = {
     "image": "image",
     "variance": "variance",
     "mask": "mask",
     "psf": "psf",
-    "wcs": "astropy_wcs",
+    "wcs": "sky_projection",
+    "bbox": "bbox",
     "schema": "schema",
     "origin": "yx0",
+    "grid": "grid",
 }
 
-#: Which of DP2's two conventions this module works in.  ``astropy_wcs`` is
-#: patch-local, which is the frame a sliced stamp lives in.  Changing this means
-#: changing ``_sky_to_pixel`` and ``_verify_centre`` together.
-PIXEL_ORIGIN = "patch-local"
+#: DP2 offers three WCS representations and they do **not** share a pixel
+#: origin: ``sky_projection`` is in *tract* coordinates, ``astropy_wcs`` in
+#: *patch-local*.  Mixing them is a position error of up to a full patch
+#: (~4000 px) -- far enough to land in the wrong galaxy, close enough to look
+#: plausible.  This module uses tract coordinates throughout, which is both the
+#: precise representation and the frame ``Box.factory`` and ``bbox.contains``
+#: expect.  ``yx0`` converts to patch-local if ever needed.
+PIXEL_ORIGIN = "tract"
 
 #: Maximum separation between where a stamp actually landed and where it was
 #: asked for, in arcsec.  A pixel-origin mix-up is off by far more than this.
@@ -162,13 +177,18 @@ def open_butler(repo: str = REPO, collection: str = COLLECTION):
 def pack_mask(mask, max_planes: int = 32) -> tuple[np.ndarray, dict[str, int]]:
     """Flatten a DP2 plane-based mask into a ``uint32`` plus its own mapping.
 
-    DP2 reads planes by name (``mask.get("SATURATED")``) and its bit numbers are
-    not stable across releases, so the bits used here are assigned locally and
-    recorded with the shard.  Nothing downstream hard-codes one.  Planes beyond
-    ``max_planes`` are dropped -- with a warning, since a silently truncated
+    A DP2 mask pixel is a short byte array, not a single integer, so
+    ``mask.array & bit`` does not work at all; ``mask.get(name)`` returns a plain
+    boolean plane and is the only sane way in.  Bit numbers are assigned
+    dynamically and are not stable across releases, so the bits used here are
+    local and travel with the shard.  Nothing downstream hard-codes one.  Planes
+    beyond ``max_planes`` are dropped, with a warning -- a silently truncated
     mask would be worse than a loud one.
     """
-    names = list(_attr(mask, "schema"))
+    schema = _attr(mask, "schema")
+    # ``schema`` iterates plane objects and can yield ``None`` for unused slots;
+    # ``schema.names`` is the clean list.
+    names = [n for n in getattr(schema, "names", schema) if n]
     if len(names) > max_planes:
         log.warning(
             "mask has %d planes, packing only the first %d: %s dropped",
@@ -331,17 +351,30 @@ def find_coadd_refs(
 
 
 def _sky_to_pixel(wcs, ra, dec) -> tuple[np.ndarray, np.ndarray]:
-    """(ra, dec) in degrees -> fractional pixel (x, y) in the ``PIXEL_ORIGIN`` frame."""
-    from astropy.coordinates import SkyCoord
-    import astropy.units as u
+    """(ra, dec) in degrees -> fractional **tract** pixel (x, y).
 
-    coords = SkyCoord(np.atleast_1d(ra) * u.deg, np.atleast_1d(dec) * u.deg)
-    x, y = wcs.world_to_pixel(coords)
-    return np.atleast_1d(x), np.atleast_1d(y)
+    ``sky_projection.sky_to_pixel`` takes a SkyCoord and returns an object with
+    ``.x``/``.y``.  It is called one position at a time because a vectorised form
+    is not documented; the cost is negligible beside a patch read.
+    """
+    import astropy.units as u
+    from astropy.coordinates import SkyCoord
+
+    ra = np.atleast_1d(np.asarray(ra, dtype=float))
+    dec = np.atleast_1d(np.asarray(dec, dtype=float))
+    xs = np.empty(ra.size)
+    ys = np.empty(ra.size)
+    for i in range(ra.size):
+        xy = wcs.sky_to_pixel(
+            SkyCoord(ra=ra[i] * u.deg, dec=dec[i] * u.deg, frame="icrs")
+        )
+        xs[i], ys[i] = float(xy.x), float(xy.y)
+    return xs, ys
 
 
 def _pixel_to_sky(wcs, x: float, y: float) -> tuple[float, float]:
-    sky = wcs.pixel_to_world(x, y)
+    """**Tract** pixel -> (ra, dec) in degrees."""
+    sky = wcs.pixel_to_sky(x=float(x), y=float(y))
     return float(sky.ra.deg), float(sky.dec.deg)
 
 
@@ -349,28 +382,66 @@ def _verify_centre(wcs, x: float, y: float, ra: float, dec: float) -> float:
     """Separation in arcsec between where a stamp landed and where it was asked for.
 
     The guard against DP2's two pixel-origin conventions.  A mix-up displaces a
-    position by up to a patch -- far enough to land on a different galaxy, close
-    enough that the stamp still looks like a plausible piece of sky.  Round-trip
-    every centre and reject loudly rather than quietly build a mis-centred set.
+    position by up to a full patch -- far enough to land on a different galaxy,
+    close enough that the stamp still looks like a plausible piece of sky.  Round
+    tripping every centre turns that into an immediate, loud failure.
     """
     got_ra, got_dec = _pixel_to_sky(wcs, x, y)
     cosd = np.cos(np.deg2rad(dec))
-    return float(
-        np.hypot((got_ra - ra) * cosd, got_dec - dec) * 3600.0
-    )
+    return float(np.hypot((got_ra - ra) * cosd, got_dec - dec) * 3600.0)
 
 
 def _stamp_box(x: float, y: float, size: int):
-    """A ``size`` x ``size`` box centred on fractional pixel ``(x, y)``.
+    """A ``size`` x ``size`` box centred on tract pixel ``(x, y)``.
 
     ``Box.factory`` is indexed ``[y, x]`` -- numpy order, the opposite of DP1's
-    ``(x, y)`` ``Box2I``.  Rounding is to the nearest pixel; the sub-pixel
-    remainder is recorded with the stamp rather than thrown away.
+    ``Box2I(x, y)``.  A transposed stamp is square and will not error; it will
+    just be wrong.
     """
     Box = _lsst().Box
     iy, ix = int(round(y)), int(round(x))
     half = size // 2
     return Box.factory[iy - half : iy - half + size, ix - half : ix - half + size]
+
+
+def _fits_in_patch(bbox, x: float, y: float, size: int) -> bool:
+    """Both stamp corners inside the patch, in tract coordinates.
+
+    Slicing off the edge truncates or raises depending on the path, and stamps of
+    inconsistent size would poison the training set.  Rejecting is cheaper than
+    repairing; the rejection is logged so the selection function stays
+    measurable.
+    """
+    ix, iy = int(round(x)), int(round(y))
+    half = size // 2
+    return bool(
+        bbox.contains(x=ix - half, y=iy - half)
+        and bbox.contains(x=ix - half + size - 1, y=iy - half + size - 1)
+    )
+
+
+def _cells_spanned(coadd, x: float, y: float, size: int) -> int:
+    """How many 150-pixel cells the stamp touches.
+
+    Each cell is coadded from its own set of input visits, so depth and PSF step
+    at cell edges.  Any stamp bigger than 150 native pixels straddles them, and a
+    generative prior would happily learn those steps as real structure -- so
+    record the span rather than pretend it is not there.
+    """
+    try:
+        grid = _attr(coadd, "grid")
+        half = size // 2
+        corners = [
+            grid.index_of(x=int(round(x)) + dx, y=int(round(y)) + dy)
+            for dx in (-half, half - 1)
+            for dy in (-half, half - 1)
+        ]
+        ii = {c.i for c in corners}
+        jj = {c.j for c in corners}
+        return int((max(ii) - min(ii) + 1) * (max(jj) - min(jj) + 1))
+    except Exception as exc:
+        log.debug("cell grid unavailable: %s", exc)
+        return -1
 
 
 # -- the driver ------------------------------------------------------------
@@ -384,7 +455,6 @@ def extract_patches(
     radius_deg: float = 0.3,
     bands: Sequence[str] = BANDS,
     native_size: int = 416,
-    psf_size: int = 41,
     n_hosts: int | None = 8000,
     jitter_arcsec: float = 4.0,
     host_flux_range: tuple[float, float] = (360.0, 36000.0),
@@ -451,6 +521,10 @@ def extract_patches(
 
     refs = find_coadd_refs(butler, ra, dec, radius_deg, bands)
     log.info("%d coadd patches overlap the field", len(refs))
+    # Tracts and patches overlap at their edges, so a host near a boundary is
+    # covered by more than one patch and would otherwise be extracted twice in
+    # the same band -- duplicates that a training set would silently weight up.
+    seen: set[tuple[int, str]] = set()
 
     try:
         for ref in refs:
@@ -462,43 +536,53 @@ def extract_patches(
                 "tract": int(data_id.get("tract", -1)),
                 "patch": int(data_id.get("patch", -1)),
             }
+
+            # Component reads move no pixels, so the patch is only loaded if a
+            # host actually lands in it.  With ~10^6 coadds that matters.
             try:
-                coadd = butler.get(ref)
+                wcs = butler.get(f"{DATASET_TYPE}.sky_projection", dataId=data_id)
             except Exception as exc:
                 records.append({**base, "status": "rejected",
-                                "reasons": f"read_failed:{exc!r}"[:120]})
+                                "reasons": f"no_wcs:{exc!r}"[:120]})
                 continue
 
-            wcs = _attr(coadd, "wcs")
-            image_all = np.asarray(_attr(coadd, "image"))
-            height, width = image_all.shape[-2:]
-            xs, ys = _sky_to_pixel(wcs, tgt_ra, tgt_dec)
-            half = native_size // 2
-            inside = (
-                (xs - half >= 0) & (xs + half < width)
-                & (ys - half >= 0) & (ys + half < height)
-            )
-            which = np.where(inside)[0]
-            if which.size == 0:
+            candidates = [
+                h for h in range(len(hosts))
+                if (int(host_id[h]), band_name) not in seen
+            ]
+            if not candidates:
                 continue
-            log.debug("patch %s: %d hosts", base["patch"], which.size)
+            xs, ys = _sky_to_pixel(wcs, tgt_ra[candidates], tgt_dec[candidates])
 
-            for h in which:
+            try:
+                bbox = butler.get(f"{DATASET_TYPE}.bbox", dataId=data_id)
+                coadd = None
+            except Exception:
+                coadd = butler.get(ref)
+                bbox = _attr(coadd, "bbox")
+
+            inside = [
+                (h, x, y) for h, x, y in zip(candidates, xs, ys)
+                if _fits_in_patch(bbox, x, y, native_size)
+            ]
+            if not inside:
+                continue
+            if coadd is None:
+                try:
+                    coadd = butler.get(ref)
+                except Exception as exc:
+                    records.append({**base, "status": "rejected",
+                                    "reasons": f"read_failed:{exc!r}"[:120]})
+                    continue
+            psf_model = _attr(coadd, "psf")
+            log.debug("patch %s band %s: %d hosts", base["patch"], band_name,
+                      len(inside))
+
+            for h, x, y in inside:
                 if max_patches is not None and n_accepted >= max_patches:
                     raise _Done
                 rec = {**base, "host_id": int(host_id[h]),
                        "host_offset_arcsec": float(r_jit[h])}
-
-                x, y = float(xs[h]), float(ys[h])
-                box = _stamp_box(x, y, native_size)
-                # `coadd[box]` is a VIEW; copy before the parent goes away.
-                stamp = coadd[box].copy()
-
-                image = np.asarray(_attr(stamp, "image"), dtype=np.float32)
-                if image.shape != (native_size, native_size):
-                    rec.update(status="rejected", reasons=f"clipped:{image.shape}")
-                    records.append(rec)
-                    continue
 
                 sep = _verify_centre(wcs, x, y, float(tgt_ra[h]), float(tgt_dec[h]))
                 rec["centre_sep_arcsec"] = sep
@@ -507,7 +591,15 @@ def extract_patches(
                     records.append(rec)
                     continue
 
-                variance = np.asarray(_attr(stamp, "variance"), dtype=np.float32)
+                # `coadd[box]` is a VIEW; copy or the whole parent patch stays
+                # pinned in memory, which defeats the point of a stamp.
+                stamp = coadd[_stamp_box(x, y, native_size)].copy()
+                image = np.asarray(_attr(stamp, "image").array, dtype=np.float32)
+                if image.shape != (native_size, native_size):
+                    rec.update(status="rejected", reasons=f"clipped:{image.shape}")
+                    records.append(rec)
+                    continue
+                variance = np.asarray(_attr(stamp, "variance").array, dtype=np.float32)
                 packed, mapping = pack_mask(_attr(stamp, "mask"))
                 if mask_mapping is None:
                     mask_mapping = mapping
@@ -519,7 +611,7 @@ def extract_patches(
                 reasons, diag = gate(image, variance, packed, mask_mapping,
                                      **gate_kwargs)
                 rec.update({f"diag_{k}": v for k, v in diag.items()})
-                psf = psf_bundle(stamp, x, y, psf_size)
+                psf = psf_bundle(psf_model, x, y)
                 if psf is None:
                     reasons = list(reasons) + ["psf_unavailable"]
                 if reasons:
@@ -531,13 +623,14 @@ def extract_patches(
                     writer = ShardWriter(
                         out_dir / "shards",
                         native_size=native_size,
-                        psf_size=psf_size,
+                        psf_size=psf["psf"].shape[0],
                         mask_plane_dict=mask_mapping,
                         prefix=prefix,
                         patches_per_shard=patches_per_shard,
                         dataset_type=DATASET_TYPE,
                         attrs={
                             "release": "DP2",
+                            "skymap": SKYMAP,
                             "field_ra": ra,
                             "field_dec": dec,
                             "bands": json.dumps(list(bands)),
@@ -545,9 +638,10 @@ def extract_patches(
                             "flux_units": "nJy",
                             "correlated_noise": 1,  # coadds are warped
                             "pixel_origin": PIXEL_ORIGIN,
-                            # DP2 coadds are over-subtracted around extended
-                            # galaxies and the background can be restored with
-                            # apply_background.  These are as delivered.
+                            # DP2 coadds get a final background subtraction that
+                            # over-subtracts around extended galaxies, and it can
+                            # be restored with apply_background('pretty').  These
+                            # are as delivered.
                             "background_restored": 0,
                         },
                     )
@@ -572,15 +666,17 @@ def extract_patches(
                         "ra": float(tgt_ra[h]),
                         "dec": float(tgt_dec[h]),
                         "psf_sigma": psf["psf_sigma"],
+                        "psf_fwhm": psf["psf_fwhm"],
                         "psf_ixx": psf["psf_ixx"],
                         "psf_iyy": psf["psf_iyy"],
                         "psf_ixy": psf["psf_ixy"],
-                        "pixel_scale": _pixel_scale(wcs),
+                        "pixel_scale": _pixel_scale(wcs, x, y),
                         "sky_noise": diag.get("sky_noise", np.nan),
                         "host_id": int(host_id[h]),
                         "host_offset_arcsec": float(r_jit[h]),
                         "tract": base["tract"],
                         "patch": base["patch"],
+                        "n_cells_spanned": _cells_spanned(coadd, x, y, native_size),
                         "n_neighbours": len(others),
                         "neighbour_flux_max": float(
                             max([n["flux"] for n in others], default=np.nan)
@@ -596,6 +692,7 @@ def extract_patches(
                     neighbour_rows.append({"patch_index": n_accepted, **n})
                 rec.update(status="accepted", patch_index=n_accepted)
                 records.append(rec)
+                seen.add((int(host_id[h]), band_name))
                 n_accepted += 1
             del coadd
     except _Done:
@@ -624,75 +721,104 @@ def extract_patches(
 
 
 def _origin(stamp) -> tuple[int, int]:
-    """``(y0, x0)`` of a stamp, or ``(-1, -1)``.
+    """``(y0, x0)`` of a stamp in tract coordinates, or ``(-1, -1)``.
 
-    Mandatory to keep, not optional: without the origin a saved stamp cannot be
-    mapped back to the sky.  WARN: the attribute name is unverified.
+    Mandatory, not optional: without the origin a saved stamp cannot be mapped
+    back to the sky.
     """
     try:
-        origin = getattr(stamp, DP2_ATTRS["origin"])
-        return int(origin[0]), int(origin[1])
+        yx0 = _attr(stamp, "origin")
+        return int(yx0.y), int(yx0.x)
     except Exception as exc:
         log.debug("no stamp origin: %s", exc)
         return -1, -1
 
 
-def _pixel_scale(wcs) -> float:
-    """Arcsec per pixel from an astropy WCS.  WARN: unverified on DP2."""
-    try:
-        from astropy.wcs.utils import proj_plane_pixel_scales
+def _pixel_scale(wcs, x: float, y: float) -> float:
+    """Arcsec per pixel, measured by stepping one pixel through the WCS itself.
 
-        return float(np.mean(proj_plane_pixel_scales(wcs)) * 3600.0)
+    Avoids assuming any particular WCS introspection API.
+    """
+    try:
+        ra0, dec0 = _pixel_to_sky(wcs, x, y)
+        ra1, dec1 = _pixel_to_sky(wcs, x + 1.0, y)
+        cosd = np.cos(np.deg2rad(dec0))
+        return float(np.hypot((ra1 - ra0) * cosd, dec1 - dec0) * 3600.0)
     except Exception:
         return float("nan")
 
 
-def psf_bundle(stamp, x: float, y: float, psf_size: int) -> dict | None:
-    """Coadd PSF image and moments at ``(x, y)``, or ``None`` if unavailable.
+def psf_bundle(psf, x: float, y: float) -> dict | None:
+    """Coadd PSF kernel and its moments at tract pixel ``(x, y)``.
 
-    A patch without a PSF cannot be forward-modelled later and is rejected rather
-    than stored incomplete.  WARN: the DP2 PSF interface is unverified; several
-    spellings are tried before giving up.
+    ``compute_kernel_image`` is the convolution kernel a forward model wants
+    (``compute_stellar_image`` is the one to compare against an observed star).
+
+    **The DP2 PSF object carries no shape or moment methods at all** -- unlike
+    DP1's ``afw`` PSF, ``CellPointSpreadFunction`` offers no ``computeShape``.
+    The moments are therefore measured from the kernel here.  The tutorial uses
+    GalSim HSM; this uses adaptive moments computed directly, to avoid a
+    dependency for one number and to give the same answer on any release.
     """
     try:
-        psf = _attr(stamp, "psf")
-        image = None
-        for call in ("compute_image", "computeImage", "image_at", "__call__"):
-            fn = getattr(psf, call, None)
-            if fn is None:
-                continue
-            try:
-                image = np.asarray(fn(x, y), dtype=np.float32)
-                break
-            except Exception:
-                continue
-        if image is None:
-            return None
-        return {"psf": image, **_psf_moments(image)}
+        kernel = np.asarray(psf.compute_kernel_image(x=float(x), y=float(y)).array,
+                            dtype=np.float32)
     except Exception as exc:
-        log.debug("PSF evaluation failed: %s", exc)
+        log.debug("PSF kernel unavailable at (%.1f, %.1f): %s", x, y, exc)
         return None
+    if not np.all(np.isfinite(kernel)) or kernel.sum() <= 0:
+        return None
+    return {"psf": kernel, **_adaptive_moments(kernel)}
 
 
-def _psf_moments(image: np.ndarray) -> dict:
-    """Second moments straight from the PSF stamp.
+#: FWHM / sigma for a Gaussian.
+SIGMA_TO_FWHM = 2.0 * np.sqrt(2.0 * np.log(2.0))
 
-    Computed here rather than asked of the stack, so the numbers are defined the
-    same way on any release and do not depend on an unverified accessor.
+
+def _adaptive_moments(image: np.ndarray, max_iter: int = 40,
+                      tol: float = 1e-8) -> dict:
+    """Gaussian-weighted second moments, iterated to self-consistency.
+
+    Unweighted moments of a PSF kernel are dominated by its wings and by
+    whatever noise is out there, and can diverge outright.  Weighting by a
+    Gaussian matched to the profile and iterating fixes that: for a Gaussian
+    image of covariance ``M`` weighted by ``W``, the weighted covariance is
+    ``(M^-1 + W^-1)^-1``, so at the fixed point ``W = M`` the measurement reads
+    ``M/2`` and the update is simply twice the weighted moments.
     """
-    a = np.asarray(image, dtype=np.float64)
+    a = np.maximum(np.asarray(image, dtype=np.float64), 0.0)
     total = a.sum()
     if not np.isfinite(total) or total <= 0:
-        return {"psf_sigma": np.nan, "psf_ixx": np.nan,
+        return {"psf_sigma": np.nan, "psf_fwhm": np.nan, "psf_ixx": np.nan,
                 "psf_iyy": np.nan, "psf_ixy": np.nan}
-    yy, xx = np.mgrid[0:a.shape[0], 0:a.shape[1]]
+    yy, xx = np.mgrid[0 : a.shape[0], 0 : a.shape[1]].astype(np.float64)
     cy, cx = (a * yy).sum() / total, (a * xx).sum() / total
-    ixx = float((a * (xx - cx) ** 2).sum() / total)
-    iyy = float((a * (yy - cy) ** 2).sum() / total)
-    ixy = float((a * (xx - cx) * (yy - cy)).sum() / total)
+    ixx = iyy = max(float(a.shape[0]) / 6.0, 1.0) ** 2
+    ixy = 0.0
+    for _ in range(max_iter):
+        det = ixx * iyy - ixy**2
+        if not np.isfinite(det) or det <= 0:
+            break
+        dx, dy = xx - cx, yy - cy
+        chi2 = (iyy * dx**2 - 2 * ixy * dx * dy + ixx * dy**2) / det
+        w = a * np.exp(-0.5 * np.clip(chi2, 0, 200))
+        wsum = w.sum()
+        if wsum <= 0:
+            break
+        cx_new = (w * xx).sum() / wsum
+        cy_new = (w * yy).sum() / wsum
+        dxn, dyn = xx - cx_new, yy - cy_new
+        nxx = 2.0 * (w * dxn**2).sum() / wsum
+        nyy = 2.0 * (w * dyn**2).sum() / wsum
+        nxy = 2.0 * (w * dxn * dyn).sum() / wsum
+        shift = max(abs(nxx - ixx), abs(nyy - iyy), abs(nxy - ixy))
+        cx, cy, ixx, iyy, ixy = cx_new, cy_new, nxx, nyy, nxy
+        if shift < tol:
+            break
     det = max(ixx * iyy - ixy**2, 0.0)
-    return {"psf_sigma": float(det**0.25), "psf_ixx": ixx,
-            "psf_iyy": iyy, "psf_ixy": ixy}
+    sigma = float(det**0.25)
+    return {"psf_sigma": sigma, "psf_fwhm": sigma * SIGMA_TO_FWHM,
+            "psf_ixx": float(ixx), "psf_iyy": float(iyy), "psf_ixy": float(ixy)}
 
 
 class _Done(Exception):

@@ -38,6 +38,7 @@ META_DTYPES: dict[str, str] = {
     "ra": "f8",
     "dec": "f8",
     "psf_sigma": "f4",
+    "psf_fwhm": "f4",
     "psf_ixx": "f4",
     "psf_iyy": "f4",
     "psf_ixy": "f4",
@@ -57,6 +58,9 @@ META_DTYPES: dict[str, str] = {
     # REJECTED cover a large fraction of the coadd, so a cut on them keeps
     # almost nothing; frac_no_data is DP2's inf-variance regions, which include
     # the cores of saturated stars.
+    # Cells are coadded from different input visits, so depth and PSF step at
+    # cell edges; any stamp over 150 native px straddles them.
+    "n_cells_spanned": "i2",
     "frac_no_data": "f4",
     "frac_inexact_psf": "f4",
     "frac_rejected": "f4",

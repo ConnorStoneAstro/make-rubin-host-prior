@@ -215,6 +215,7 @@ def write_synthetic_shards(
                     "ra": 53.13 + float(rng.normal(0, 0.1)),
                     "dec": -28.10 + float(rng.normal(0, 0.1)),
                     "psf_sigma": p["psf_sigma"],
+                    "psf_fwhm": p["psf_sigma"] * 2.3548200450309493,
                     "pixel_scale": 0.2003,
                     "sky_noise": noise[band],
                     "host_id": i,
@@ -225,6 +226,8 @@ def write_synthetic_shards(
                     "neighbour_flux_max": float(10 ** rng.uniform(2, 4.5)),
                     "nearest_galaxy_arcsec": float(rng.uniform(2, 30)),
                     "nearest_star_arcsec": float(rng.uniform(2, 30)),
+                    # A 416 px stamp spans ~3x3 of the 150 px coadd cells.
+                    "n_cells_spanned": int(max(1, round((native_size / 150) ** 2))),
                     "frac_no_data": float(no_data_fraction),
                     "frac_inexact_psf": 0.3,
                     "frac_rejected": float(rng.uniform(0, 0.4)),

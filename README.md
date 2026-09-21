@@ -410,17 +410,23 @@ coadd's own `mask.schema`, stores that mapping with the shard, and `gate`
 That last check is the difference between a loud failure and a silently useless
 training set.
 
-**No-data is carried by the variance, not by a plane.** DP2 variance holds `inf`
-where there were no contributing exposures, including the cores of saturated
-stars. The fraction is measured, with a tolerance, and zero tolerance at the
-centre where the transient goes. Rejecting merely because non-finite variance is
-*present* would discard every stamp containing a bright neighbour.
+**No-data is carried twice over.** DP2 has a `NO_DATA` plane *and* `inf` in the
+variance where there were no contributing exposures, including the cores of
+saturated stars. The plane is excluded outright. The variance is treated more
+gently — its fraction is measured, with a tolerance and zero tolerance at the
+centre — because rejecting merely because non-finite variance is *present* would
+discard every stamp containing a bright neighbour.
 
-**`SATURATED` gets a fraction, not zero.** DP1 excluded any saturation outright.
-On a DP2 coadd the saturated core of a bright neighbour lands in a great many
-stamps, and a scene with a bright neighbour is exactly the regime this project
-models — so a small fraction away from the centre is kept, and the manifest
-records how much.
+**`SATURATED` gets a fraction, not zero — a deliberate deviation.** Rubin's own
+guidance (tutorial 202.5) is to exclude `NO_DATA` and `SATURATED`, which for
+*pixels* in a measurement is right. For whole training stamps it is not: on a
+coadd the saturated core of a bright neighbour lands in a great many stamps, and
+a scene with a bright neighbour is exactly the regime this project models, so a
+blanket cut would reproduce the selection bias the rejection statistics exist to
+expose. A small fraction is kept away from the centre, zero at the centre where
+the transient goes, and the fraction is recorded either way. Set
+`FRAC_TOL["SATURATED"] = 0.0` to follow the guidance literally. `NO_DATA` *is*
+excluded outright, as are `DETECTION_EDGE` pixels.
 
 **`INEXACT_PSF` and `REJECTED` are not quality cuts.** They cover a large
 fraction of the DP2 coadd, so gating on them keeps almost nothing. They are
@@ -445,6 +451,22 @@ galaxies and the background is recoverable via `apply_background`. The images ar
 taken **as delivered**, without restoration, and every shard records
 `background_restored=0` so a set made the other way is distinguishable.
 
+### Cell structure: a real caveat
+
+DP2 coadds are cell-based — a 22×22 grid of **150-pixel** cells, each coadded
+from its own set of input visits (typically 11–33). Depth and PSF are therefore
+piecewise constant, with genuine discontinuities at cell edges.
+
+A 416-pixel native stamp spans roughly **3×3 cells**, so essentially every
+training patch straddles them. A generative prior will happily learn those depth
+steps as real sky structure. Staying inside one cell is not an option here: 150
+native pixels is 50 pooled, which with `L = 8` leaves an 18×18 loss interior.
+
+So the span is recorded per stamp (`n_cells_spanned`) rather than pretended away,
+and `provenance.contributions` offers per-cell input counts as a better
+effective-depth covariate than the variance plane if you want to go further.
+Worth looking at the trained samples for cell-edge artefacts.
+
 ### Storage
 
 Shards hold **native-resolution stamps in physical units** (nJy), plus variance,
@@ -463,40 +485,32 @@ native stamps.
 
 ## Porting to NERSC: what to verify
 
-The model, loss, loader and gate are tested locally. The Butler and `lsst.images`
-layer is not. **The DP2 skill shipped only its overview — `references/dp2-facts.md`
-and `references/dp2-images-api.md` were not available** — so the items below are
-written from the overview's description of the semantics, not from verified
-signatures. They are collected so each is a one-line fix.
+The model, loss, loader and gate are tested locally; the Butler and `lsst.images`
+layer is not. These are now written against the verified DP2 reference rather
+than guessed, so the list is short:
 
-- [ ] **`REPO` / `COLLECTION`** in `rubin/extract.py` — `"dp2"` and
-      `"LSSTCam/DP2"` are guesses. Check `Butler.get_known_repos()`,
-      `$DAF_BUTLER_REPOSITORY_INDEX`, `butler.collections.query("*")`.
-- [ ] **`DP2_ATTRS`** — the `CellCoadd` attribute names for image, variance,
-      mask, psf, wcs, schema and origin. Every access goes through `_attr`,
-      which on failure reports what the object actually offers, so a wrong name
-      produces a useful error rather than a crash.
-- [ ] **`PIXEL_ORIGIN`.** DP2 has two conventions: `sky_projection` works in
-      *tract* coordinates, `astropy_wcs` in *patch-local*. Mixing them misplaces
-      a position by up to a patch — far enough to land on the wrong galaxy, close
-      enough to look plausible. This module commits to patch-local and then
-      round-trips **every** stamp centre back to the sky, rejecting anything more
-      than `CENTRE_TOLERANCE_ARCSEC` from the position asked for. If the
-      convention is wrong, the first patch fails loudly with `centre_mismatch`
-      in the manifest instead of quietly producing a mis-centred training set.
-      **Check the rejection counts for `centre_mismatch` on your first run.**
-- [ ] **`Box.factory` is `[y, x]`** — numpy order, the opposite of DP1's
-      `Box2I(x, y)`. `_stamp_box` assumes this.
-- [ ] **`coadd[box]` returns a view**, so `_extract` calls `.copy()`. If the API
-      instead returns a copy this is merely wasteful, not wrong.
-- [ ] **PSF accessor.** `psf_bundle` tries several spellings and gives up
-      cleanly; the moments are computed from the returned stamp locally, so they
-      do not depend on an unverified accessor.
+- [ ] **`Butler("dp2", collections="dp2")`** — both are literally `"dp2"`.
+      Off-platform, confirm the alias with `Butler.get_known_repos()` or
+      `$DAF_BUTLER_REPOSITORY_INDEX`.
+- [ ] **`deep_coadd.bbox` as a component read.** `sky_projection` and `psf` are
+      documented component reads; `bbox` is assumed to work the same way and
+      falls back to loading the patch if not, which is correct either way.
+- [ ] **`grid.index_of(x=, y=)` returning `.i`/`.j`.** Used only for the
+      `n_cells_spanned` covariate, and degrades to `-1` if the attribute names
+      differ.
 - [ ] **Object-table columns** assumed unchanged from DP1 (`coord_ra`,
       `shape_xx`, `refExtendedness`, `{b}_cModelFlux`, `detect_isPrimary`).
-- [ ] **Field coordinates.** ECDFS is a standard deep-drilling field so DP2 very
-      likely covers it, but the DP2 field list was not available.
-- [ ] Pixels are nJy in both releases; do not apply a calibration step.
+- [ ] **Field choice.** ECDFS (tract 5063) is the best-characterised DP2 field
+      and the one the tutorials use; check dp2.lsst.io before choosing on cadence
+      grounds.
+- [ ] **`centre_mismatch` count in the manifest should be zero.** Every stamp
+      centre is projected back to the sky and compared against the position
+      asked for. DP2 has two pixel-origin conventions — `sky_projection` is
+      tract, `astropy_wcs` is patch-local — and mixing them is an error of up to
+      a full patch (~4000 px), far enough to land in the wrong galaxy and close
+      enough to look plausible. This module works in tract coordinates
+      throughout, which is what `Box.factory` and `bbox.contains` expect, and the
+      round-trip makes any residual geometry error loud rather than silent.
 
 ## Open questions and known gaps
 
