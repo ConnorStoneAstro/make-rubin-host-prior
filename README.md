@@ -473,31 +473,80 @@ than loudly, so `select_hosts` is built to fail loudly instead:
 - DP2 also offers continuous `{band}_sizeExtendedness` and
   `{band}_model_extendedness`, either a better primary cut than the hard 0/1
   `refExtendedness` if the sample turns out to need one, and
-  `{band}_cModel_exp_reff_major` — a half-light radius directly in arcsec, which
-  the diagnostic plots prefer over the moments trace.
+  `{band}_cModel_{exp,dev}_reff_{major,minor}` — half-light ellipse axes directly
+  in arcsec, which the size cut and the diagnostic plots use in preference to the
+  moments trace.
 
-**Size stratification draws from equal-width bins in log size, not quantiles.**
+**Hosts must be at least 1″ across.** `min_reff_arcsec` cuts on the cModel
+half-light radius, and it is the cut that decides what the prior sees: the
+catalogue is dominated by galaxies a pixel or two across, which carry no
+structure to learn from, and without it they are most of the sample. At the DP2
+pixel of 0.2″ a 1″ half-light radius is 5 native pixels, or 1.7 after the 3×
+pooling — small, but the visible galaxy runs to several half-light radii beyond
+it.
+
+DP2 publishes no single combined cModel radius, only the exponential and de
+Vaucouleurs half-light ellipses separately, and whichever component carries
+little flux has a correspondingly ill-constrained radius. Taking the larger would
+admit small galaxies whose unconstrained component ran away; taking the smaller
+would reject large ones whose component collapsed. `host_half_light_arcsec`
+weights the two by `fracDev` — the fit's own statement of how the flux divides —
+which gives the runaway component no say precisely when it has no flux to justify
+it. The **major** axis is used rather than the circularised √(ab), because the
+point is structure to learn from and an inclined disc at a = 2″, b = 0.4″ has
+plenty of it while circularising would call it 0.9″ and throw it away.
+
+`min_trace_px` stays as a second, non-parametric floor from the adaptive moments,
+a cross-check against a runaway fit.
+
+**Size stratification draws from equal-width bins in log half-light radius, not
+quantiles.**
 This matters and was wrong until recently: quantile bins hold equal numbers by
 construction, so drawing equally from each is *exactly* a uniform sample and
 stratifies nothing. With equal-width bins the sample carries ~9× more
 well-resolved hosts than a uniform draw, falling to 1× as the request approaches
 the whole population — you cannot over-sample galaxies that are not there.
 
-### Cell structure: a real caveat
+### Cell structure, and the depth step it causes
 
 DP2 coadds are cell-based — a 22×22 grid of **150-pixel** cells, each coadded
 from its own set of input visits (typically 11–33). Depth and PSF are therefore
-piecewise constant, with genuine discontinuities at cell edges.
+piecewise constant, with genuine discontinuities at cell edges. A 416-pixel
+native stamp spans roughly **3×3 cells**, so essentially every training patch
+straddles them, and staying inside one cell is not an option: 150 native pixels
+is 50 pooled, which with `L = 8` leaves an 18×18 loss interior.
 
-A 416-pixel native stamp spans roughly **3×3 cells**, so essentially every
-training patch straddles them. A generative prior will happily learn those depth
-steps as real sky structure. Staying inside one cell is not an option here: 150
-native pixels is 50 pooled, which with `L = 8` leaves an 18×18 loss interior.
+Where the input set actually changes, the noise level steps across a straight
+cell edge and the stamp comes out visibly patchworked — most obviously in y,
+which has the fewest visits and so the largest fractional step. **No mask plane
+flags this.** It is not a defect: the pixels are all real, they are just not
+equally deep, and Rubin has nothing to say about it. What records it is the
+*variance plane*, which is where depth lives.
 
-So the span is recorded per stamp (`n_cells_spanned`) rather than pretended away,
-and `provenance.contributions` offers per-cell input counts as a better
-effective-depth covariate than the variance plane if you want to go further.
-Worth looking at the trained samples for cell-edge artefacts.
+So `variance_step` measures it directly — the ratio between the highest and the
+lowest block-wise variance floor across the stamp, 1.0 for a uniform stamp and
+the depth ratio of the two cells for a boundary. Two things keep a galaxy from
+being mistaken for a step, which matters because source Poisson variance is
+one-sided and the biggest, best hosts would be rejected first:
+
+- Pixels the *image* shows to be source are dropped before any floor is taken.
+  In sky-limited data a source only inflates the variance once its flux
+  approaches the sky per pixel, which is a detection at S/N of order √(sky
+  counts) — far above the 3σ threshold used — so this removes every pixel where
+  the source could matter, with a wide margin.
+- What is taken within a block is the 10th percentile, not a mean or median. At
+  the 25th, a bright 3″ galaxy reads as a step of 1.9; at the 10th it reads 1.16.
+  A real step is measured identically at any percentile — the ratio of two like
+  quantiles is unbiased — so the low one is free.
+
+With both, a σ = 30 px galaxy at 200× the sky reads 1.01 while a true 1.3 step
+still reads 1.31. The default threshold is **1.5 in variance**, which is 1.22 in
+noise σ; the ratio goes into the manifest whether the stamp passes or not, so it
+can be retuned from `variance_step` without re-reading pixels. `--max-variance-step
+inf` keeps everything.
+
+`n_cells_spanned` is still recorded, and `provenance.contributions` offers
+per-cell input counts if you want the depth itself rather than its footprint.
 
 ### Storage
 
@@ -539,8 +588,13 @@ than guessed, so the list is short:
       and the one the tutorials use; check dp2.lsst.io before choosing on cadence
       grounds.
 - [ ] **`min_trace_px = 1.75`** in `select_hosts` is a DP1-era ComCam PSF size.
-      Check it against the DP2 PSF before relying on the point-source
-      cross-check.
+      It is now only a cross-check behind the 1″ half-light cut, so it matters
+      less, but check it against the DP2 PSF before leaning on it.
+- [ ] **`--max-variance-step 1.5`** was chosen from what a depth step looks like,
+      not from DP2 statistics. Look at the `variance step` panel in `hosts.png`
+      and the rejection counts after a real run: if it is rejecting a large
+      fraction, the cells in this field differ more than assumed and the
+      threshold, not the data, is what should move.
 - [ ] **`centre_mismatch` count in the manifest should be zero.** Every stamp
       centre is projected back to the sky and compared against the position
       asked for. DP2 has two pixel-origin conventions — `sky_projection` is

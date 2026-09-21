@@ -142,7 +142,10 @@ PHOTOMETRY_BANDS = ("u", "g", "r", "i")
 
 #: Added per band in ``PHOTOMETRY_BANDS``.  ``_ixx``/``_iyy``/``_ixy`` are
 #: Gaussian-weighted adaptive moments in pixel^2; the ``reff`` columns are
-#: half-light major axes in arcsec.
+#: half-light ellipse axes in arcsec.  DP2 publishes no single combined cModel
+#: radius -- only the exponential and de Vaucouleurs components separately -- so
+#: ``_cModel_fracDev`` comes along to weight them; see
+#: ``host_half_light_arcsec``.
 OBJECT_BAND_COLUMNS = [
     "{b}_cModelFlux",
     "{b}_cModelFluxErr",
@@ -151,7 +154,10 @@ OBJECT_BAND_COLUMNS = [
     "{b}_iyy",
     "{b}_ixy",
     "{b}_cModel_dev_reff_major",
+    "{b}_cModel_dev_reff_minor",
     "{b}_cModel_exp_reff_major",
+    "{b}_cModel_exp_reff_minor",
+    "{b}_cModel_fracDev",
 ]
 
 #: ECDFS, still in tract 5063 as on DP1, and the field the DP2 tutorials use
@@ -346,6 +352,11 @@ def dedupe_hosts(table, radius_arcsec: float = 0.5):
     return table[keep]
 
 
+def _colnames(table) -> set[str]:
+    """Column names of an astropy Table or a pandas DataFrame."""
+    return set(getattr(table, "colnames", None) or getattr(table, "columns", []))
+
+
 def host_trace_radius_px(table, band: str) -> np.ndarray:
     """Trace radius in pixels from the per-band adaptive moments.
 
@@ -356,7 +367,7 @@ def host_trace_radius_px(table, band: str) -> np.ndarray:
     worse than stopping.
     """
     needed = [f"{band}_ixx", f"{band}_iyy"]
-    have = set(table.colnames)
+    have = _colnames(table)
     if not set(needed) <= have:
         raise KeyError(
             f"{needed} not in the object table. DP2 second moments are per band "
@@ -368,6 +379,53 @@ def host_trace_radius_px(table, band: str) -> np.ndarray:
     return np.sqrt(np.maximum(0.5 * (ixx + iyy), 0.0))
 
 
+def host_half_light_arcsec(table, band: str, axis: str = "major") -> np.ndarray:
+    """Half-light radius in arcsec, blending the two cModel components.
+
+    DP2 publishes no combined cModel radius: the exponential and de Vaucouleurs
+    half-light ellipses are separate columns, and whichever component carries
+    little flux has a correspondingly ill-constrained radius.  Taking the larger
+    of the two would admit small galaxies whose unconstrained component ran away,
+    and taking the smaller would reject large ones whose unconstrained component
+    collapsed.  Weighting by ``fracDev`` -- the fit's own statement of how the
+    flux divides -- gives the runaway component no say precisely when it has no
+    flux to justify it.
+
+    ``major`` is the default rather than the circularised ``sqrt(a*b)`` because
+    the point of a size cut here is structure to learn from, and an inclined disc
+    at a = 2", b = 0.4" has plenty of it while circularising would call it 0.9"
+    and throw it away.
+
+    NaN where neither component was fit.
+    """
+    if axis not in ("major", "minor"):
+        raise ValueError(f"axis must be 'major' or 'minor', not {axis!r}")
+    cols = {k: f"{band}_cModel_{k}_reff_{axis}" for k in ("exp", "dev")}
+    frac_col = f"{band}_cModel_fracDev"
+    have = _colnames(table)
+    missing = [c for c in (*cols.values(), frac_col) if c not in have]
+    if missing:
+        raise KeyError(
+            f"{missing} not in the object table. DP2 half-light radii are per "
+            f"band and split into exp/dev components, and only "
+            f"{PHOTOMETRY_BANDS} carry them. Columns present: "
+            f"{sorted(c for c in have if 'reff' in c or 'fracDev' in c)[:12]}"
+        )
+    exp = np.asarray(table[cols["exp"]], dtype=float)
+    dev = np.asarray(table[cols["dev"]], dtype=float)
+    frac = np.asarray(table[frac_col], dtype=float)
+    frac = np.where(np.isfinite(frac), np.clip(frac, 0.0, 1.0), 0.0)
+
+    exp_ok = np.isfinite(exp) & (exp > 0)
+    dev_ok = np.isfinite(dev) & (dev > 0)
+    # A weighted mean over whichever components exist, renormalised so that a
+    # missing component shifts the weight onto the other rather than to zero.
+    weight = np.where(exp_ok, 1.0 - frac, 0.0) + np.where(dev_ok, frac, 0.0)
+    total = (np.where(exp_ok, exp, 0.0) * (1.0 - frac)
+             + np.where(dev_ok, dev, 0.0) * frac)
+    return np.where(weight > 0, total / np.maximum(weight, 1e-12), np.nan)
+
+
 def select_hosts(
     table,
     band: str = "r",
@@ -376,6 +434,7 @@ def select_hosts(
     n_hosts: int | None = None,
     seed: int = 0,
     size_stratified: bool = True,
+    min_reff_arcsec: float = 1.0,
     min_trace_px: float = 1.75,
     dedupe_radius_arcsec: float = 0.5,
     n_size_bins: int = 5,
@@ -384,6 +443,14 @@ def select_hosts(
 
     ``flux_range`` bounds are 360 nJy (r = 25.0) to 36000 nJy (r = 20.0).
 
+    ``min_reff_arcsec`` is the real size cut: the cModel half-light major axis,
+    blended across the two components by ``fracDev``.  The catalogue is dominated
+    by galaxies a pixel or two across, which carry no structure for a prior to
+    learn, and they would otherwise be most of the sample.  For scale, at the DP2
+    pixel of 0.2 arcsec a 1 arcsec half-light radius is 5 native pixels, which is
+    1.7 pixels after the 3x pooling -- small, but the visible galaxy runs to
+    several half-light radii beyond it.
+
     ``refExtendedness`` is a hard 0/1 threshold on a flux ratio, so it is
     unreliable near the faint limit -- a cut on it alone at r > 23 admits a lot
     of faint stars.  The size cross-check drops the point-like contaminants.
@@ -391,16 +458,17 @@ def select_hosts(
     ``{band}_model_extendedness``, either of which would be a better primary cut
     if the sample turns out to need one.)
 
-    ``size_stratified`` draws equally from bins of equal *width* in log size, so
-    the sample is spread over size rather than following the catalogue, in which
-    small faint galaxies vastly outnumber well-resolved ones.  Note this must be
-    equal-width bins: drawing equally from quantile bins is exactly a uniform
-    sample, since quantile bins hold equal numbers by construction.  If the size
-    columns are missing this **raises** rather than quietly falling back to a
-    uniform draw.
+    ``size_stratified`` draws equally from bins of equal *width* in log half-light
+    radius, so the sample is spread over size rather than following the
+    catalogue, in which small faint galaxies vastly outnumber well-resolved ones.
+    Note this must be equal-width bins: drawing equally from quantile bins is
+    exactly a uniform sample, since quantile bins hold equal numbers by
+    construction.  If the size columns are missing this **raises** rather than
+    quietly falling back to a uniform draw.
 
-    ``min_trace_px`` is a DP1-era ComCam PSF size; check it against the DP2
-    PSF before relying on the cross-check.
+    ``min_trace_px`` is a second, non-parametric size floor from the adaptive
+    moments, kept as a cross-check against a runaway cModel fit.  It is a DP1-era
+    ComCam PSF size; check it against the DP2 PSF before leaning on it.
     """
     rng = np.random.default_rng(seed)
     if band not in PHOTOMETRY_BANDS:
@@ -424,8 +492,22 @@ def select_hosts(
     trace = host_trace_radius_px(t, band)
     keep &= np.isfinite(trace) & (trace > min_trace_px)
 
+    reff = host_half_light_arcsec(t, band)
+    if min_reff_arcsec is not None:
+        big_enough = np.isfinite(reff) & (reff >= min_reff_arcsec)
+        # Split the loss, because "no cModel fit" and "genuinely small" are very
+        # different statements about the selection function.
+        log.info(
+            "half-light cut at %.2f\": %d of %d survive; %d dropped as smaller, "
+            "%d for having no cModel fit",
+            min_reff_arcsec, int((keep & big_enough).sum()), int(keep.sum()),
+            int((keep & np.isfinite(reff) & ~big_enough).sum()),
+            int((keep & ~np.isfinite(reff)).sum()),
+        )
+        keep &= big_enough
+
     t = t[keep]
-    trace = trace[keep]
+    reff = reff[keep]
     if n_hosts is None or n_hosts >= len(t):
         return t
     if not size_stratified:
@@ -437,13 +519,13 @@ def select_hosts(
     # bins hold wildly unequal numbers, so an equal draw from each is what
     # actually flattens the size distribution and gets well-resolved hosts into
     # the sample.
-    log_trace = np.log10(np.maximum(trace, 1e-6))
-    edges = np.linspace(log_trace.min(), log_trace.max(), n_size_bins + 1)
+    log_size = np.log10(np.maximum(reff, 1e-6))
+    edges = np.linspace(log_size.min(), log_size.max(), n_size_bins + 1)
     edges[-1] += 1e-9
     per_bin = max(n_hosts // n_size_bins, 1)
     picks: list[int] = []
     for lo, hi in zip(edges[:-1], edges[1:]):
-        idx = np.where((log_trace >= lo) & (log_trace < hi))[0]
+        idx = np.where((log_size >= lo) & (log_size < hi))[0]
         if len(idx) == 0:
             continue
         picks += list(rng.choice(idx, size=min(per_bin, len(idx)), replace=False))
@@ -601,6 +683,7 @@ def extract_patches(
     jitter_arcsec: float = 4.0,
     host_flux_range: tuple[float, float] = (360.0, 36000.0),
     max_blendedness: float | None = None,
+    min_reff_arcsec: float = 1.0,
     patches_per_shard: int = 1024,
     max_patches: int | None = None,
     neighbour_radius_arcsec: float = 30.0,
@@ -636,6 +719,7 @@ def extract_patches(
         band="r" if "r" in bands else bands[0],
         flux_range=host_flux_range,
         max_blendedness=max_blendedness,
+        min_reff_arcsec=min_reff_arcsec,
         n_hosts=n_hosts,
         seed=seed,
     )
@@ -845,6 +929,7 @@ def extract_patches(
                         "nearest_galaxy_arcsec": float(min(gal, default=np.nan)),
                         "nearest_star_arcsec": float(min(star, default=np.nan)),
                         "frac_no_data": diag.get("frac_no_data", np.nan),
+                        "variance_step": diag.get("variance_step", np.nan),
                         "frac_inexact_psf": diag.get("frac_INEXACT_PSF", np.nan),
                         "frac_rejected": diag.get("frac_REJECTED", np.nan),
                     },

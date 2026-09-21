@@ -30,6 +30,20 @@ rejecting on it would reject every patch containing a galaxy.
 no ``STREAK`` plane at all.  Trails and unmasked electronics artefacts have to
 come from your own detection step; nothing here will catch them.
 
+**Nor does any plane flag a depth step.**  DP2 coadds are cell-based: each 150 px
+cell is built from its own set of input visits, so where the input set changes --
+at a visit edge, a dither boundary, the rim of the field -- the noise level steps
+across a straight cell edge, and a stamp larger than a cell straddles it.  It is
+most obvious in y, which has the fewest visits and so the largest fractional
+step.  Rubin does not mark this: it is not a defect, the pixels are all real, they
+are just not equally deep.  What records it is the *variance plane*, which is
+where depth lives, so ``variance_step`` measures it directly -- the ratio between
+the highest and lowest block-wise variance floor across the stamp.  The floor is
+a low percentile within each block so that a source, which only ever pushes
+variance up, cannot fake a step, and pixels the image shows to be source are dropped
+outright; blocks are sized well under a cell so at least one lands wholly inside
+each.
+
 Tolerances for ``COSMIC_RAY`` and ``INTERPOLATED`` are tighter than the
 documentation recommends, deliberately.  That guidance is written for
 *measurement*, where an interpolated pixel barely perturbs a flux.  Here the
@@ -88,6 +102,97 @@ INNER_FRAC_TOL: dict[str, float] = {
 NEVER_REJECT: tuple[str, ...] = COVARIATE_PLANES
 
 
+#: Block side for the variance floors, as a fraction of the stamp.  At the
+#: nominal 416 px stamp this is 52 px: well under a 150 px coadd cell, so at
+#: least one block falls wholly inside each cell and a step between cells shows
+#: up as a difference between blocks; and well over a galaxy -- a 1 arcsec
+#: half-light radius is 5 native px -- so no source can fill a block and lift its
+#: floor.
+VARIANCE_BLOCK_FRACTION: float = 1 / 8
+
+#: Largest accepted ratio between the highest and lowest block variance floor.
+#: This is a ratio in *variance*, so 1.5 is a factor 1.22 in noise sigma, about
+#: where a cell boundary stops being subtle and starts being the first thing you
+#: see in the stamp.  Recorded for every stamp either way, so this can be
+#: retuned from the manifest without re-reading pixels.
+MAX_VARIANCE_STEP: float = 1.5
+
+
+#: Percentile taken within each block.  Low, because source Poisson variance is
+#: one-sided: at the 25th percentile a bright 3 arcsec galaxy reads as a step of
+#: 1.9, which would reject exactly the well-resolved hosts the set is for; at the
+#: 10th it reads as 1.16.  A real step is measured identically at any percentile
+#: -- the ratio of two like quantiles is unbiased -- so the low one is free.
+VARIANCE_FLOOR_PERCENTILE: float = 10.0
+
+#: Pixels brighter than sky + this many sigma are excluded from the floors.
+#: In sky-limited data a source only inflates the variance appreciably once its
+#: flux approaches the sky per pixel, which is a detection at S/N of order
+#: sqrt(sky counts) -- far above 3 -- so this removes every pixel where the
+#: source could matter, with a wide margin, and leaves the sky pixels that carry
+#: the depth information.
+SOURCE_NSIGMA: float = 3.0
+
+
+def variance_floors(
+    variance: np.ndarray,
+    image: np.ndarray | None = None,
+    block: int | None = None,
+    floor_percentile: float = VARIANCE_FLOOR_PERCENTILE,
+    min_usable: float = 0.5,
+    source_nsigma: float = SOURCE_NSIGMA,
+) -> np.ndarray:
+    """Low envelope of the sky variance on a block grid, in reading order.
+
+    Two defences against a source being read as depth, because it adds its own
+    Poisson variance and that contamination is one-sided.  First, given the
+    ``image``, pixels detected above the sky are dropped outright -- a galaxy big
+    enough to fill a block would otherwise defeat any percentile.  Second, what
+    is taken within a block is a low percentile rather than a mean or median.
+
+    Blocks left with less than ``min_usable`` of their pixels are dropped rather
+    than given a floor from whatever survived; a block covered by a galaxy has no
+    sky in it to report.
+    """
+    v = np.asarray(variance, dtype=float)
+    h, w = v.shape
+    if block is None:
+        block = max(int(round(min(h, w) * VARIANCE_BLOCK_FRACTION)), 8)
+    usable = np.isfinite(v) & (v > 0)
+    if image is not None:
+        im = np.asarray(image, dtype=float)
+        sky = float(np.median(im[usable])) if usable.any() else 0.0
+        with np.errstate(invalid="ignore"):
+            usable &= np.isfinite(im) & (im < sky + source_nsigma * np.sqrt(v))
+    floors: list[float] = []
+    for y0 in range(0, h - block + 1, block):
+        for x0 in range(0, w - block + 1, block):
+            sl = (slice(y0, y0 + block), slice(x0, x0 + block))
+            good = v[sl][usable[sl]]
+            if good.size < min_usable * block * block:
+                continue
+            floors.append(float(np.percentile(good, floor_percentile)))
+    return np.asarray(floors, dtype=float)
+
+
+def variance_step(
+    variance: np.ndarray,
+    image: np.ndarray | None = None,
+    block: int | None = None,
+    floor_percentile: float = VARIANCE_FLOOR_PERCENTILE,
+) -> float:
+    """Ratio of the highest to the lowest block variance floor.
+
+    1.0 is a uniform stamp; a coadd cell boundary shows as the ratio of the two
+    cells' depths.  NaN when fewer than two blocks are usable, which is a lack of
+    information and not a defect -- the gate treats it as a pass.
+    """
+    floors = variance_floors(variance, image, block, floor_percentile)
+    if floors.size < 2 or floors.min() <= 0:
+        return float("nan")
+    return float(floors.max() / floors.min())
+
+
 def plane_bitmask(plane_dict: dict[str, int], names) -> int:
     """OR of the bits for ``names`` that actually exist in ``plane_dict``."""
     if isinstance(names, str):
@@ -124,6 +229,9 @@ def gate(
     inner_frac_tol: dict[str, float] | None = None,
     max_no_data: float = 0.02,
     max_inner_no_data: float = 0.0,
+    max_variance_step: float = MAX_VARIANCE_STEP,
+    variance_block: int | None = None,
+    variance_floor_percentile: float = VARIANCE_FLOOR_PERCENTILE,
     require_known_planes: bool = True,
 ) -> tuple[list[str], dict[str, float]]:
     """Return ``(rejection_reasons, diagnostics)``.  Empty reasons means accept.
@@ -177,6 +285,14 @@ def gate(
     diag["inner_frac_no_data"] = inner_no_data
     if inner_no_data > max_inner_no_data:
         reasons.append(f"inner_no_data:{inner_no_data:.4f}>{max_inner_no_data}")
+
+    # Cell-based coadds step in depth at cell edges and nothing flags it; see the
+    # module docstring.  Gate on it, because a stamp with a straight noise
+    # boundary through it teaches the model that the sky does that.
+    step = variance_step(variance, image, variance_block, variance_floor_percentile)
+    diag["variance_step"] = step
+    if np.isfinite(step) and step > max_variance_step:
+        reasons.append(f"variance_step:{step:.2f}>{max_variance_step}")
 
     if sky_noise is None:
         finite = variance[~no_data]

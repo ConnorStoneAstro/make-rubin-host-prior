@@ -246,6 +246,8 @@ def plot_hosts(shards, hosts=None, band: str = "r", out: Path | None = None):
     plt = _plt()
     from .config import BANDS
 
+    from rubin_host_prior.rubin.extract import host_half_light_arcsec
+
     meta = shards.meta
     panels = []
 
@@ -259,16 +261,13 @@ def plot_hosts(shards, hosts=None, band: str = "r", out: Path | None = None):
             ixx, iyy, ixy = (np.asarray(hosts[c], dtype=float) for c in mom)
             panels.append(("host distortion", _distortion(ixx, iyy, ixy), 40,
                            "$|e| = (1-q^2)/(1+q^2)$", False))
-            # Prefer the half-light radius, which DP2 gives directly in arcsec;
-            # fall back to the moments trace converted with the pixel scale.
-            reff = [f"{band}_cModel_exp_reff_major", f"{band}_cModel_dev_reff_major"]
-            present = [c for c in reff if c in cols]
-            if present:
-                size = np.nanmean(
-                    [np.asarray(hosts[c], dtype=float) for c in present], axis=0
-                )
+            # Prefer the half-light radius, which DP2 gives directly in arcsec
+            # and which the size cut is made on; fall back to the moments trace
+            # converted with the pixel scale.
+            try:
+                size = host_half_light_arcsec(hosts, band)
                 label = "half-light major axis (arcsec)"
-            else:
+            except KeyError:
                 size = np.sqrt(np.maximum(0.5 * (ixx + iyy), 0)) * scale
                 label = "trace radius (arcsec)"
             panels.append(("host size", size, 40, label, False))
@@ -285,6 +284,11 @@ def plot_hosts(shards, hosts=None, band: str = "r", out: Path | None = None):
                            40, "fraction of flux from neighbours", False))
 
     panels.append(("local sky noise", meta["sky_noise"], 40, "nJy / native pixel", False))
+    if "variance_step" in meta:
+        # 1.0 is a uniform stamp; a tail above it is depth stepping across a
+        # coadd cell edge, which is what the gate is set against.
+        panels.append(("variance step", np.asarray(meta["variance_step"], dtype=float),
+                       40, "max/min block variance floor", False))
     panels.append(("PSF size", np.asarray(meta["psf_sigma"], dtype=float), 40,
                    "PSF sigma (pixels)", False))
     panels.append(("nearest galaxy", meta["nearest_galaxy_arcsec"], 40,

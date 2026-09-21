@@ -19,6 +19,7 @@ from rubin_host_prior.rubin.extract import (
     _adaptive_moments,
     _data_id_dict,
     dedupe_hosts,
+    host_half_light_arcsec,
     host_trace_radius_px,
     select_hosts,
 )
@@ -28,6 +29,9 @@ Table = pytest.importorskip("astropy.table").Table
 
 def _catalogue(n=3000, seed=0, band="r"):
     rng = np.random.default_rng(seed)
+    ixx = 10 ** rng.uniform(0.4, 2.4, n)
+    iyy = 10 ** rng.uniform(0.4, 2.4, n)
+    reff = np.sqrt(0.5 * (ixx + iyy)) * 0.2 * 1.177  # trace px -> half-light arcsec
     return Table({
         "objectId": np.arange(n),
         "coord_ra": 53.13 + rng.normal(0, 0.1, n),
@@ -36,9 +40,16 @@ def _catalogue(n=3000, seed=0, band="r"):
         "refBand": [band] * n,
         f"{band}_cModelFlux": 10 ** rng.uniform(2.6, 4.5, n),
         f"{band}_blendedness": rng.beta(1.2, 8, n),
-        f"{band}_ixx": 10 ** rng.uniform(0.4, 2.4, n),
-        f"{band}_iyy": 10 ** rng.uniform(0.4, 2.4, n),
+        f"{band}_ixx": ixx,
+        f"{band}_iyy": iyy,
         f"{band}_ixy": rng.normal(0, 5, n),
+        # Half-light radius tracks the moments trace, as it does on the sky, so
+        # the two size cuts are consistent with each other.
+        f"{band}_cModel_exp_reff_major": reff,
+        f"{band}_cModel_exp_reff_minor": 0.7 * reff,
+        f"{band}_cModel_dev_reff_major": reff,
+        f"{band}_cModel_dev_reff_minor": 0.7 * reff,
+        f"{band}_cModel_fracDev": rng.uniform(0, 1, n),
     })
 
 
@@ -128,6 +139,26 @@ def test_select_hosts_dedupes_before_selecting():
     assert len(select_hosts(doubled, band="r")) == len(select_hosts(t, band="r"))
 
 
+def _sized_catalogue(n, scale=0.25, seed=1, size_mult=1.0):
+    """A catalogue with a steep size distribution, as a real one has."""
+    rng = np.random.default_rng(seed)
+    trace_sq = size_mult * 10 ** rng.exponential(scale, n)
+    reff = np.sqrt(trace_sq) * 0.2 * 1.177  # trace px -> half-light arcsec
+    return Table({
+        "objectId": np.arange(n),
+        "coord_ra": 53.13 + rng.normal(0, 0.3, n),
+        "coord_dec": -28.10 + rng.normal(0, 0.3, n),
+        "refExtendedness": np.ones(n),
+        "r_cModelFlux": 10 ** rng.uniform(2.6, 4.5, n),
+        "r_ixx": trace_sq, "r_iyy": trace_sq, "r_ixy": np.zeros(n),
+        "r_cModel_exp_reff_major": reff,
+        "r_cModel_exp_reff_minor": 0.7 * reff,
+        "r_cModel_dev_reff_major": reff,
+        "r_cModel_dev_reff_minor": 0.7 * reff,
+        "r_cModel_fracDev": rng.uniform(0, 1, n),
+    })
+
+
 # -- host selection --------------------------------------------------------
 
 
@@ -140,23 +171,14 @@ def test_size_stratification_actually_stratifies():
     in log size hold wildly unequal numbers, and an equal draw from each is what
     actually gets well-resolved hosts into the sample.
     """
-    rng = np.random.default_rng(1)
-    n = 4000
-    size = 10 ** rng.exponential(0.25, n)  # steep, as a real catalogue is
-    t = Table({
-        "objectId": np.arange(n),
-        "coord_ra": 53.13 + rng.normal(0, 0.3, n),
-        "coord_dec": -28.10 + rng.normal(0, 0.3, n),
-        "refExtendedness": np.ones(n),
-        "r_cModelFlux": 10 ** rng.uniform(2.6, 4.5, n),
-        "r_ixx": size, "r_iyy": size, "r_ixy": np.zeros(n),
-    })
-    parent = host_trace_radius_px(select_hosts(t, band="r"), "r")
+    t = _sized_catalogue(4000, seed=1)
+    kw = dict(band="r", min_reff_arcsec=None)  # isolate stratification from the cut
+    parent = host_half_light_arcsec(select_hosts(t, **kw), "r")
     big = np.percentile(parent, 90)
 
-    strat = host_trace_radius_px(select_hosts(t, band="r", n_hosts=50, seed=0), "r")
-    flat = host_trace_radius_px(
-        select_hosts(t, band="r", n_hosts=50, seed=0, size_stratified=False), "r"
+    strat = host_half_light_arcsec(select_hosts(t, n_hosts=50, seed=0, **kw), "r")
+    flat = host_half_light_arcsec(
+        select_hosts(t, n_hosts=50, seed=0, size_stratified=False, **kw), "r"
     )
     assert np.mean(strat > big) > 4 * np.mean(flat > big)
     assert np.median(strat) > np.median(flat)
@@ -165,38 +187,20 @@ def test_size_stratification_actually_stratifies():
 def test_stratification_cannot_invent_large_galaxies():
     """Asking for the whole population must return the whole population, not a
     size-skewed subset of it -- the gain is bounded by what exists."""
-    rng = np.random.default_rng(2)
-    n = 600
-    size = 10 ** rng.exponential(0.25, n)
-    t = Table({
-        "objectId": np.arange(n),
-        "coord_ra": 53.13 + rng.normal(0, 0.3, n),
-        "coord_dec": -28.10 + rng.normal(0, 0.3, n),
-        "refExtendedness": np.ones(n),
-        "r_cModelFlux": 10 ** rng.uniform(2.6, 4.5, n),
-        "r_ixx": size, "r_iyy": size, "r_ixy": np.zeros(n),
-    })
-    everything = len(select_hosts(t, band="r"))
-    assert len(select_hosts(t, band="r", n_hosts=everything)) == everything
+    t = _sized_catalogue(600, seed=2)
+    kw = dict(band="r", min_reff_arcsec=None)
+    everything = len(select_hosts(t, **kw))
+    assert len(select_hosts(t, n_hosts=everything, **kw)) == everything
 
 
 def test_stratification_still_returns_the_number_asked_for():
     """Sparse bins at the large end leave the quota unfilled; the remainder is
     topped up rather than silently returning fewer hosts."""
-    rng = np.random.default_rng(3)
-    n = 3000
-    size = 10 ** rng.exponential(0.3, n)
-    t = Table({
-        "objectId": np.arange(n),
-        "coord_ra": 53.13 + rng.normal(0, 0.3, n),
-        "coord_dec": -28.10 + rng.normal(0, 0.3, n),
-        "refExtendedness": np.ones(n),
-        "r_cModelFlux": 10 ** rng.uniform(2.6, 4.5, n),
-        "r_ixx": size, "r_iyy": size, "r_ixy": np.zeros(n),
-    })
-    available = len(select_hosts(t, band="r"))
+    t = _sized_catalogue(3000, scale=0.3, seed=3)
+    kw = dict(band="r", min_reff_arcsec=None)
+    available = len(select_hosts(t, **kw))
     want = available // 2
-    assert len(select_hosts(t, band="r", n_hosts=want, seed=0)) == want
+    assert len(select_hosts(t, n_hosts=want, seed=0, **kw)) == want
 
 
 def test_point_like_objects_are_dropped():
@@ -320,3 +324,81 @@ def test_extracted_fields_survive_the_conversion():
     assert str(fields.get("band", "?")) == "r"
     assert int(fields.get("tract", -1)) == 5063
     assert int(fields.get("patch", -1)) == 17
+
+
+# -- host size -------------------------------------------------------------
+
+
+def _two_component(exp, dev, frac, band="r"):
+    n = len(exp)
+    return Table({
+        f"{band}_cModel_exp_reff_major": np.asarray(exp, float),
+        f"{band}_cModel_dev_reff_major": np.asarray(dev, float),
+        f"{band}_cModel_fracDev": np.asarray(frac, float),
+    })
+
+
+def test_half_light_follows_the_component_that_has_the_flux():
+    """DP2 publishes no combined cModel radius, and whichever component carries
+    no flux has a radius to match. fracDev is the fit's own statement of how the
+    flux divides, so weighting by it gives the runaway component no say."""
+    t = _two_component(exp=[2.0, 2.0, 2.0], dev=[8.0, 8.0, 8.0], frac=[0.0, 1.0, 0.5])
+    assert host_half_light_arcsec(t, "r") == pytest.approx([2.0, 8.0, 5.0])
+
+
+def test_half_light_is_neither_the_larger_nor_the_smaller_component():
+    """Taking max would admit small galaxies whose unconstrained component ran
+    away; taking min would reject large ones whose component collapsed."""
+    t = _two_component(exp=[0.4], dev=[9.0], frac=[0.05])
+    r = float(host_half_light_arcsec(t, "r")[0])
+    assert 0.4 < r < 9.0 and r == pytest.approx(0.83, abs=0.01)
+
+
+def test_a_missing_component_shifts_the_weight_rather_than_zeroing_it():
+    t = _two_component(exp=[3.0], dev=[np.nan], frac=[0.8])
+    assert host_half_light_arcsec(t, "r") == pytest.approx([3.0])
+
+
+def test_half_light_is_nan_when_neither_component_was_fit():
+    t = _two_component(exp=[np.nan], dev=[np.nan], frac=[0.5])
+    assert np.isnan(host_half_light_arcsec(t, "r")[0])
+
+
+def test_a_missing_fracDev_is_refused_not_guessed():
+    t = _two_component(exp=[1.0], dev=[1.0], frac=[0.5])
+    t.remove_column("r_cModel_fracDev")
+    with pytest.raises(KeyError, match="fracDev"):
+        host_half_light_arcsec(t, "r")
+
+
+def test_minor_axis_is_available_but_not_the_default():
+    t = _catalogue(50)
+    major = host_half_light_arcsec(t, "r", axis="major")
+    minor = host_half_light_arcsec(t, "r", axis="minor")
+    assert np.all(minor < major)
+    with pytest.raises(ValueError):
+        host_half_light_arcsec(t, "r", axis="circularised")
+
+
+def test_small_hosts_are_cut():
+    """The catalogue is dominated by galaxies a pixel or two across, which carry
+    no structure for a prior to learn from."""
+    t = _sized_catalogue(3000, scale=0.6, seed=7)
+    out = select_hosts(t, band="r", min_reff_arcsec=1.0)
+    assert len(out) and np.all(host_half_light_arcsec(out, "r") >= 1.0)
+    assert len(out) < len(select_hosts(t, band="r", min_reff_arcsec=None))
+
+
+def test_the_size_cut_can_be_turned_off():
+    t = _sized_catalogue(3000, scale=0.6, seed=7)
+    loose = select_hosts(t, band="r", min_reff_arcsec=None)
+    assert np.nanmin(host_half_light_arcsec(loose, "r")) < 1.0
+
+
+def test_hosts_without_a_cmodel_fit_do_not_pass_the_size_cut():
+    """NaN is not a size. It must not compare its way through the cut."""
+    t = _sized_catalogue(400, scale=0.6, seed=8)
+    for col in ("r_cModel_exp_reff_major", "r_cModel_dev_reff_major"):
+        t[col][:200] = np.nan
+    out = select_hosts(t, band="r", min_reff_arcsec=1.0)
+    assert len(out) and np.all(np.asarray(out["objectId"]) >= 200)

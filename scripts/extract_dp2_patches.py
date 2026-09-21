@@ -26,6 +26,7 @@ import json
 import logging
 from pathlib import Path
 
+from rubin_host_prior.rubin.quality import MAX_VARIANCE_STEP
 from rubin_host_prior.rubin.extract import (
     COLLECTION,
     ECDFS,
@@ -55,6 +56,18 @@ def main() -> None:
         "translation augmentation",
     )
     p.add_argument("--n-hosts", type=int, default=8000)
+    p.add_argument(
+        "--min-reff-arcsec", type=float, default=1.0,
+        help="host cModel half-light major axis floor. The catalogue is mostly "
+             "galaxies a pixel or two across, which carry no structure to learn",
+    )
+    p.add_argument(
+        "--max-variance-step", type=float, default=MAX_VARIANCE_STEP,
+        help="reject a stamp whose block variance floors differ by more than "
+             "this ratio. Cell-based coadds step in depth at cell edges and no "
+             "mask plane flags it; set high to keep them and cut later from the "
+             "manifest, which records the ratio either way",
+    )
     p.add_argument("--jitter-arcsec", type=float, default=4.0)
     p.add_argument("--patches-per-shard", type=int, default=1024)
     p.add_argument("--max-patches", type=int, default=None)
@@ -79,6 +92,8 @@ def main() -> None:
         bands=args.bands,
         native_size=args.native_size,
         n_hosts=args.n_hosts,
+        min_reff_arcsec=args.min_reff_arcsec,
+        gate_kwargs={"max_variance_step": args.max_variance_step},
         jitter_arcsec=args.jitter_arcsec,
         patches_per_shard=args.patches_per_shard,
         max_patches=args.max_patches,

@@ -15,6 +15,7 @@ from rubin_host_prior.rubin.quality import (
     plane_bitmask,
     plane_fraction,
     plane_fractions,
+    variance_step,
 )
 
 # The DP1 r29.2.0 bit assignments.
@@ -257,3 +258,104 @@ def test_gating_on_an_unpopulated_plane_is_a_no_op():
 
 
 
+
+
+# -- depth steps -----------------------------------------------------------
+#
+# Cell-based coadds build each 150 px cell from its own set of input visits, so
+# the noise level steps across a straight cell edge and no mask plane says so.
+# It is most obvious in y, which has the fewest visits and so the largest
+# fractional step.
+
+
+def _var(step=1.0, frac=0.5, seed=0):
+    """Variance plane whose right-hand `frac` is `step` times deeper."""
+    v = np.full((SIZE, SIZE), SKY**2, dtype=float)
+    v[:, int(SIZE * (1 - frac)):] *= step
+    # Real variance planes are themselves noisy; the floor must not be fooled.
+    return v * np.random.default_rng(seed).lognormal(0.0, 0.05, v.shape)
+
+
+def test_uniform_variance_has_no_step():
+    assert variance_step(_var(1.0)) == pytest.approx(1.0, abs=0.1)
+
+
+@pytest.mark.parametrize("step", [1.3, 2.0, 4.0])
+def test_a_cell_boundary_is_measured_at_its_true_depth_ratio(step):
+    assert variance_step(_var(step)) == pytest.approx(step, rel=0.15)
+
+
+def test_a_step_is_found_wherever_it_falls():
+    """The blocks are not aligned to cells, so a boundary anywhere must show."""
+    for frac in (0.2, 0.35, 0.5, 0.75):
+        assert variance_step(_var(2.0, frac=frac)) > 1.7
+
+
+def _galaxy(sigma_px, peak_over_sky, gain=0.1, seed=0):
+    """An image and the variance plane that goes with it, source Poisson and all."""
+    rng = np.random.default_rng(seed)
+    r2 = (_X - SIZE / 2) ** 2 + (_Y - SIZE / 2) ** 2
+    gal = peak_over_sky * SKY * np.exp(-r2 / (2 * sigma_px**2))
+    var = (SKY**2 + gain * gal) * rng.lognormal(0.0, 0.05, gal.shape)
+    return gal + rng.normal(0.0, 1.0, gal.shape) * np.sqrt(var), var
+
+
+@pytest.mark.parametrize("sigma_px", [4.2, 10.0, 20.0])
+def test_a_bright_galaxy_does_not_fake_a_step(sigma_px):
+    """Sources add their own Poisson variance, and it is one-sided, so it reads
+    as a depth step under any statistic that is not a low envelope.  Rejecting on
+    it would throw away exactly the well-resolved hosts this set is for -- and
+    the biggest galaxies, which are the most wanted, would go first.
+
+    sigma = 20 px is a galaxy wider than a whole block, which no percentile
+    survives; it takes the image to tell source from depth.
+    """
+    image, variance = _galaxy(sigma_px, peak_over_sky=200)
+    assert variance_step(variance, image) < 1.15
+    reasons, _ = gate(image, variance, np.zeros((SIZE, SIZE), np.uint32), PLANES)
+    assert not any(r.startswith("variance_step") for r in reasons)
+
+
+def test_a_step_is_still_found_under_a_bright_galaxy():
+    """Masking the source must not mask the evidence."""
+    image, variance = _galaxy(10.0, peak_over_sky=200)
+    variance[:, SIZE // 2:] *= 2.0
+    image[:, SIZE // 2:] *= np.sqrt(2.0)
+    assert variance_step(variance, image) == pytest.approx(2.0, rel=0.2)
+
+
+def test_no_data_regions_do_not_read_as_depth():
+    """inf variance marks no coverage, including saturated cores; a block that
+    is mostly no-data has no floor to report rather than a wrong one."""
+    v = _var(1.0)
+    v[:40, :40] = np.inf
+    assert variance_step(v) == pytest.approx(1.0, abs=0.1)
+
+
+def test_gate_rejects_a_depth_step_and_records_it():
+    mask = np.zeros((SIZE, SIZE), np.uint32)
+    reasons, diag = gate(_scene(), _var(2.5), mask, PLANES)
+    assert any(r.startswith("variance_step") for r in reasons)
+    assert diag["variance_step"] == pytest.approx(2.5, rel=0.15)
+
+
+def test_gate_records_the_step_even_when_it_passes():
+    """The ratio is in the manifest either way, so the threshold can be retuned
+    without re-reading pixels."""
+    reasons, diag = gate(_scene(), _var(1.2), np.zeros((SIZE, SIZE), np.uint32), PLANES)
+    assert not any(r.startswith("variance_step") for r in reasons)
+    assert diag["variance_step"] == pytest.approx(1.2, rel=0.15)
+
+
+def test_the_depth_gate_can_be_turned_off():
+    reasons, _ = gate(_scene(), _var(4.0), np.zeros((SIZE, SIZE), np.uint32), PLANES,
+                      max_variance_step=np.inf)
+    assert not any(r.startswith("variance_step") for r in reasons)
+
+
+def test_too_few_blocks_is_a_pass_not_a_rejection():
+    """Absence of information is not a defect."""
+    small = np.full((10, 10), SKY**2)
+    assert np.isnan(variance_step(small))
+    reasons, _ = gate(np.zeros((10, 10)), small, np.zeros((10, 10), np.uint32), PLANES)
+    assert not any(r.startswith("variance_step") for r in reasons)
