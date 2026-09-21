@@ -10,9 +10,10 @@ Read the rejection counts in the summary before trusting the set: if bright
 dense centres are being rejected, the training set is biased against the regime
 this project cares about and the gate needs loosening.
 
-Coadds give at most one patch per band per host, so ``--n-hosts`` sets the
-training-set size fairly directly: expect roughly ``n_hosts * len(bands)``
-patches before rejections.
+``--n-hosts`` counts *hosts*, not cutouts: each yields at most one per band and
+the gate rejects a share of those, so 128 hosts is nowhere near 128 cutouts.  Use
+``--n-patches`` to ask for a number of cutouts and let extraction keep drawing
+hosts until it has them.
 
 Early DP2 publishes ``deep_coadd`` and nothing else -- no ``visit_image``, no
 ``difference_image`` -- which suits this project, since the prior trains on
@@ -55,7 +56,22 @@ def main() -> None:
         "patches (56%% of each clears the loss crop) with slack left for "
         "translation augmentation",
     )
-    p.add_argument("--n-hosts", type=int, default=8000)
+    p.add_argument(
+        "--n-hosts", type=int, default=8000,
+        help="hosts per round. Each can yield up to one cutout per band, and the "
+             "gate rejects a share of those, so this is not the size of the "
+             "training set -- see --n-patches",
+    )
+    p.add_argument(
+        "--n-patches", type=int, default=None,
+        help="target number of accepted cutouts. Keeps drawing fresh hosts, in "
+             "batches sized from the yield observed so far, until it has this "
+             "many or the catalogue runs out",
+    )
+    p.add_argument(
+        "--max-rounds", type=int, default=8,
+        help="give up topping up towards --n-patches after this many rounds",
+    )
     p.add_argument(
         "--min-reff-arcsec", type=float, default=1.0,
         help="host cModel half-light major axis floor. The catalogue is mostly "
@@ -92,6 +108,8 @@ def main() -> None:
         bands=args.bands,
         native_size=args.native_size,
         n_hosts=args.n_hosts,
+        n_patches=args.n_patches,
+        max_rounds=args.max_rounds,
         min_reff_arcsec=args.min_reff_arcsec,
         gate_kwargs={"max_variance_step": args.max_variance_step},
         jitter_arcsec=args.jitter_arcsec,

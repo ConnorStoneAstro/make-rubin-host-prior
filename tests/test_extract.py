@@ -23,6 +23,7 @@ from rubin_host_prior.rubin.extract import (
     dedupe_hosts,
     host_half_light_arcsec,
     host_trace_radius_px,
+    next_batch,
     select_hosts,
     stamp_depth,
 )
@@ -493,3 +494,49 @@ def test_depth_is_unknown_rather_than_zero_without_provenance():
     """-1 is 'not measured'; 0 would claim a cell with no visits in it."""
     assert stamp_depth({}, [(0, 0)]) == (-1, -1)
     assert stamp_depth({(0, 0): 30}, []) == (-1, -1)
+
+
+# -- working towards a target ----------------------------------------------
+#
+# n_hosts counts hosts, not cutouts: each yields at most one per band and the
+# gate rejects a share of those. n_patches is the target, and extraction keeps
+# drawing fresh hosts until it has them.
+
+
+def test_excluded_hosts_are_not_offered_again():
+    """Without this the top-up loop re-offers the same objects forever."""
+    t = _sized_catalogue(400, scale=0.6, seed=11)
+    first = select_hosts(t, band="r", n_hosts=20, seed=0)
+    ids = {int(i) for i in first["objectId"]}
+    second = select_hosts(t, band="r", n_hosts=20, seed=0, exclude_ids=ids)
+    assert len(second) == 20
+    assert not (ids & {int(i) for i in second["objectId"]})
+
+
+def test_repeated_rounds_walk_the_catalogue_to_exhaustion():
+    t = _sized_catalogue(300, scale=0.6, seed=12)
+    available = len(select_hosts(t, band="r"))
+    tried, rounds = set(), 0
+    while rounds < 50:
+        rounds += 1
+        got = select_hosts(t, band="r", n_hosts=25, seed=rounds, exclude_ids=tried)
+        if not len(got):
+            break
+        tried |= {int(i) for i in got["objectId"]}
+    assert len(tried) == available and rounds <= 50
+
+
+def test_the_next_batch_is_sized_from_the_observed_yield():
+    """25 cutouts from 100 hosts, 90 still wanted -> ~360 hosts plus headroom."""
+    assert next_batch(100, 100, 25, 90) == pytest.approx(468, abs=1)
+
+
+def test_a_round_that_yielded_nothing_widens_rather_than_dividing_by_zero():
+    assert next_batch(100, 100, 0, 90) == 400
+    assert next_batch(None, 0, 0, 90) == 64
+
+
+def test_the_batch_never_collapses_to_nothing():
+    """A shortfall of one must not ask for zero hosts and spin."""
+    assert next_batch(100, 100, 100, 1) >= 16
+    assert next_batch(100, 100, 100, 0) >= 16

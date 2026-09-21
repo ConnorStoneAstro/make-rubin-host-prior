@@ -433,6 +433,7 @@ def select_hosts(
     max_blendedness: float | None = None,
     n_hosts: int | None = None,
     seed: int = 0,
+    exclude_ids: set[int] | None = None,
     size_stratified: bool = True,
     min_reff_arcsec: float = 1.0,
     min_trace_px: float = 1.75,
@@ -466,6 +467,9 @@ def select_hosts(
     construction.  If the size columns are missing this **raises** rather than
     quietly falling back to a uniform draw.
 
+    ``exclude_ids`` drops hosts that have already been tried, so repeated calls
+    walk through the catalogue rather than re-offering the same objects.
+
     ``min_trace_px`` is a second, non-parametric size floor from the adaptive
     moments, kept as a cross-check against a runaway cModel fit.  It is a DP1-era
     ComCam PSF size; check it against the DP2 PSF before leaning on it.
@@ -480,6 +484,13 @@ def select_hosts(
     t = dedupe_hosts(table, dedupe_radius_arcsec)
 
     keep = np.ones(len(t), dtype=bool)
+    if exclude_ids:
+        # Topping up towards a target: these have already been tried, and
+        # offering them again would either duplicate a stamp or re-earn the same
+        # rejection.
+        keep &= ~np.isin(np.asarray(t["objectId"], dtype=np.int64),
+                         np.fromiter(exclude_ids, dtype=np.int64,
+                                     count=len(exclude_ids)))
     if "refExtendedness" in t.colnames:
         ext = np.asarray(t["refExtendedness"], dtype=float)
         keep &= np.isfinite(ext) & (ext > 0.5)
@@ -739,6 +750,25 @@ def stamp_depth(counts: dict[tuple[int, int], int],
 # -- the driver ------------------------------------------------------------
 
 
+def next_batch(batch: int | None, n_hosts: int, gained: int, shortfall: int,
+               headroom: float = 1.3, blind_growth: int = 4,
+               floor: int = 16) -> int:
+    """How many hosts to ask for in the next round.
+
+    Sized from the yield actually observed rather than from an assumption, since
+    the yield depends on the field, the band set and how tight the gate is, none
+    of which are known in advance.  A round that produced nothing says the
+    estimate is useless, not that the field is empty, so widen the net instead of
+    dividing by zero.
+
+    Always at least ``floor``, so the last few cutouts do not cost a round each.
+    """
+    if n_hosts <= 0 or gained <= 0:
+        return max((batch or floor) * blind_growth, floor)
+    per_host = gained / n_hosts
+    return max(int(np.ceil(max(shortfall, 0) / per_host * headroom)), floor)
+
+
 def extract_patches(
     butler,
     out_dir: str | Path,
@@ -748,6 +778,8 @@ def extract_patches(
     bands: Sequence[str] = BANDS,
     native_size: int = 416,
     n_hosts: int | None = 8000,
+    n_patches: int | None = None,
+    max_rounds: int = 8,
     jitter_arcsec: float = 4.0,
     host_flux_range: tuple[float, float] = (360.0, 36000.0),
     max_blendedness: float | None = None,
@@ -770,6 +802,19 @@ def extract_patches(
     prior trained on centred galaxies learns that galaxies are always centred,
     which is useless for a transient that can sit anywhere in the scene.
 
+    ``n_hosts`` is a number of *hosts*; each can yield up to one cutout per band,
+    and the gate rejects a good share of those, so it does not set the size of
+    the training set.  ``n_patches`` does: it is a target number of accepted
+    cutouts, and extraction keeps drawing fresh batches of hosts -- sized from
+    the yield it has actually observed -- until it has them, the catalogue runs
+    out, or ``max_rounds`` is reached.  ``max_patches`` remains a hard stop that
+    never tops up.
+
+    Topping up is not free of consequences: whatever the gate rejects, it
+    rejects preferentially, so a set filled by several rounds is drawn deeper
+    into the catalogue than one filled by the first.  ``rejection_counts`` in the
+    summary is the thing to read before deciding that is acceptable.
+
     Every attempt is recorded in the manifest, rejections included, with the
     reason and the diagnostics.  Those statistics *are* the selection function,
     and the bias they reveal -- against dense bright centres -- is the regime this
@@ -779,52 +824,41 @@ def extract_patches(
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     gate_kwargs = dict(gate_kwargs or {})
+    # ``n_patches`` is a target to work towards; ``max_patches`` is a hard stop.
+    # Both end the sweep at the same place, only ``n_patches`` tops up.
+    target = n_patches if n_patches is not None else max_patches
 
     log.info("loading object table near (%.4f, %.4f)", ra, dec)
     catalogue = load_object_table(butler, ra, dec, bands=bands)
-    hosts = select_hosts(
-        catalogue,
-        band="r" if "r" in bands else bands[0],
-        flux_range=host_flux_range,
-        max_blendedness=max_blendedness,
-        min_reff_arcsec=min_reff_arcsec,
-        n_hosts=n_hosts,
-        seed=seed,
-    )
-    log.info("selected %d hosts from %d catalogue rows", len(hosts), len(catalogue))
-
-    host_ra = np.asarray(hosts["coord_ra"], dtype=float)
-    host_dec = np.asarray(hosts["coord_dec"], dtype=float)
-    host_id = np.asarray(hosts["objectId"], dtype=np.int64)
-
-    # Jitter once per host, not once per (host, patch): the same physical scene
-    # should be cut the same way in every band.
-    r_jit = jitter_arcsec * np.sqrt(rng.uniform(size=len(hosts)))
-    th_jit = rng.uniform(0, 2 * np.pi, size=len(hosts))
-    cosd = np.maximum(np.cos(np.deg2rad(host_dec)), 1e-6)
-    tgt_ra = host_ra + r_jit * np.cos(th_jit) / 3600.0 / cosd
-    tgt_dec = host_dec + r_jit * np.sin(th_jit) / 3600.0
-
     neighbours = _NeighbourIndex(catalogue, bands)
+
     records: list[dict] = []
     neighbour_rows: list[dict] = []
     mask_mapping: dict[str, int] | None = None
     writer: ShardWriter | None = None
     n_accepted = 0
     acf = AutocorrelationAccumulator(native_size)
-
-    refs = find_coadd_refs(butler, ra, dec, radius_deg, bands)
-    log.info("%d coadd patches overlap the field", len(refs))
     # Tracts and patches overlap at their edges, so a host near a boundary is
     # covered by more than one patch and would otherwise be extracted twice in
     # the same band -- duplicates that a training set would silently weight up.
     seen: set[tuple[int, str]] = set()
+    tried: set[int] = set()
     component_reads_failed = False
     depth_logged = False
     depth_checked = False
     depth_usable = True
 
-    try:
+    refs = list(find_coadd_refs(butler, ra, dec, radius_deg, bands))
+    log.info("%d coadd patches overlap the field", len(refs))
+    # Shuffled, because the sweep stops the moment the target is reached and the
+    # query returns patches ordered by band: left in order, a run that stops
+    # early would be entirely g-band and entirely one corner of the field.
+    rng.shuffle(refs)
+
+    def _sweep(hosts, host_id, tgt_ra, tgt_dec, r_jit):
+        """One pass over every coadd patch for one batch of hosts."""
+        nonlocal writer, mask_mapping, n_accepted, component_reads_failed
+        nonlocal depth_logged, depth_checked, depth_usable
         for ref in refs:
             data_id = ref.dataId
             fields = _data_id_dict(data_id)
@@ -903,7 +937,7 @@ def extract_patches(
                       len(inside))
 
             for h, x, y in inside:
-                if max_patches is not None and n_accepted >= max_patches:
+                if target is not None and n_accepted >= target:
                     raise _Done
                 rec = {**base, "host_id": int(host_id[h]),
                        "host_offset_arcsec": float(r_jit[h])}
@@ -1048,8 +1082,67 @@ def extract_patches(
                 seen.add((int(host_id[h]), band_name))
                 n_accepted += 1
             del coadd
-    except _Done:
-        log.info("reached max_patches=%s", max_patches)
+
+    host_tables = []
+    batch = n_hosts
+    rounds = 0
+    while True:
+        rounds += 1
+        hosts = select_hosts(
+            catalogue,
+            band="r" if "r" in bands else bands[0],
+            flux_range=host_flux_range,
+            max_blendedness=max_blendedness,
+            min_reff_arcsec=min_reff_arcsec,
+            n_hosts=batch,
+            exclude_ids=tried,
+            seed=seed + rounds,
+        )
+        if not len(hosts):
+            log.info("no untried hosts left in the catalogue after %d round(s)",
+                     rounds - 1)
+            break
+        tried.update(int(i) for i in hosts["objectId"])
+        host_tables.append(hosts)
+        log.info("round %d: %d hosts selected from %d catalogue rows",
+                 rounds, len(hosts), len(catalogue))
+
+        host_ra = np.asarray(hosts["coord_ra"], dtype=float)
+        host_dec = np.asarray(hosts["coord_dec"], dtype=float)
+        host_id = np.asarray(hosts["objectId"], dtype=np.int64)
+        # Jitter once per host, not once per (host, patch): the same physical
+        # scene should be cut the same way in every band.
+        r_jit = jitter_arcsec * np.sqrt(rng.uniform(size=len(hosts)))
+        th_jit = rng.uniform(0, 2 * np.pi, size=len(hosts))
+        cosd = np.maximum(np.cos(np.deg2rad(host_dec)), 1e-6)
+        tgt_ra = host_ra + r_jit * np.cos(th_jit) / 3600.0 / cosd
+        tgt_dec = host_dec + r_jit * np.sin(th_jit) / 3600.0
+
+        before = n_accepted
+        try:
+            _sweep(hosts, host_id, tgt_ra, tgt_dec, r_jit)
+        except _Done:
+            log.info("reached the target of %d cutouts", target)
+            break
+        gained = n_accepted - before
+        log.info("round %d: %d cutouts from %d hosts (%.2f per host), %d total",
+                 rounds, gained, len(hosts), gained / max(len(hosts), 1), n_accepted)
+
+        if target is None or n_accepted >= target:
+            break
+        if rounds >= max_rounds:
+            log.warning(
+                "stopping after %d rounds with %d of %d cutouts; raise max_rounds, "
+                "widen --radius-deg, or loosen the gate -- read rejection_counts "
+                "in the summary first", rounds, n_accepted, target,
+            )
+            break
+        batch = next_batch(batch, len(hosts), gained, target - n_accepted)
+
+    if host_tables:
+        hosts = _stack_tables(host_tables)
+    if target is not None and n_accepted < target:
+        log.warning("produced %d of the %d cutouts asked for", n_accepted, target)
 
     paths = writer.close() if writer is not None else []
     acf_result = acf.result()
@@ -1060,6 +1153,8 @@ def extract_patches(
         n_accepted=n_accepted,
         n_shards=len(paths),
         shards=[str(p) for p in paths],
+        n_requested=target,
+        n_rounds=rounds,
         n_hosts=len(hosts),
         n_coadd_patches=len(refs),
         dataset_type=DATASET_TYPE,
@@ -1071,6 +1166,22 @@ def extract_patches(
     )
     (out_dir / "summary.json").write_text(json.dumps(summary, indent=2, default=str))
     return summary
+
+
+def _stack_tables(tables):
+    """Concatenate the per-round host tables, or return the one there is."""
+    if not tables:
+        return None
+    if len(tables) == 1:
+        return tables[0]
+    try:
+        from astropy.table import vstack
+
+        return vstack(tables, join_type="exact")
+    except Exception as exc:  # pragma: no cover - astropy is present in the stack
+        log.warning("could not stack %d host tables (%s); recording the first",
+                    len(tables), exc)
+        return tables[0]
 
 
 def _origin(stamp) -> tuple[int, int]:

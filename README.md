@@ -451,6 +451,30 @@ galaxies and the background is recoverable via `apply_background`. The images ar
 taken **as delivered**, without restoration, and every shard records
 `background_restored=0` so a set made the other way is distinguishable.
 
+### `n_hosts` is not the size of the training set
+
+A host yields at most one cutout per band, and the gate rejects a share of those,
+so `--n-hosts 128` produces nowhere near 128 cutouts — `n_accepted` in the
+summary is the number that actually got written, and the first thing to read
+beside it is `rejection_counts`, which says where the rest went.
+
+`--n-patches` is the number to ask for when you want a training set of a given
+size. Extraction then works towards it: draw a batch of hosts, sweep every coadd
+patch, and if it is still short draw another batch — sized from the yield it has
+actually observed, since that depends on the field, the band set and how tight
+the gate is, none of which are known in advance — excluding hosts already tried.
+It stops when the target is met, the catalogue runs out, or `--max-rounds` is
+reached, and says which. `--max-patches` is the older hard stop and never tops
+up.
+
+Two consequences worth knowing. The patch list is **shuffled**, because the sweep
+stops the moment the target is reached and the butler returns patches ordered by
+band: left in order, a run that stopped early would be entirely g-band and
+entirely one corner of the field. And topping up is not free — whatever the gate
+rejects, it rejects preferentially, so a set filled over several rounds is drawn
+deeper into the catalogue than one filled by the first round. Read
+`rejection_counts` before deciding that is acceptable.
+
 ### Host selection on DP2
 
 The DP2 Object table differs from DP1 in ways that break code silently rather
