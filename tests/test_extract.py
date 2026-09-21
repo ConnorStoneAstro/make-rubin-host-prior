@@ -31,6 +31,9 @@ from rubin_host_prior.rubin.extract import (
     _BearerForPrefix,
     discover_tap_url,
     rsp_token,
+    check_tap_scope,
+    find_token,
+    token_info,
     run_adql,
     _within_radius,
     _write_manifest,
@@ -1022,3 +1025,80 @@ def test_an_unlisted_release_falls_back_rather_than_crashing(monkeypatch):
                                         json=lambda: {"datasets": {}}),
     )
     assert discover_tap_url("dp7") == TAP_URL_FALLBACK
+
+
+# -- why a token was rejected ----------------------------------------------
+
+
+def _response(status=200, payload=None):
+    return SimpleNamespace(
+        status_code=status, ok=200 <= status < 300,
+        json=lambda: payload if payload is not None else {},
+    )
+
+
+def test_the_token_source_is_reported_but_never_the_token(monkeypatch, caplog):
+    """ACCESS_TOKEN is a generic name that other software sets too, and picking
+    up somebody else's value looks exactly like a rejected RSP token."""
+    for var in TOKEN_ENV_VARS:
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setenv("ACCESS_TOKEN", "gt-abcdef.ghijklmnop")
+    with caplog.at_level("INFO"):
+        rsp_token()
+    assert "$ACCESS_TOKEN" in caplog.text
+    assert "gt-..." in caplog.text
+    assert "abcdef" not in caplog.text and "ghijklmnop" not in caplog.text
+
+
+def test_find_token_reports_a_file_source(monkeypatch, tmp_path):
+    for var in TOKEN_ENV_VARS:
+        monkeypatch.delenv(var, raising=False)
+    path = tmp_path / "tok"
+    path.write_text("gt-x.y\n")
+    monkeypatch.setattr("rubin_host_prior.rubin.extract.TOKEN_PATHS", (str(path),))
+    assert find_token() == ("gt-x.y", str(path))
+
+
+def test_a_rejected_token_says_so_before_any_query(monkeypatch):
+    monkeypatch.setattr("rubin_host_prior.rubin.extract.requests.get",
+                        lambda *a, **k: _response(401))
+    with pytest.raises(RuntimeError, match="expired, revoked"):
+        token_info("gt-nope")
+
+
+def _check(info, monkeypatch=None):
+    import rubin_host_prior.rubin.extract as ex
+    real = ex.requests.get
+    ex.requests.get = lambda *a, **k: _response(200, info)
+    try:
+        check_tap_scope("gt-x")
+    finally:
+        ex.requests.get = real
+
+
+def test_a_valid_token_without_the_tap_scope_is_caught_early():
+    """Otherwise this surfaces as a bare 401 from inside a TAP job submission,
+    which says nothing about what to fix."""
+    info = {"username": "cstone", "scopes": ["read:image", "exec:notebook"]}
+    with pytest.raises(RuntimeError, match="read:tap"):
+        _check(info)
+
+
+def test_a_token_with_the_scope_passes():
+    _check({"username": "cstone", "scopes": ["read:tap", "read:image"]})
+
+
+def test_being_unable_to_check_does_not_block_a_run(monkeypatch):
+    """Failing to check a token is not the same as the token being bad."""
+    def boom(*a, **k):
+        raise OSError("no network")
+
+    monkeypatch.setattr("rubin_host_prior.rubin.extract.requests.get", boom)
+    assert token_info("gt-x") == {}
+    check_tap_scope("gt-x")  # must not raise
+
+
+def test_an_unexpected_status_is_not_treated_as_a_rejection(monkeypatch):
+    monkeypatch.setattr("rubin_host_prior.rubin.extract.requests.get",
+                        lambda *a, **k: _response(503))
+    assert token_info("gt-x") == {}

@@ -503,6 +503,15 @@ and in every process listing on a shared machine. It is attached only to request
 whose URL is under the TAP endpoint, because a session-wide header follows
 redirects and one redirect off-host hands the token to whoever answered.
 
+If TAP answers **401**, run `python scripts/check_tap.py`. It separates the four
+things that all present as one 401: no token, a token Gafaelfawr does not
+recognise (expired, revoked, or not an RSP token — `ACCESS_TOKEN` is a generic
+name that other software sets too, which is why the source it came from is
+logged), a valid token without the `read:tap` scope, and a query the service
+refuses. The token value is never printed, only its type prefix. `tap_client`
+runs the scope check itself before submitting anything, so the failure arrives
+with a reason attached rather than as a 401 from inside a job.
+
 TAP needs network, which a batch node may not have. That is what `--host-cache`
 is for: query once where there is a network, cache, and extraction then runs with
 no service at all. `--limit-hosts` puts a `TOP N` on the query.

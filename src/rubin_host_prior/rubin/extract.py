@@ -418,28 +418,92 @@ class _BearerForPrefix(requests.auth.AuthBase):
         return request
 
 
-def rsp_token(token: str | None = None) -> str:
-    """A Gafaelfawr token from the environment or from disk."""
+#: The scope a Gafaelfawr token needs to use TAP.
+TAP_SCOPE = "read:tap"
+
+
+def find_token(token: str | None = None) -> tuple[str, str]:
+    """``(token, where it came from)``.  The source matters: ``ACCESS_TOKEN`` is
+    a generic name that other software sets too, and picking up somebody else's
+    value looks exactly like a rejected RSP token."""
     if token:
-        return token
+        return token, "the caller"
     import os
 
     for var in TOKEN_ENV_VARS:
         if value := os.environ.get(var):
-            return value.strip()
+            return value.strip(), f"${var}"
     for path in TOKEN_PATHS:
         candidate = Path(path).expanduser()
         try:
             if candidate.is_file() and (value := candidate.read_text().strip()):
-                return value
+                return value, str(candidate)
         except OSError:
             continue
     raise RuntimeError(
         "No RSP token found. Make one at https://data.lsst.cloud under Security "
-        "tokens with the 'read:tap' scope, then either export it as ACCESS_TOKEN "
-        f"or save it to ~/.rsp-token (chmod 600). Looked in {TOKEN_ENV_VARS} and "
-        f"{TOKEN_PATHS}. To avoid TAP entirely, use source='butler'."
+        f"tokens with the {TAP_SCOPE!r} scope, then either export it as "
+        "ACCESS_TOKEN or save it to ~/.rsp-token (chmod 600). Looked in "
+        f"{TOKEN_ENV_VARS} and {TOKEN_PATHS}. To avoid TAP entirely, use "
+        "source='butler'."
     )
+
+
+def rsp_token(token: str | None = None) -> str:
+    """A Gafaelfawr token from the environment or from disk."""
+    value, source = find_token(token)
+    # The source and the type prefix, never the token: a Gafaelfawr token is
+    # "gt-<key>.<secret>", so the prefix alone says whether what was found is
+    # even an RSP token, which is the usual answer when ACCESS_TOKEN was set by
+    # something else entirely.
+    log.info("RSP token from %s (looks like %r)", source,
+             value.split("-", 1)[0] + "-...")
+    return value
+
+
+def token_info(token: str, base_url: str = "https://data.lsst.cloud") -> dict:
+    """What Gafaelfawr says about a token: username, scopes, expiry.
+
+    Returns ``{}`` if the question could not be asked -- no network, endpoint
+    moved -- because failing to *check* a token is not the same as the token
+    being bad, and should not stop a run that might have worked.
+    """
+    url = base_url.rstrip("/") + "/auth/api/v1/token-info"
+    try:
+        response = requests.get(url, headers={"Authorization": f"Bearer {token}"},
+                                timeout=15)
+    except Exception as exc:
+        log.debug("could not reach %s: %r", url, exc)
+        return {}
+    if response.status_code in (401, 403):
+        raise RuntimeError(
+            f"Gafaelfawr rejected the token ({response.status_code}). It is "
+            f"expired, revoked, or not an RSP token at all. Make a new one at "
+            f"{base_url} under Security tokens with the {TAP_SCOPE!r} scope."
+        )
+    if not response.ok:
+        log.debug("%s returned %d", url, response.status_code)
+        return {}
+    try:
+        return response.json()
+    except Exception:
+        return {}
+
+
+def check_tap_scope(token: str, base_url: str = "https://data.lsst.cloud") -> None:
+    """Fail now, with the reason, rather than as a 401 inside a TAP job."""
+    info = token_info(token, base_url)
+    if not info:
+        return
+    scopes = list(info.get("scopes") or [])
+    who = info.get("username", "?")
+    if TAP_SCOPE not in scopes:
+        raise RuntimeError(
+            f"The token for {who!r} is valid but has scopes {scopes}, which do "
+            f"not include {TAP_SCOPE!r}. TAP will answer 401. Make a new token "
+            f"at {base_url} under Security tokens with that scope ticked."
+        )
+    log.info("token for %s carries %s", who, TAP_SCOPE)
 
 
 def discover_tap_url(release: str = "dp2",
@@ -477,9 +541,14 @@ def tap_client(release: str = "dp2", url: str | None = None,
             "source='butler' to scan the object tables through the repo instead."
         ) from exc
 
+    from urllib.parse import urlparse
+
     url = url or discover_tap_url(release)
+    value = rsp_token(token)
+    parts = urlparse(url)
+    check_tap_scope(value, f"{parts.scheme}://{parts.netloc}")
     session = requests.Session()
-    session.auth = _BearerForPrefix(rsp_token(token), [url])
+    session.auth = _BearerForPrefix(value, [url])
     log.info("TAP service at %s", url)
     return pyvo.dal.TAPService(url, session=session)
 
