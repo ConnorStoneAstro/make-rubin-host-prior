@@ -25,6 +25,8 @@ from rubin_host_prior.rubin.extract import (
     build_host_catalogue,
     coadd_refs_for_tract,
     read_component,
+    host_adql,
+    run_adql,
     _within_radius,
     _write_manifest,
     cell_visit_counts,
@@ -673,7 +675,7 @@ def _footprint(n_tracts=4, per_tract=300, seed=30):
 def test_the_catalogue_is_built_from_every_object_table():
     tables = _footprint()
     butler = _Butler(tables)
-    pool = build_host_catalogue(butler, min_reff_arcsec=3.0)
+    pool = build_host_catalogue(butler, source="butler", min_reff_arcsec=3.0)
     assert set(butler.reads) == set(tables)
     assert len(pool) and np.all(host_half_light_arcsec(pool) >= 3.0)
 
@@ -682,7 +684,7 @@ def test_only_survivors_are_kept_in_memory():
     """An object table is ~700k rows and the footprint is ~1000 of them, so the
     cuts have to run per tract rather than on a concatenation of all of them."""
     tables = _footprint()
-    pool = build_host_catalogue(_Butler(tables), min_reff_arcsec=3.0)
+    pool = build_host_catalogue(_Butler(tables), source="butler", min_reff_arcsec=3.0)
     assert len(pool) < sum(len(t) for t in tables.values())
 
 
@@ -691,13 +693,13 @@ def test_sampling_does_not_happen_during_the_scan():
     stratify within tracts and not across them. Asking for a sample during the
     scan is refused rather than quietly applied per tract."""
     with pytest.raises(TypeError):
-        build_host_catalogue(_Butler(_footprint()), min_reff_arcsec=None, n_hosts=5)
+        build_host_catalogue(_Butler(_footprint()), source="butler", min_reff_arcsec=None, n_hosts=5)
 
 
 def test_limit_tracts_bounds_a_test_run():
     tables = _footprint(n_tracts=6)
     butler = _Butler(tables)
-    build_host_catalogue(butler, min_reff_arcsec=None, limit_tracts=2)
+    build_host_catalogue(butler, source="butler", min_reff_arcsec=None, limit_tracts=2)
     assert len(set(butler.reads)) == 2
 
 
@@ -713,7 +715,7 @@ def test_a_tract_that_will_not_read_does_not_end_the_scan():
         return real_get(ref, parameters)
 
     butler.get = get
-    pool = build_host_catalogue(butler, min_reff_arcsec=3.0)
+    pool = build_host_catalogue(butler, source="butler", min_reff_arcsec=3.0)
     assert len(pool) and bad not in set(np.asarray(pool["tract"], dtype=int))
 
 
@@ -721,10 +723,10 @@ def test_the_catalogue_is_cached_and_reused(tmp_path):
     """Scanning a thousand object tables takes minutes; it should happen once."""
     tables = _footprint()
     butler = _Butler(tables)
-    first = build_host_catalogue(butler, min_reff_arcsec=3.0,
+    first = build_host_catalogue(butler, source="butler", min_reff_arcsec=3.0,
                                  cache=tmp_path / "hosts.parquet")
     n_reads = len(butler.reads)
-    second = build_host_catalogue(butler, min_reff_arcsec=3.0,
+    second = build_host_catalogue(butler, source="butler", min_reff_arcsec=3.0,
                                   cache=tmp_path / "hosts.parquet")
     assert len(butler.reads) == n_reads  # nothing re-read
     assert len(second) == len(first)
@@ -733,7 +735,7 @@ def test_the_catalogue_is_cached_and_reused(tmp_path):
 def test_nothing_surviving_anywhere_is_an_error_not_an_empty_run():
     tables = _footprint()
     with pytest.raises(RuntimeError, match="min_reff_arcsec"):
-        build_host_catalogue(_Butler(tables), min_reff_arcsec=1e6)
+        build_host_catalogue(_Butler(tables), source="butler", min_reff_arcsec=1e6)
 
 
 def test_coadd_refs_come_from_the_patches_hosts_are_in():
@@ -820,3 +822,123 @@ def test_cells_work_off_a_grid_or_a_coadd():
     grid = _Grid()
     assert cells_in_stamp(grid, 225, 225, 416) == \
         cells_in_stamp(SimpleNamespace(grid=grid), 225, 225, 416)
+
+
+# -- TAP -------------------------------------------------------------------
+#
+# The host cuts are a selection, and a selection is what a query service is for:
+# the footprint is ~10^9 rows and the survivors ~10^4, so filtering there rather
+# than here is the difference between moving the survivors and moving the
+# catalogue. The pixels are the opposite case -- those are already local.
+
+
+class _Job:
+    def __init__(self, service, query):
+        self.service, self.query = service, query
+        self.phase = "PENDING"
+        self.deleted = False
+
+    def run(self):
+        self.phase = "EXECUTING"
+
+    def wait(self, phases=(), timeout=None):
+        self.phase = self.service.end_phase
+
+    def raise_if_error(self):
+        if self.phase == "ERROR":
+            raise RuntimeError("ADQL error: bad column")
+
+    def fetch_result(self):
+        return SimpleNamespace(to_table=lambda: self.service.table)
+
+    def delete(self):
+        self.deleted = True
+
+
+class _Tap:
+    def __init__(self, table, end_phase="COMPLETED"):
+        self.table, self.end_phase = table, end_phase
+        self.jobs = []
+
+    def submit_job(self, query):
+        job = _Job(self, query)
+        self.jobs.append(job)
+        return job
+
+
+def test_the_selective_cuts_go_into_the_query():
+    q = host_adql(bands=("r",), min_reff_arcsec=3.0, flux_range=(360.0, 3.0e6))
+    assert "sersic_reff_major >= 3.0" in q
+    assert "r_cModelFlux > 360.0" in q and "r_cModelFlux <= 3000000.0" in q
+    assert "FROM dp2.Object" in q
+    assert "sersic_reff_major" in q.split("FROM")[0]  # and comes back as a column
+
+
+def test_boolean_flags_stay_out_of_the_query():
+    """How a boolean column compares is backend-specific, and a wrong guess
+    silently returns nothing. They cost nothing to apply locally."""
+    q = host_adql(bands=("r",))
+    assert "sersic_unknown_flag" in q.split("FROM")[0]  # fetched
+    assert "sersic_unknown_flag" not in q.split("WHERE")[1]  # not compared
+
+
+def test_the_query_does_not_sort():
+    """Sorting is expensive on a shared service and the stratified draw has to
+    happen locally anyway."""
+    assert "ORDER BY" not in host_adql()
+
+
+def test_a_region_is_optional():
+    assert "CONTAINS" not in host_adql()
+    assert "CONTAINS" in host_adql(ra=53.13, dec=-28.1, radius_deg=0.3)
+
+
+def test_top_bounds_a_test_query():
+    assert host_adql(top=25).startswith("SELECT TOP 25 ")
+    assert host_adql().startswith("SELECT objectId")
+
+
+def test_tap_results_still_get_the_local_cuts():
+    """The service applied the numeric cuts; the Sersic failure flags, the
+    point-source cross-check and the cross-tract dedupe are not expressible
+    there."""
+    table = _sized_catalogue(200, scale=0.6, seed=40)
+    table["sersic_no_data_flag"][:100] = True
+    pool = build_host_catalogue(tap_service=_Tap(table), min_reff_arcsec=3.0)
+    assert len(pool) and np.all(np.asarray(pool["objectId"]) >= 100)
+
+
+def test_the_tap_job_is_deleted_even_when_it_fails():
+    """An abandoned job sits on a shared service."""
+    service = _Tap(_sized_catalogue(50, seed=41), end_phase="ERROR")
+    with pytest.raises(RuntimeError):
+        build_host_catalogue(tap_service=service, min_reff_arcsec=3.0)
+    assert service.jobs[0].deleted
+
+
+def test_a_job_that_ends_in_an_unexpected_phase_is_an_error():
+    service = _Tap(_sized_catalogue(50, seed=42), end_phase="ABORTED")
+    with pytest.raises(RuntimeError, match="ABORTED"):
+        run_adql(service, "SELECT 1")
+
+
+def test_tap_results_can_be_cached_for_an_offline_run(tmp_path):
+    """A batch node may have no network. Query once where there is one, cache,
+    and extraction runs from the cache with no service at all."""
+    service = _Tap(_sized_catalogue(200, scale=0.6, seed=43))
+    build_host_catalogue(tap_service=service, min_reff_arcsec=3.0,
+                         cache=tmp_path / "hosts.parquet")
+    pool = build_host_catalogue(tap_service=None, butler=None,
+                                min_reff_arcsec=3.0,
+                                cache=tmp_path / "hosts.parquet")
+    assert len(pool) and len(service.jobs) == 1
+
+
+def test_an_unknown_source_is_refused():
+    with pytest.raises(ValueError, match="tap"):
+        build_host_catalogue(source="qserv")
+
+
+def test_the_butler_scan_needs_a_butler():
+    with pytest.raises(ValueError, match="butler"):
+        build_host_catalogue(source="butler")

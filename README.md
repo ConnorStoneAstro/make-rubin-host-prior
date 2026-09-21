@@ -468,14 +468,37 @@ workable sample and almost nothing: big galaxies are rare per square degree, so
 the way to get more of them is more sky, not more draws from the same 0.3°.
 `--radius-deg` still restricts to a field if you want one.
 
-`build_host_catalogue` streams the object tables one tract at a time, applies the
-cuts, and keeps only the survivors, so what is held in memory is the host list
-and not the footprint — an object table is ~700k rows and there are around a
-thousand of them. Sampling deliberately does *not* happen during the scan: a
-stratified draw has to see the whole pool or it stratifies within tracts instead
-of across them, and asking for one during the scan is refused rather than quietly
-applied per tract. Pass `--host-cache` so the scan happens once; delete the file
-if the cuts change. `--limit-tracts` bounds a test run.
+**The host cuts are sent to TAP** (`--host-source tap`, the default). They are a
+selection, and a selection is what a query service is for: the footprint is ~10⁹
+rows and the survivors ~10⁴, so filtering where the catalogue already lives is
+the difference between moving the survivors and moving the catalogue. One ADQL
+query replaces reading every row of ~1000 object tables.
+
+Note this is the opposite conclusion to the *cutout* service, and for the
+symmetric reason. TAP is asked for a selection whose result is tiny; the cutout
+service would be asked to ship pixels that are already on local disk. The right
+question is never "remote or local" but "is the answer smaller than the input".
+
+Only the numeric cuts go into the WHERE clause. The boolean Sersic failure flags
+are fetched and applied locally, because how a boolean compares in ADQL is
+backend-specific and a wrong guess silently returns nothing; the point-source
+cross-check and the cross-tract dedupe are not expressible there either. There is
+no `ORDER BY` — the tutorial is explicit that sorting burdens a shared service,
+and the stratified draw happens locally regardless. The job is submitted async
+and deleted afterwards, including on failure.
+
+TAP needs network and an RSP token, which a batch node may not have. That is what
+`--host-cache` is for: query once where there is a network, cache, and extraction
+then runs with no service at all. `--limit-hosts` puts a `TOP N` on the query.
+
+**`--host-source butler`** is the offline route: scan the object tables through
+the repo instead, one tract at a time, applying the cuts before anything is
+concatenated so what is held is the host list and not the footprint. It reads far
+more but needs nothing beyond the repo. It is not a silent fallback — ask for it.
+`--limit-tracts` bounds a test run.
+
+Sampling deliberately does *not* happen during either scan: a stratified draw has
+to see the whole pool or it stratifies within tracts instead of across them.
 
 The sweep is then **tract-major**, which is what makes the footprint affordable.
 The object table is per tract, so the neighbour index is built once per tract and

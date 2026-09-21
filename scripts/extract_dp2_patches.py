@@ -60,8 +60,21 @@ def main() -> None:
              "if the host cuts change",
     )
     p.add_argument(
+        "--host-source", choices=["tap", "butler"], default="tap",
+        help="where the host list comes from. 'tap' sends the cuts to the TAP "
+             "service as one ADQL query, which is far less work than reading "
+             "every row, but needs network and an RSP token. 'butler' scans the "
+             "object tables through the repo and needs nothing else. Cache the "
+             "result and a later run needs neither",
+    )
+    p.add_argument(
+        "--limit-hosts", type=int, default=None,
+        help="TOP N on the TAP query. For a quick test run",
+    )
+    p.add_argument(
         "--limit-tracts", type=int, default=None,
-        help="scan only this many object tables. For a quick test run",
+        help="scan only this many object tables (--host-source butler). For a "
+             "quick test run",
     )
     p.add_argument("--bands", nargs="+", default=["u", "g", "r", "i", "z", "y"])
     p.add_argument(
@@ -125,7 +138,9 @@ def main() -> None:
         dec=args.dec,
         radius_deg=args.radius_deg,
         host_cache=args.host_cache,
+        host_source=args.host_source,
         limit_tracts=args.limit_tracts,
+        limit_hosts=args.limit_hosts,
         bands=args.bands,
         native_size=args.native_size,
         n_hosts=args.n_hosts,

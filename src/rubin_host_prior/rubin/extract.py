@@ -334,8 +334,93 @@ def find_object_refs(butler, ra: float | None = None, dec: float | None = None,
     return refs
 
 
+#: The TAP-side table.  The host cuts are a selection, and a selection is what a
+#: query service is for: the whole footprint is ~10^9 rows and the survivors are
+#: ~10^4, so the difference between filtering there and filtering here is the
+#: difference between moving the survivors and moving the catalogue.
+TAP_TABLE = "dp2.Object"
+
+
+def host_adql(
+    bands: Sequence[str] = BANDS,
+    band: str = "r",
+    flux_range: tuple[float, float] = (360.0, 3.0e6),
+    min_reff_arcsec: float | None = 3.0,
+    max_blendedness: float | None = None,
+    ra: float | None = None,
+    dec: float | None = None,
+    radius_deg: float | None = None,
+    top: int | None = None,
+) -> str:
+    """The ADQL for the host selection.
+
+    Only the numeric cuts go into the WHERE clause.  The boolean Sersic failure
+    flags are fetched and applied here instead, because how a boolean column
+    compares in ADQL is backend-specific and a wrong guess silently returns
+    nothing; they cost nothing to apply locally on a result this size.  Nor is
+    there an ``ORDER BY``: the tutorial is explicit that sorting is expensive on
+    a shared service, and the stratified draw has to happen locally anyway.
+    """
+    columns = ", ".join(host_columns(bands))
+    where = [f"{band}_cModelFlux > {float(flux_range[0])}",
+             f"{band}_cModelFlux <= {float(flux_range[1])}",
+             "refExtendedness > 0.5"]
+    if min_reff_arcsec is not None:
+        # NaN and NULL both fail a > comparison, which is the behaviour wanted:
+        # an object with no fit is not a large object.
+        where.append(f"sersic_reff_major >= {float(min_reff_arcsec)}")
+    if max_blendedness is not None:
+        where.append(f"{band}_blendedness <= {float(max_blendedness)}")
+    if radius_deg is not None and ra is not None and dec is not None:
+        where.append(
+            "CONTAINS(POINT('ICRS', coord_ra, coord_dec), "
+            f"CIRCLE('ICRS', {float(ra)}, {float(dec)}, {float(radius_deg)})) = 1"
+        )
+    select = f"SELECT TOP {int(top)}" if top else "SELECT"
+    return f"{select} {columns}\nFROM {TAP_TABLE}\nWHERE " + "\n  AND ".join(where)
+
+
+def tap_client(release: str = "dp2"):
+    """The RSP TAP client, with an error that says what to do if it is absent."""
+    try:
+        from lsst.rsp import RSPDiscovery
+    except ImportError as exc:
+        raise RuntimeError(
+            "lsst.rsp is not importable, so the TAP service cannot be reached. "
+            "Run the host query where it is (an RSP notebook or a machine with "
+            "an RSP token), cache the result, and point extraction at the cache; "
+            "or pass source='butler' to scan the object tables instead."
+        ) from exc
+    service = RSPDiscovery(release).get_tap_client()
+    if service is None:
+        raise RuntimeError(f"RSPDiscovery({release!r}) returned no TAP client")
+    return service
+
+
+def run_adql(service, query: str, timeout: float | None = None):
+    """Submit an async ADQL job, wait for it, return an astropy table.
+
+    Async rather than sync because a footprint-wide selection is a long query;
+    the job is deleted afterwards either way, since an abandoned job sits on a
+    shared service.
+    """
+    job = service.submit_job(query)
+    try:
+        job.run()
+        job.wait(phases=["COMPLETED", "ERROR", "ABORTED"], timeout=timeout)
+        if job.phase != "COMPLETED":
+            job.raise_if_error()
+            raise RuntimeError(f"TAP job ended in phase {job.phase}")
+        return job.fetch_result().to_table()
+    finally:
+        try:
+            job.delete()
+        except Exception as exc:  # pragma: no cover - best effort cleanup
+            log.debug("could not delete TAP job: %r", exc)
+
+
 def build_host_catalogue(
-    butler,
+    butler=None,
     bands: Sequence[str] = BANDS,
     band: str = "r",
     ra: float | None = None,
@@ -344,11 +429,26 @@ def build_host_catalogue(
     limit_tracts: int | None = None,
     cache: str | Path | None = None,
     report_every: int = 25,
+    source: str = "tap",
+    tap_service=None,
+    top: int | None = None,
     **cuts,
 ):
     """Host candidates from every object table in reach, cut but not sampled.
 
-    The cuts run per tract and only the survivors are kept, so what is held in
+    Two ways to get there.  ``source="tap"`` sends the cuts to the TAP service as
+    one ADQL query, which is what a query service is for: the footprint is ~10^9
+    rows and the survivors are ~10^4, so the selection belongs where the
+    catalogue already is.  That needs network and an RSP token, which a batch
+    node may not have -- so the result is cached, and extraction can then run
+    from the cache with no network at all.
+
+    ``source="butler"`` is the offline route: scan the object tables through the
+    butler instead.  It reads far more (every row of every tract, column-pruned)
+    but needs nothing beyond the repo.  It is not a fallback that happens
+    silently; ask for it.
+
+    Either way the cuts run before anything is concatenated, so what is held in
     memory is the host list rather than the footprint.  That matters: an object
     table is ~700k rows, and the whole DP2 coadd footprint is around a thousand
     of them.  Sampling deliberately does *not* happen here -- a stratified draw
@@ -369,6 +469,32 @@ def build_host_catalogue(
                      len(table), cache)
             return table
 
+    if source not in ("tap", "butler"):
+        raise ValueError(f"source must be 'tap' or 'butler', not {source!r}")
+
+    if source == "tap":
+        query = host_adql(
+            bands=bands, band=band, ra=ra, dec=dec, radius_deg=radius_deg,
+            top=top,
+            # Only the cuts the query can express; the rest stay local.
+            **{k: v for k, v in cuts.items()
+               if k in ("flux_range", "min_reff_arcsec", "max_blendedness")},
+        )
+        log.info("querying %s:\n%s", TAP_TABLE, query)
+        pool = run_adql(tap_service or tap_client(), query)
+        log.info("TAP returned %d rows", len(pool))
+        # The service applied the numeric cuts; these are the rest -- the Sersic
+        # failure flags, the point-source cross-check, and the dedupe across
+        # tracts, which the query cannot do.
+        pool = select_hosts(pool, band=band, n_hosts=None, **cuts)
+        log.info("host catalogue: %d candidates", len(pool))
+        if cache is not None:
+            _write_table(cache.with_suffix(""), pool)
+            log.info("cached the host catalogue at %s", cache)
+        return pool
+
+    if butler is None:
+        raise ValueError("source='butler' needs a butler")
     refs = find_object_refs(butler, ra, dec, radius_deg, limit=limit_tracts)
     columns = host_columns(bands)
     log.info("building host catalogue from %d object table(s)%s", len(refs),
@@ -901,7 +1027,10 @@ def extract_patches(
     n_patches: int | None = None,
     max_rounds: int = 8,
     host_cache: str | Path | None = None,
+    host_source: str = "tap",
+    tap_service=None,
     limit_tracts: int | None = None,
+    limit_hosts: int | None = None,
     jitter_arcsec: float = 4.0,
     host_flux_range: tuple[float, float] = (360.0, 3.0e6),
     max_blendedness: float | None = None,
@@ -953,7 +1082,8 @@ def extract_patches(
     field = build_host_catalogue(
         butler, bands=bands, band="r" if "r" in bands else bands[0],
         ra=ra, dec=dec, radius_deg=radius_deg, limit_tracts=limit_tracts,
-        cache=host_cache,
+        cache=host_cache, source=host_source, tap_service=tap_service,
+        top=limit_hosts,
         flux_range=host_flux_range, max_blendedness=max_blendedness,
         min_reff_arcsec=min_reff_arcsec,
     )
