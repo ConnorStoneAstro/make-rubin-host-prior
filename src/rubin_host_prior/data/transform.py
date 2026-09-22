@@ -1,7 +1,14 @@
 """Flux <-> log-space transform.
 
-    forward:  x = log( softplus(f / s_band) ) / c        softplus(u) = log(1 + e^u)
-    model:    f = s_band * exp(c * x)                    strictly positive
+    soften:   f_s = s_band * softplus(f / s_band)        softplus(u)=log(1+e^u)
+    forward:  x   = log(f_s / s_band) / c
+    model:    f   = s_band * exp(c * x)                  strictly positive
+
+The softening is written as ``s * softplus(f / s)`` because that form has one
+parameter, it is a flux, and above it the map is the identity: bright pixels
+pass through untouched and the entire adjustment is confined to the low and
+negative regime.  ``s * exp(c * forward(f))`` reproduces it exactly, so the
+model can express the softened data and nothing else.
 
 ``s_band`` is a per-band *softening* scale in nJy, ``softening_sigma`` times the
 pooled sky noise of that band.
@@ -30,12 +37,18 @@ nothing else:
   so no clipping, no point mass, no NaN, and no bound on how negative an input
   pixel may be.
 
-The cost is a pedestal: the model's sky sits at ``softplus(0) * s = 0.693 * s``
-rather than at zero.  That is why ``softening_sigma`` defaults to 1 -- it keeps
-the pedestal at 0.69 sigma, below the noise it is replacing.  Raising it buys a
-tighter, less skewed noise distribution in ``x`` at the price of a pedestal that
-climbs above the noise, and of pushing the flux at which the exponential becomes
-accurate proportionately higher.
+**The softening suppresses the sky, and that is the point.**  With ``s`` at two
+sigma of the pooled noise, pixels within the noise are compressed towards a
+common pedestal at ``softplus(0) * s = 1.39 sigma`` while anything detected is
+untouched.  The prior is meant to describe what a galaxy looks like, not what
+this particular realisation of the sky looked like, and a prior that reproduces
+noise faithfully is spending capacity on a thing the likelihood already models.
+
+``softening_sigma`` is that scale in units of the measured per-band noise, and
+is the knob.  Lower values preserve the noise distribution more faithfully at
+the cost of a skewed, heavy-tailed ``x``; higher values flatten the sky harder
+and push the flux at which the exponential map becomes accurate proportionately
+up.  Two is a deliberate choice to suppress rather than to preserve.
 
 An ELU-style softening was considered and rejected: ``ELU(u) + 1`` leaves a
 permanent ``+s`` offset on positive flux (still 3.3% high at ``f = 30 s``),
@@ -89,16 +102,44 @@ def _xp(a):
     return np
 
 
-def log_softplus(u, xp=None):
-    """``log(log(1 + e^u))``, stable across the whole real line.
+def softplus(u, xp=None):
+    """``log(1 + e^u)``, from the library rather than by hand.
 
-    ``softplus`` is computed as ``max(u, 0) + log1p(exp(-|u|))`` so it never
-    overflows, and the ``u < -20`` branch covers the region where softplus
-    underflows to zero and its log is simply ``u``.
+    ``jax.nn.softplus`` on a jax array and ``numpy.logaddexp(0, u)`` otherwise.
+    Both are the stable formulation; neither overflows.
     """
     xp = _xp(u) if xp is None else xp
-    safe = xp.maximum(u, 0.0) + xp.log1p(xp.exp(-xp.abs(u)))
-    return xp.where(u < _LINEAR_BELOW, u, xp.log(xp.where(safe > 0, safe, 1.0)))
+    if xp is not np:
+        import jax.nn
+
+        return jax.nn.softplus(u)
+    return np.logaddexp(0.0, u)
+
+
+def soften(flux, scale, xp=None):
+    """``scale * softplus(flux / scale)``: nJy in, nJy out.
+
+    The scale is the only parameter, and it is a flux.  Above it the map is the
+    identity -- ``softplus(u) -> u`` exponentially fast, so bright pixels pass
+    through with the adjustment confined to the low and negative regime, which
+    is the whole point of writing it this way.  Below it the map bends over and
+    approaches zero from above without ever reaching it.
+    """
+    xp = _xp(flux) if xp is None else xp
+    return scale * softplus(flux / scale, xp)
+
+
+def log_softplus(u, xp=None):
+    """``log(softplus(u))``, stable across the whole real line.
+
+    The instability here belongs to the logarithm, not to softplus: for
+    ``u < -745`` softplus underflows to zero in float64 and its log is ``-inf``.
+    Since ``log(softplus(u)) -> u`` in that limit, the branch below ``-20``
+    returns ``u`` directly, and is exact to 1e-9 there.
+    """
+    xp = _xp(u) if xp is None else xp
+    sp = softplus(u, xp)
+    return xp.where(u < _LINEAR_BELOW, u, xp.log(xp.where(sp > 0, sp, 1.0)))
 
 
 @dataclass(frozen=True)

@@ -31,11 +31,11 @@ catalogue:
 # What each cutout is.  native_size is deliberately larger than the training
 # crop: that slack is what the loader translates within, and since extraction
 # centres every stamp on its host, it is the only source of decentring.  At
-# native 416 and a 384 crop the host stays within +-16 native px (3.2") of the
-# centre; widen native_size if the model should see hosts further off-centre.
+# native 512 and a 384 crop the host moves within +-64 native px, 12.8", which
+# is most of the way to the frame edge.
 stamps:
   bands: [u, g, r, i, z, y]
-  native_size: 416
+  native_size: 512
   patches_per_shard: 1024
   neighbour_radius_arcsec: 30.0
 

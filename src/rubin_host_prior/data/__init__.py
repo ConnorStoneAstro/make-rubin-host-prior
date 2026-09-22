@@ -4,7 +4,7 @@ from .diagnostics import autocorrelation, context_advice, correlation_length
 from .pooling import area_resample, block_mean, center_crop, pool_to_training_grid
 from .shards import META_DTYPES, ShardSet, ShardWriter
 from .transform import (LogFluxTransform, estimate_band_softening,
-                        expected_sky_scatter, log_softplus,
+                        expected_sky_scatter, log_softplus, soften, softplus,
                         measure_pooled_sky_noise)
 
 __all__ = [
@@ -23,6 +23,8 @@ __all__ = [
     "correlation_length",
     "dihedral",
     "log_softplus",
+    "soften",
+    "softplus",
     "measure_pooled_sky_noise",
     "pool_shards",
     "estimate_band_softening",

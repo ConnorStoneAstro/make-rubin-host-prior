@@ -63,14 +63,15 @@ class TransformConfig:
     ones that are there rather than over the ones extraction was asked for.
 
     ``s_band = softening_sigma * pooled sky noise`` sets where the softening
-    turns over.  See ``data.transform`` for the full rationale; in brief, 1.0
-    keeps the sky pedestal (``0.693 * s``) below the noise it replaces while
-    making ``inverse`` accurate to 0.1% above 5 sigma.
+    turns over, and is the knob that decides how hard the sky is flattened.  At
+    2.0 the pedestal sits at 1.39 sigma and pixels within the noise are
+    compressed towards it: the prior describes the galaxy rather than this
+    realisation of the sky, which is what the likelihood is for.
     """
 
     band_softening: dict[str, float] = field(default_factory=dict)  # nJy, per band
     log_scale: float = 1.0  # "c" above
-    softening_sigma: float = 1.0  # s_band = softening_sigma * pooled sky noise
+    softening_sigma: float = 2.0  # s_band = softening_sigma * pooled sky noise
 
 
 @dataclass
@@ -90,7 +91,7 @@ class PatchConfig:
     every sub-pixel phase.
     """
 
-    native_size: int = 416  # pixels cut from the visit image
+    native_size: int = 512  # pixels cut from the coadd
     nominal_crop: int = 384  # native pixels feeding one training image
     out_size: int = 128  # nominal_crop / pool_factor; the reference size
     pool_factor: int = 3

@@ -14,6 +14,8 @@ from rubin_host_prior.data import (
     dihedral,
     estimate_band_softening,
     log_softplus,
+    soften,
+    softplus,
     pool_shards,
     pool_to_training_grid,
     random_dihedral,
@@ -749,3 +751,36 @@ def test_shards_whose_bands_the_config_never_saw_are_refused(shard_dir):
     with pytest.raises(ValueError, match="no softening scale"):
         PatchDataset.from_shards(
             ss, config, LogFluxTransform.from_config(config.transform))
+
+
+def test_the_softening_is_the_identity_above_its_scale():
+    """`s * softplus(f/s)` has one parameter, it is a flux, and above it the map
+    is the identity: bright pixels pass through untouched and the whole
+    adjustment is confined to the low and negative regime."""
+    s = 24.0
+    bright = np.array([5.0, 10.0, 100.0, 1e4]) * s
+    assert soften(bright, s) == pytest.approx(bright, rel=1e-2)
+    assert soften(np.array([10.0 * s]), s) == pytest.approx([10.0 * s], rel=1e-4)
+
+    # Below the scale it bends over and approaches zero from above, without
+    # reaching it and without a floor.
+    faint = np.array([-10.0, -5.0, -2.0, -1.0, 0.0]) * s
+    out = soften(faint, s)
+    assert np.all(out > 0) and np.all(np.diff(out) > 0)
+    assert soften(np.array([0.0]), s)[0] == pytest.approx(s * np.log(2.0))
+
+
+def test_softplus_comes_from_the_library_and_agrees_across_backends():
+    """numpy.logaddexp and jax.nn.softplus are the stable formulations; the
+    hand-rolled branch that used to be here was only ever needed for the *log*
+    of softplus, which is a different function's problem."""
+    jnp = pytest.importorskip("jax.numpy")
+
+    u = np.array([-800.0, -50.0, -1.0, 0.0, 1.0, 50.0, 800.0])
+    got = softplus(u)
+    assert np.all(np.isfinite(got))
+    assert got[-1] == pytest.approx(800.0, rel=1e-9)   # no overflow
+    assert got[3] == pytest.approx(np.log(2.0))
+    assert np.allclose(np.asarray(softplus(jnp.asarray(u))), got, atol=1e-4)
+    # log(softplus(u)) -> u far negative, where softplus itself underflows.
+    assert log_softplus(u)[0] == pytest.approx(-800.0)

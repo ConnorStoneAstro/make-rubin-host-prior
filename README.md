@@ -334,57 +334,46 @@ decades of score magnitude. Set `sigma_scaling="none"` for the unmodified energy
 
 ### The log-space transform
 
-```
-forward (data):   x = log( softplus(f / s_band) ) / c       softplus(u) = log(1 + e^u)
-model map:        f = s_band · exp(c · x)                   strictly positive
-```
+    soften:   f_s = s_band * softplus(f / s_band)       softplus(u) = log(1+e^u)
+    forward:  x   = log(f_s / s_band) / c
+    model:    f   = s_band * exp(c * x)                 strictly positive
 
-`s_band = softening_sigma × σ_pooled` is a per-band *softening* scale in nJy.
+The softening is written as `s · softplus(f/s)` because that form has **one**
+parameter, it is a flux, and above it the map is the identity: `softplus(u) → u`
+exponentially fast, so bright pixels pass through untouched and the entire
+adjustment is confined to the low and negative regime. `softplus` itself comes
+from the library — `jax.nn.softplus`, or `numpy.logaddexp(0, u)` — rather than
+being hand-rolled. The one branch that remains belongs to the *logarithm*, not
+to softplus: below `u = -745` softplus underflows in float64 and its log is
+`-inf`, where `log(softplus(u)) → u` is exact to 1e-9.
 
-**These two are deliberately not inverses, and that is the point.** A source
-cannot emit negative flux, so the prior's reachable domain in flux space must be
-strictly positive — hence the plain exponential, which maps all of ℝ to `(0, ∞)`.
-Measured flux, by contrast, *is* negative wherever noise dips below the
-subtracted sky, and the right thing to do with those pixels is carry them
-smoothly toward zero rather than represent them faithfully.
+`s · exp(c · forward(f))` reproduces the softened flux exactly, so the entire
+discrepancy between the data and what the model can express is the softening and
+nothing else.
 
-`s·exp(c·forward(f))` equals `softplus_s(f)` exactly, so the entire discrepancy
-between the data and what the model can express is the softening and nothing
-else. Three consequences:
+**The softening suppresses the sky, and that is the point.** With `s` at two
+sigma of the pooled per-band noise, pixels within the noise are compressed
+towards a pedestal at `softplus(0)·s = 1.39σ` while anything detected is
+untouched. The prior is meant to describe what a galaxy looks like, not what
+this realisation of the sky looked like — and a prior that reproduces noise
+faithfully spends capacity on something the likelihood already models. This is a
+deliberate reversal: the transform used to soften at 1σ specifically to keep the
+noise distribution intact.
 
-- **Bright flux passes through untouched.** `softplus(u) → u` exponentially
-  fast: within 1.6% at `f = 3s`, 0.1% at `5s`, exact in double precision by
-  `10s`. Anything detected is represented far inside its own photometric error.
-- **Negative flux vanishes smoothly.** `softplus(u) → e^u`, so `x → f/s`: the
-  negative tail is *linear* in flux, which keeps Gaussian pixel noise Gaussian
-  instead of compressing it. (A `√(f²+4s²)` style softening fails here — it goes
-  as `−log|f|` and distorts the noise.)
-- **There is no floor anywhere.** `softplus` is strictly positive on all of ℝ, so
-  no clipping, no point mass, no NaN, and **no bound on how negative an input
-  pixel may be**. Background over-subtraction of any depth is representable.
+`softening_sigma` is that scale in units of the measured noise, and is the knob.
+Lower preserves the noise more faithfully at the cost of a skewed, heavy-tailed
+`x`; higher flattens the sky harder and pushes the flux at which the exponential
+map becomes accurate proportionately up (0.1% above 5σ at `softening_sigma = 1`,
+above 10σ at 2).
 
-The cost is a pedestal: the model's sky sits at `softplus(0)·s = 0.693·s` rather
-than zero. That is why `softening_sigma` defaults to **1.0** — it keeps the
-pedestal at 0.69σ, below the noise it replaces, while making the exponential map
-accurate to 0.1% above 5σ. Raising it buys a tighter, less skewed noise
-distribution in `x` at the price of a pedestal climbing above the noise and a
-proportionately higher flux threshold for accuracy.
-
-An **ELU-style softening was considered and rejected**: `ELU(u) + 1` leaves a
-permanent `+s` offset on positive flux — still 3.3% high at `f = 30s` — whereas
+A source cannot emit negative flux, so the prior's reachable domain in flux space
+must be strictly positive — hence the plain exponential, which maps all of ℝ to
+(0, ∞). The data transform is therefore **not** exactly invertible, and should
+not be: measured flux *is* negative wherever noise takes it below the subtracted
+sky, and the right thing to do with those pixels is let them approach zero
+smoothly. An ELU-style softening was considered and rejected: `ELU(u)+1` leaves a
+permanent `+s` offset on positive flux (still 3.3% high at `f = 30s`), whereas
 softplus converges to the identity exponentially.
-
-`inverse_exact` undoes `forward` exactly (to ~10⁻¹⁵), including negative flux,
-for round-trip checks. `inverse` is what a forward model calls.
-
-A forward model in log space needs no Jacobian: generate the scene in `x`, map to
-flux with `inverse`, compare to the data. `jacobian` is simply `c·f` if you ever
-want a density in flux units.
-
-Check `stats()["sky_scatter"]` against `expected_sky_scatter(softening_sigma)`
-(= `0.721 / (softening_sigma · c)`); a large disagreement means the per-band
-softening scales are wrong, which would put the bands on different footings and
-break the single band-agnostic prior. `prepare_config.py` does this for you.
 
 ### Pooling in flux, then log — not the other way round
 
