@@ -708,3 +708,24 @@ def test_a_shard_missing_a_metadata_column_is_refused(shard_dir, tmp_path):
         del f["meta"]["sky_noise"]
     with pytest.raises(ValueError, match="sky_noise"):
         ShardSet.from_dir(copy)
+
+
+def test_a_band_with_no_patches_gets_no_softening_scale():
+    """The scale is measured, so a band the shards never saw has nothing to
+    measure.  Inventing one would put its turnover wherever the guess landed."""
+    from rubin_host_prior.data.transform import measure_pooled_sky_noise
+
+    rng = np.random.default_rng(0)
+    pooled = rng.normal(0.0, 12.0, (40, 16, 16))
+    bands = np.zeros(40, dtype=int)          # everything in u
+    got = measure_pooled_sky_noise(pooled, bands, BANDS)
+    assert set(got) == {"u"} and got["u"] == pytest.approx(12.0, rel=0.1)
+
+
+def test_a_config_prepared_without_a_band_says_which_shard_set_it_came_from():
+    """The old message told you to run the script that was raising it."""
+    with pytest.raises(ValueError, match="no patches in"):
+        LogFluxTransform.from_config(
+            TransformConfig(band_softening={"u": 12.0, "g": 11.0}), BANDS)
+    with pytest.raises(ValueError, match="prepare_config"):
+        LogFluxTransform.from_config(TransformConfig(band_softening={}), BANDS)

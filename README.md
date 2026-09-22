@@ -112,6 +112,14 @@ pixel variance sits in the zero-lag noise delta; the estimator renormalises at
 lag 1 to exclude it, because a naive 1/e crossing on the raw profile returns
 ξ ≈ 1 regardless of galaxy size (measured: wrong by 4×).
 
+The softening scale is **measured per band**, so a band the shards contain no
+patches in gets no scale, and the transform is built over the bands the data
+actually has rather than the ones extraction was asked for — inventing a scale
+for an absent band would put its turnover wherever the guess landed. The script
+prints the patch count per band and says so when one is empty; a band missing
+entirely usually means the run hit its `--n-patches` target before reaching it,
+or that no coadds exist for those tracts.
+
 ### 4. Train
 
 ```bash

@@ -34,6 +34,14 @@ from rubin_host_prior.data import (
 )
 
 
+def _band_counts(shards) -> dict[str, int]:
+    """How many patches each band actually contributed."""
+    import numpy as np
+
+    idx = np.asarray(shards.meta["band_idx"], dtype=int)
+    return {b: int(np.sum(idx == i)) for i, b in enumerate(shards.bands)}
+
+
 def main() -> None:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--shards", required=True, help="directory of *.h5 shards")
@@ -67,7 +75,28 @@ def main() -> None:
         bands=shards.bands,
     )
 
-    transform = LogFluxTransform.from_config(config.transform, shards.bands)
+    # The softening is measured per band, so a band with no patches gets no
+    # scale.  Build the transform over the bands the shards actually contain
+    # rather than over the bands extraction was asked for: inventing a scale for
+    # an absent band would put its turnover wherever the guess landed.
+    counts = _band_counts(shards)
+    present = tuple(b for b in shards.bands if counts.get(b, 0) > 0)
+    absent = [b for b in shards.bands if b not in present]
+    print("patches per band: " + ", ".join(
+        f"{b}={counts.get(b, 0)}" for b in shards.bands))
+    if absent:
+        print(f"  NOTE: no patches in {absent}; the config covers {list(present)} "
+              f"only. Check the manifest's rejection_counts -- a band missing "
+              f"entirely is usually a run that stopped at its target before "
+              f"reaching it, or coadds that do not exist for those tracts.")
+    unmeasured = [b for b in present if b not in config.transform.band_softening]
+    if unmeasured:
+        raise ValueError(
+            f"bands {unmeasured} have patches but no measurable sky noise; "
+            f"their patches are probably all source or all masked"
+        )
+
+    transform = LogFluxTransform.from_config(config.transform, present)
     dataset = PatchDataset.from_shards(shards, config, transform)
     stats = dataset.stats(args.n_stats)
     sigma_min, sigma_max = suggest_sigma_range(stats)
@@ -75,7 +104,8 @@ def main() -> None:
     config.sde.sigma_max = round(sigma_max, 3)
     config.save(args.out)
 
-    print(json.dumps({"n_patches": len(shards), "stats": stats,
+    print(json.dumps({"n_patches": len(shards),
+                      "patches_per_band": counts, "stats": stats,
                       "band_softening_nJy": config.transform.band_softening,
                       "sigma_min": config.sde.sigma_min,
                       "sigma_max": config.sde.sigma_max}, indent=2))
@@ -83,7 +113,7 @@ def main() -> None:
     # The correlation length, measured on the pooled log-space patches the model
     # actually sees.  This is the authoritative version -- the one in the
     # extraction summary is native-resolution flux and is contaminated by the PSF.
-    t = LogFluxTransform.from_config(config.transform, shards.bands)
+    t = LogFluxTransform.from_config(config.transform, present)
     ss = config.transform.softening_sigma
     print(f"\nlog transform:  x = log(softplus(f/s))/c,  model map f = s*exp(c*x)")
     print(f"  softening s = {ss:.2f} x pooled sky noise")

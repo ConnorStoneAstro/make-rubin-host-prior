@@ -58,6 +58,10 @@ class TransformConfig:
     flux goes negative wherever noise takes it below the subtracted sky, and
     those pixels are smoothly carried towards zero instead.
 
+    ``band_softening`` doubles as the band list: a band with no measured scale
+    is a band the shards had no patches in, and the transform is built over the
+    ones that are there rather than over the ones extraction was asked for.
+
     ``s_band = softening_sigma * pooled sky noise`` sets where the softening
     turns over.  See ``data.transform`` for the full rationale; in brief, 1.0
     keeps the sky pedestal (``0.693 * s``) below the noise it replaces while

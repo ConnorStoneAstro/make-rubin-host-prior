@@ -110,9 +110,16 @@ class LogFluxTransform:
     def from_config(cls, config: TransformConfig, bands: tuple[str, ...] = BANDS):
         missing = [b for b in bands if b not in config.band_softening]
         if missing:
+            have = sorted(config.band_softening)
             raise ValueError(
-                f"no softening scale for band(s) {missing}; run "
-                f"scripts/prepare_config.py on the shards first"
+                f"no softening scale for band(s) {missing}. "
+                + (f"The config has scales for {have}, so it was prepared "
+                   f"against a shard set that had no patches in {missing} -- "
+                   f"build the transform over the bands the data actually has, "
+                   f"or re-run scripts/prepare_config.py on the current shards."
+                   if have else
+                   "The config has no scales at all; run "
+                   "scripts/prepare_config.py on the shards first.")
             )
         return cls(
             softening=tuple(float(config.band_softening[b]) for b in bands),
