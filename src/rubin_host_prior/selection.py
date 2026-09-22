@@ -271,7 +271,12 @@ class Stamps:
     #: decentring comes from now that extraction centres on the host.
     native_size: int = 416
     patches_per_shard: int = 1024
-    #: Catalogue radius for the neighbour covariates, arcsec.
+    #: Record what sits near each host: how many objects, the brightest, the
+    #: nearest galaxy and star.  Covariates only -- nothing trains on them --
+    #: and they cost one ~700k-row object-table read per tract that yields a
+    #: stamp.  With hosts drawn thinly across the footprint that is most of the
+    #: runtime, so it is off unless asked for.
+    neighbours: bool = False
     neighbour_radius_arcsec: float = 30.0
 
 

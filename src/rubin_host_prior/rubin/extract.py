@@ -61,6 +61,8 @@ from __future__ import annotations
 
 import json
 import logging
+import time
+from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Iterable, Sequence
@@ -1316,6 +1318,7 @@ def extract_patches(
     patches_per_shard: int = 1024,
     max_patches: int | None = None,
     neighbour_radius_arcsec: float = 30.0,
+    neighbours_wanted: bool = False,
     seed: int = 0,
     prefix: str = "patches",
 ) -> dict:
@@ -1361,20 +1364,22 @@ def extract_patches(
     # Both end the sweep at the same place, only ``n_patches`` tops up.
     target = n_patches if n_patches is not None else max_patches
 
-    field = build_host_catalogue(
-        butler,
-        bands=bands,
-        cuts=selection.hosts,
-        ra=ra,
-        dec=dec,
-        radius_deg=radius_deg,
-        limit_tracts=limit_tracts,
-        cache=host_cache,
-        source=host_source,
-        tap_service=tap_service,
-        tap_url=tap_url,
-        top=limit_hosts,
-    )
+    clock = Stopwatch()
+    with clock("host catalogue"):
+        field = build_host_catalogue(
+            butler,
+            bands=bands,
+            cuts=selection.hosts,
+            ra=ra,
+            dec=dec,
+            radius_deg=radius_deg,
+            limit_tracts=limit_tracts,
+            cache=host_cache,
+            source=host_source,
+            tap_service=tap_service,
+            tap_url=tap_url,
+            top=limit_hosts,
+        )
 
     records: list[dict] = []
     neighbour_rows: list[dict] = []
@@ -1398,6 +1403,7 @@ def extract_patches(
     #: Every cell of every patch swept, so the run can report its own depth
     #: rather than whichever patch happened to be visited first.
     all_visit_counts: list[int] = []
+    n_tracts_swept = 0
 
     def depth_logged_once() -> bool:
         """True after the first time the per-cell depth line has been printed."""
@@ -1418,7 +1424,7 @@ def extract_patches(
         component, a mask plane quietly absent -- are indistinguishable from
         working until you look at the clock or the training set.
         """
-        nonlocal writer, mask_mapping, n_accepted, n_refs
+        nonlocal writer, mask_mapping, n_accepted, n_refs, n_tracts_swept
         nonlocal depth_checked, depth_usable, n_empty_patches, n_matched_patches
 
         by_patch: dict[tuple[int, int], list[int]] = {}
@@ -1433,10 +1439,29 @@ def extract_patches(
 
         for tract in tracts:
             want = [pa for (t, pa) in by_patch if t == tract]
-            refs = coadd_refs_for_tract(butler, tract, want, bands)
+            with clock("coadd ref queries"):
+                refs = coadd_refs_for_tract(butler, tract, want, bands)
             rng.shuffle(refs)
             n_refs += len(refs)
-            neighbours = _neighbour_index(butler, tract, neighbour_cols, bands)
+            n_tracts_swept += 1
+            log.info("tract %d (%d/%d): %d refs, %d cutouts so far%s",
+                     tract, n_tracts_swept, len(tracts), len(refs), n_accepted,
+                     f" of {target}" if target else "")
+
+            # Lazily, and once per tract.  An object table is ~700k rows, and
+            # building this eagerly meant paying for one in every tract whose
+            # hosts all turned out to be rejected -- which, with hosts drawn
+            # thinly across the footprint, was most of the runtime, for
+            # covariates that nothing trains on.
+            neighbours = None
+
+            def _neighbours(_tract=tract):
+                nonlocal neighbours
+                if neighbours is None:
+                    with clock("neighbour object tables"):
+                        neighbours = _neighbour_index(butler, _tract,
+                                                      neighbour_cols, bands)
+                return neighbours
 
             for ref in refs:
                 fields = _data_id_dict(ref.dataId)
@@ -1459,9 +1484,11 @@ def extract_patches(
                 # Components only: no pixels move until a host is known to land
                 # inside the cells.  `bounds` and the cell grid come off the PSF,
                 # which is where CellCoadd reads them from too.
-                wcs = read_component(butler, ref, "wcs")
-                bounds = read_component(butler, ref, "psf").bounds
-                visit_counts = cell_visit_counts(read_component(butler, ref, "provenance"))
+                with clock("component reads"):
+                    wcs = read_component(butler, ref, "wcs")
+                    bounds = read_component(butler, ref, "psf").bounds
+                    visit_counts = cell_visit_counts(
+                        read_component(butler, ref, "provenance"))
                 if visit_counts:
                     all_visit_counts.extend(visit_counts.values())
                     log.log(
@@ -1537,7 +1564,11 @@ def extract_patches(
                         continue
 
                     # One read, of just these pixels.
-                    stamp = butler.get(ref, parameters={"bbox": _stamp_box(x, y, native_size)})
+                    with clock("stamp pixels"):
+                        stamp = butler.get(
+                            ref,
+                            parameters={"bbox": _stamp_box(x, y, native_size)},
+                        )
                     image = np.asarray(_attr(stamp, "image").array, dtype=np.float32)
                     if image.shape != (native_size, native_size):
                         rec.update(status="rejected", reasons=f"clipped:{image.shape}")
@@ -1565,15 +1596,16 @@ def extract_patches(
                         depth_ratio = np.inf  # a cell with no visits at all
                     else:
                         depth_ratio = None  # provenance carried no such cell
-                    reasons, diag = gate(
-                        image,
-                        variance,
-                        packed,
-                        mask_mapping,
-                        cell_depth_ratio=depth_ratio,
-                        n_visits=n_lo,
-                        **gate_kwargs,
-                    )
+                    with clock("gate"):
+                        reasons, diag = gate(
+                            image,
+                            variance,
+                            packed,
+                            mask_mapping,
+                            cell_depth_ratio=depth_ratio,
+                            n_visits=n_lo,
+                            **gate_kwargs,
+                        )
                     rec.update({f"diag_{k}": v for k, v in diag.items()})
                     if reasons:
                         rec.update(status="rejected", reasons=";".join(reasons))
@@ -1601,13 +1633,13 @@ def extract_patches(
                             },
                         )
 
-                    nb = neighbours.near(
+                    nb = _neighbours().near(
                         float(tgt_ra[h]),
                         float(tgt_dec[h]),
                         neighbour_radius_arcsec,
                         band_name,
                         host_id=int(host_id[h]),
-                    )
+                    ) if neighbours_wanted else []
                     others = [n for n in nb if not n["is_host"]]
                     gal = [n["sep_arcsec"] for n in others if n["extendedness"] > 0.5]
                     star = [n["sep_arcsec"] for n in others if n["extendedness"] <= 0.5]
@@ -1714,21 +1746,29 @@ def extract_patches(
     summary = _write_manifest(out_dir, records, neighbour_rows)
     summary.update(
         release="DP2",
-        n_accepted=n_accepted,
-        n_shards=len(paths),
+        # A *host* is a catalogue object.  A *stamp* is one cutout of one host
+        # in one band, so a single host yields up to len(bands) of them -- which
+        # is why stamps_attempted is several times hosts_selected, and why
+        # subtracting rejections from it does not give back the hosts asked for.
+        counts={
+            "host_candidates_in_catalogue": len(field),
+            "hosts_selected": len(tried),
+            "hosts_that_reached_a_patch": len(attempted),
+            "hosts_whose_stamp_fitted_nowhere": never,
+            "stamps_attempted": summary["n_attempts"],
+            "stamps_accepted": n_accepted,
+            "stamps_rejected": summary["n_rejected"],
+            "stamps_requested": target,
+            "coadd_patches_read": n_refs,
+            "patches_holding_a_host": n_matched_patches,
+            "patches_holding_none": n_empty_patches,
+            "rounds": rounds,
+            "shards_written": len(paths),
+        },
+        seconds=clock.summary(),
         shards=[str(p) for p in paths],
-        n_requested=target,
-        n_rounds=rounds,
-        n_hosts_tried=len(tried),
-        n_hosts_attempted=len(attempted),
-        n_hosts_no_stamp_fitted=never,
         visits_per_cell=_distribution(all_visit_counts),
-        n_patches_with_hosts=n_matched_patches,
-        n_patches_without_hosts=n_empty_patches,
         field_radius_deg=radius_deg,
-        n_host_candidates=len(field),
-        n_hosts=len(hosts),
-        n_coadd_patches=n_refs,
         dataset_type=DATASET_TYPE,
         mask_plane_dict=mask_mapping,
         correlation_length_native_flux_px=acf_result["xi"],
@@ -1736,8 +1776,74 @@ def extract_patches(
         correlation_length_n_patches=acf_result["n_patches"],
         correlation_profile_native_flux=acf_result["profile"],
     )
+    summary.pop("n_attempts", None)
+    summary.pop("n_rejected", None)
     (out_dir / "summary.json").write_text(json.dumps(summary, indent=2, default=str))
+    log.info("\n%s", describe_summary(summary))
     return summary
+
+
+class Stopwatch:
+    """Cumulative wall time per stage.
+
+    A run that takes half an hour with no output is a run you cannot tune.
+    These totals go into the summary, so the answer to "what is it doing" is a
+    measurement rather than a guess.
+    """
+
+    def __init__(self) -> None:
+        self.totals: dict[str, float] = {}
+
+    @contextmanager
+    def __call__(self, name: str):
+        start = time.perf_counter()
+        try:
+            yield
+        finally:
+            self.totals[name] = (self.totals.get(name, 0.0)
+                                 + time.perf_counter() - start)
+
+    def summary(self) -> dict[str, float]:
+        return {k: round(v, 1) for k, v in
+                sorted(self.totals.items(), key=lambda kv: -kv[1])}
+
+
+def describe_summary(summary: dict) -> str:
+    """The run in a dozen lines, in the units the numbers are actually in.
+
+    A host is a catalogue object; a stamp is one cutout of one host in one band.
+    Keeping the two words apart is most of what makes the counts readable.
+    """
+    c = summary.get("counts", {})
+    lines = [
+        f"{c.get('hosts_selected', 0)} hosts selected from "
+        f"{c.get('host_candidates_in_catalogue', 0)} candidates, in "
+        f"{c.get('rounds', 0)} round(s)",
+        f"  {c.get('hosts_that_reached_a_patch', 0)} reached a patch; "
+        f"{c.get('hosts_whose_stamp_fitted_nowhere', 0)} fitted inside none",
+        f"{c.get('stamps_attempted', 0)} stamps attempted "
+        f"(one host x one band) -> {c.get('stamps_accepted', 0)} written, "
+        f"{c.get('stamps_rejected', 0)} rejected",
+    ]
+    reasons = summary.get("rejection_counts") or {}
+    if reasons:
+        top = ", ".join(f"{k} {v}" for k, v in list(reasons.items())[:5])
+        lines.append(f"  most common reasons: {top}")
+        lines.append("  (a stamp can fail several gates, so these sum to more "
+                     "than the rejections)")
+    lines.append(
+        f"{c.get('coadd_patches_read', 0)} coadd patches read, "
+        f"{c.get('patches_holding_a_host', 0)} of which held a host")
+    depth = summary.get("visits_per_cell") or {}
+    if depth:
+        lines.append(f"depth: {depth.get('min')}-{depth.get('max')} visits per "
+                     f"cell, median {depth.get('p50')}, over {depth.get('n')} cells")
+    seconds = summary.get("seconds") or {}
+    if seconds:
+        total = sum(seconds.values())
+        spend = ", ".join(f"{k} {v:.0f}s" for k, v in seconds.items())
+        lines.append(f"time: {total:.0f}s total -- {spend}")
+    return "\n".join(lines)
 
 
 def _distribution(values) -> dict:

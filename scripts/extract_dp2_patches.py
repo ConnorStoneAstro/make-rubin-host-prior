@@ -23,7 +23,11 @@ import logging
 from pathlib import Path
 
 from rubin_host_prior.selection import ExtractionConfig
-from rubin_host_prior.rubin.extract import extract_patches, open_butler
+from rubin_host_prior.rubin.extract import (
+    describe_summary,
+    extract_patches,
+    open_butler,
+)
 
 #: Shipped with the repository, not generated.
 DEFAULT_CONFIG = Path(__file__).resolve().parent.parent / "extraction.yaml"
@@ -60,6 +64,7 @@ def main() -> None:
         native_size=config.stamps.native_size,
         patches_per_shard=config.stamps.patches_per_shard,
         neighbour_radius_arcsec=config.stamps.neighbour_radius_arcsec,
+        neighbours_wanted=config.stamps.neighbours,
         host_source=config.catalogue.source,
         host_cache=config.catalogue.cache,
         limit_hosts=config.catalogue.limit_hosts,
@@ -74,6 +79,8 @@ def main() -> None:
         selection=config,
     )
     print(json.dumps(summary, indent=2, default=str))
+    print()
+    print(describe_summary(summary))
 
     if not args.no_plots:
         # Extraction-side figures only: the loader figures need the softening

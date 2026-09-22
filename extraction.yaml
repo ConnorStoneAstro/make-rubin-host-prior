@@ -37,13 +37,18 @@ stamps:
   bands: [u, g, r, i, z, y]
   native_size: 512
   patches_per_shard: 1024
+  # Record what sits near each host.  Covariates only -- nothing trains on
+  # them -- and they cost one ~700k-row object-table read per tract that yields
+  # a stamp, which with hosts drawn thinly across the footprint is most of the
+  # runtime.  Off unless you want them.
+  neighbours: false
   neighbour_radius_arcsec: 30.0
 
 # How much to do.  n_hosts counts hosts, not cutouts: each yields at most one
 # per band and the gate rejects a share of those.  n_patches is a target the run
 # works towards, drawing fresh hosts until it has them.
 run:
-  n_hosts: 200
+  n_hosts: 1000
   n_patches: null
   max_patches: null
   max_rounds: 8

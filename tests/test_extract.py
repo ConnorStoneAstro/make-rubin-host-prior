@@ -114,7 +114,7 @@ def test_a_run_produces_the_stamps_asked_for_reading_only_their_pixels(
     """
     summary = _run(butler, tmp_path)
 
-    assert summary["n_accepted"] == 12
+    assert summary["counts"]["stamps_accepted"] == 12
     assert butler.reads["bbox"] == 12 and butler.reads["whole"] == 0
     # Components are cheap and per patch, not per stamp.
     assert butler.reads["component"] < butler.reads["bbox"]
@@ -126,7 +126,7 @@ def test_a_run_produces_the_stamps_asked_for_reading_only_their_pixels(
     assert shards.load("image").shape == (12, 416, 416)
     assert (tmp_path / "hosts.parquet").exists()
     assert (tmp_path / "manifest.parquet").exists()
-    assert summary["n_rejected"] == 0
+    assert summary["counts"]["stamps_rejected"] == 0
 
 
 def test_only_the_image_is_stored(butler, tmp_path):
@@ -178,7 +178,7 @@ def test_stamps_over_cells_that_were_never_built_are_rejected(monkeypatch,
 
     summary = _run(butler, tmp_path, n_patches=None, n_hosts=40)
     manifest = pd.read_parquet(tmp_path / "manifest.parquet")
-    assert summary["n_accepted"] > 0
+    assert summary["counts"]["stamps_accepted"] > 0
     # Nothing from the emptied tract, and nothing crashed getting there.
     assert (manifest[manifest["status"] == "accepted"]["tract"] == 5064).all()
 
@@ -192,7 +192,7 @@ def test_a_shallow_coadd_is_rejected_when_asked(monkeypatch, tmp_path):
     summary = _run(butler, tmp_path, n_patches=None,
                    selection=Selection(hosts=HostCuts(**_LOOSE),
                                        patches=PatchCuts(min_visits=10)))
-    assert summary["n_accepted"] == 0
+    assert summary["counts"]["stamps_accepted"] == 0
     assert "too_shallow" in summary["rejection_counts"]
 
 
@@ -780,3 +780,46 @@ def test_the_run_summary_survives_a_field_with_no_provenance(butler, tmp_path):
     butler.get = no_prov
     with pytest.raises(RuntimeError):
         _run(butler, tmp_path)
+
+
+def test_the_summary_says_what_it_counts(butler, tmp_path):
+    """A host is a catalogue object; a stamp is one cutout of one host in one
+    band.  n_hosts_tried and n_hosts_attempted read as the same thing and were
+    not, and stamps_attempted minus rejections never gave back the hosts asked
+    for because those are different units."""
+    summary = _run(butler, tmp_path)
+    c = summary["counts"]
+
+    assert c["stamps_attempted"] == c["stamps_accepted"] + c["stamps_rejected"]
+    assert c["hosts_that_reached_a_patch"] + c["hosts_whose_stamp_fitted_nowhere"] \
+        == c["hosts_selected"]
+    assert c["patches_holding_a_host"] + c["patches_holding_none"] <= \
+        c["coadd_patches_read"]
+    # One host yields up to len(bands) stamps, which is the whole confusion.
+    assert c["stamps_attempted"] >= c["hosts_that_reached_a_patch"]
+
+    from rubin_host_prior.rubin.extract import describe_summary
+
+    text = describe_summary(summary)
+    assert "hosts selected" in text and "stamps attempted" in text
+    assert "one host x one band" in text
+    assert "time:" in text
+
+
+def test_the_run_reports_where_its_time_went(butler, tmp_path):
+    """Half an hour with no output is a run you cannot tune."""
+    summary = _run(butler, tmp_path)
+    seconds = summary["seconds"]
+    assert {"host catalogue", "component reads", "stamp pixels"} <= set(seconds)
+    assert all(v >= 0 for v in seconds.values())
+
+
+def test_neighbour_covariates_are_off_by_default_and_cost_nothing(butler, tmp_path):
+    """They cost one ~700k-row object-table read per tract that yields a stamp,
+    for numbers nothing trains on."""
+    _run(butler, tmp_path)
+    without = butler.reads["object"]      # the catalogue scan, and only that
+
+    butler.reads["object"] = 0
+    _run(butler, tmp_path / "with", neighbours_wanted=True)
+    assert butler.reads["object"] > without

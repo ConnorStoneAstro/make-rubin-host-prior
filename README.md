@@ -60,6 +60,30 @@ as provenance only: at native resolution the small lags are dominated by the PSF
 and the log transform changes the correlation structure. The number to act on is
 the pooled, log-space one from step 2.
 
+### Reading `summary.json`
+
+A **host** is a catalogue object. A **stamp** is one cutout of one host in one
+band, so a single host yields up to `len(bands)` of them — which is why
+`stamps_attempted` is several times `hosts_selected`, and why subtracting
+rejections from it does not give back the hosts you asked for. The `counts`
+block keeps the two words apart:
+
+| key | means |
+|---|---|
+| `host_candidates_in_catalogue` | rows that passed the host cuts |
+| `hosts_selected` | drawn from those, across all rounds |
+| `hosts_that_reached_a_patch` | had a stamp attempted somewhere |
+| `hosts_whose_stamp_fitted_nowhere` | the rest: too near a coverage edge |
+| `stamps_attempted` | rows in the manifest |
+| `stamps_accepted` / `stamps_rejected` | written / gated away |
+| `coadd_patches_read` | refs swept |
+| `patches_holding_a_host` | of those, the ones a host landed in |
+
+`rejection_counts` counts **every** reason a stamp failed, so it sums to more
+than `stamps_rejected`; `first_rejection_counts` is one reason each. `seconds`
+says where the wall time went. The same thing is printed in prose at the end of
+a run.
+
 ### 2. Look at the diagnostic figures
 
 Extraction writes them automatically to `<out>/diagnostics` (`--no-plots` to

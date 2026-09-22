@@ -67,7 +67,7 @@ def _save(fig, out: Path | None, name: str) -> Path | None:
 # -- raw cutouts -----------------------------------------------------------
 
 
-def plot_cutouts(shards, n: int = 25, seed: int = 0, out: Path | None = None):
+def plot_cutouts(shards, n: int = 100, seed: int = 0, out: Path | None = None):
     """Grid of native-resolution stamps, stretched in units of their sky noise.
 
     Each panel is ``asinh(flux / sky_noise)``, so a faint u-band patch and a deep

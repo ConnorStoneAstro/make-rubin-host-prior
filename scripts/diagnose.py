@@ -67,17 +67,18 @@ def _read_table(path: Path | None):
 
 
 def main() -> None:
-    p = argparse.ArgumentParser(description=__doc__,
-                                formatter_class=argparse.RawDescriptionHelpFormatter)
+    p = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
     p.add_argument("--shards", required=True, help="directory of *.h5 shards")
     p.add_argument("--out", default=None, help="default: <shards>/../diagnostics")
-    p.add_argument("--config", default=None,
-                   help="config JSON; without it the loader figures are skipped")
+    p.add_argument(
+        "--config", default=None, help="config JSON; without it the loader figures are skipped"
+    )
     p.add_argument("--hosts", default=None, help="default: <shards>/../hosts.parquet")
-    p.add_argument("--manifest", default=None,
-                   help="default: <shards>/../manifest.parquet")
+    p.add_argument("--manifest", default=None, help="default: <shards>/../manifest.parquet")
     p.add_argument("--band", default="r", help="band for the magnitude panel")
-    p.add_argument("--n-cutouts", type=int, default=25)
+    p.add_argument("--n-cutouts", type=int, default=100)
     p.add_argument("--seed", type=int, default=0)
     args = p.parse_args()
 
@@ -90,8 +91,10 @@ def main() -> None:
 
     hosts = _read_table(_find(args.hosts, "hosts", root, shard_dir))
     manifest = _read_table(_find(args.manifest, "manifest", root, shard_dir))
-    print(f"  hosts table: {'found' if hosts is not None else 'not found'}"
-          f"   manifest: {'found' if manifest is not None else 'not found'}")
+    print(
+        f"  hosts table: {'found' if hosts is not None else 'not found'}"
+        f"   manifest: {'found' if manifest is not None else 'not found'}"
+    )
 
     dataset = None
     if args.config:
@@ -101,7 +104,9 @@ def main() -> None:
             # here so the loader figures are still available.
             pooled, pooled_bands = pool_shards(shards, config, n=512)
             config.transform.band_softening = estimate_band_softening(
-                pooled, pooled_bands, config.transform.softening_sigma,
+                pooled,
+                pooled_bands,
+                config.transform.softening_sigma,
                 bands=shards.bands,
             )
         dataset = PatchDataset.from_shards(
@@ -111,8 +116,14 @@ def main() -> None:
         print("no --config: skipping the loader figures")
 
     written = plots.make_all(
-        shards, dataset=dataset, hosts=hosts, manifest=manifest,
-        out_dir=out, band=args.band, n_cutouts=args.n_cutouts, seed=args.seed,
+        shards,
+        dataset=dataset,
+        hosts=hosts,
+        manifest=manifest,
+        out_dir=out,
+        band=args.band,
+        n_cutouts=args.n_cutouts,
+        seed=args.seed,
     )
     for path in written:
         print(f"  wrote {path}")
