@@ -51,8 +51,7 @@ def _grid(n: int):
 
 def _show(ax, img, vmin=None, vmax=None, cmap="magma"):
     ax.set_axis_off()
-    return ax.imshow(img, origin="lower", cmap=cmap, vmin=vmin, vmax=vmax,
-                     interpolation="nearest")
+    return ax.imshow(img, origin="lower", cmap=cmap, vmin=vmin, vmax=vmax, interpolation="nearest")
 
 
 def _save(fig, out: Path | None, name: str) -> Path | None:
@@ -128,12 +127,18 @@ def plot_training_batch(dataset, n: int = 25, seed: int = 0, out: Path | None = 
         if k < n:
             im = _show(ax, x[k], lo, hi, cmap="viridis")
     if im is not None:
-        fig.colorbar(im, ax=np.atleast_1d(axes).ravel().tolist(),
-                     fraction=0.02, pad=0.01, label="x (log space)")
+        fig.colorbar(
+            im,
+            ax=np.atleast_1d(axes).ravel().tolist(),
+            fraction=0.02,
+            pad=0.01,
+            label="x (log space)",
+        )
     size = x.shape[-1]
     sizes = dataset.config.patch.training_sizes
-    also = (f"; also cycles {', '.join(str(s) for s in sizes if s != size)}"
-            if len(sizes) > 1 else "")
+    also = (
+        f"; also cycles {', '.join(str(s) for s in sizes if s != size)}" if len(sizes) > 1 else ""
+    )
     fig.suptitle(
         f"training batch as the loader yields it: {size}x{size}, pooled "
         f"{dataset.config.patch.pool_factor}x, log space, augmented{also}",
@@ -164,11 +169,18 @@ def plot_transform(dataset, n: int = 4, seed: int = 0, out: Path | None = None):
     gs = fig.add_gridspec(n + 1, 3, height_ratios=[1] * n + [1.25])
     for k in range(n):
         sigma = noise[k] if np.isfinite(noise[k]) and noise[k] > 0 else 1.0
-        for col, (img, title, cmap, asinh) in enumerate((
-            (np.arcsinh(native[k] / sigma), "native flux (asinh, $\\sigma$ units)", "magma", True),
-            (np.arcsinh(pooled[k] / sigma), "pooled flux (asinh)", "magma", True),
-            (logged[k], "x = log(softplus(f/s))", "viridis", False),
-        )):
+        for col, (img, title, cmap, asinh) in enumerate(
+            (
+                (
+                    np.arcsinh(native[k] / sigma),
+                    "native flux (asinh, $\\sigma$ units)",
+                    "magma",
+                    True,
+                ),
+                (np.arcsinh(pooled[k] / sigma), "pooled flux (asinh)", "magma", True),
+                (logged[k], "x = log(softplus(f/s))", "viridis", False),
+            )
+        ):
             ax = fig.add_subplot(gs[k, col])
             if asinh:
                 lo = _ASINH_VMIN
@@ -182,22 +194,26 @@ def plot_transform(dataset, n: int = 4, seed: int = 0, out: Path | None = None):
     ax = fig.add_subplot(gs[n, :])
     allx = dataset.make_batch(
         np.sort(rng.choice(len(dataset), size=min(256, len(dataset)), replace=False)),
-        rng=None, augment=False,
+        rng=None,
+        augment=False,
     )[:, 0].ravel()
     ax.hist(allx, bins=200, color="0.3")
     sky = dataset.transform.sky_level
     ss = dataset.config.transform.softening_sigma
-    ax.axvline(sky, color="crimson", lw=1.2,
-               label=f"zero flux: x = log(log 2) = {sky:.2f}")
+    ax.axvline(sky, color="crimson", lw=1.2, label=f"zero flux: x = log(log 2) = {sky:.2f}")
     scatter = expected_sky_scatter(ss, dataset.config.transform.log_scale)
-    ax.axvspan(sky - scatter, sky + scatter, color="crimson", alpha=0.15,
-               label=f"predicted sky scatter $\\pm${scatter:.2f}")
+    ax.axvspan(
+        sky - scatter,
+        sky + scatter,
+        color="crimson",
+        alpha=0.15,
+        label=f"predicted sky scatter $\\pm${scatter:.2f}",
+    )
     ax.set_yscale("log")
     ax.set_xlabel("x (log space)")
     ax.set_ylabel("pixels")
     ax.legend(fontsize=8)
-    ax.set_title("pixel-value distribution: sky should sit in the red band",
-                 fontsize=9)
+    ax.set_title("pixel-value distribution: sky should sit in the red band", fontsize=9)
     fig.suptitle("transform chain: native flux -> pooled -> log space", fontsize=10)
     fig.tight_layout()
     return fig, _save(fig, out, "transform")
@@ -259,8 +275,15 @@ def plot_hosts(shards, hosts=None, band: str = "r", out: Path | None = None):
         scale = float(np.nanmedian(meta["pixel_scale"])) if len(meta["pixel_scale"]) else 0.2
         if set(mom) <= cols:
             ixx, iyy, ixy = (np.asarray(hosts[c], dtype=float) for c in mom)
-            panels.append(("host distortion", _distortion(ixx, iyy, ixy), 40,
-                           "$|e| = (1-q^2)/(1+q^2)$", False))
+            panels.append(
+                (
+                    "host distortion",
+                    _distortion(ixx, iyy, ixy),
+                    40,
+                    "$|e| = (1-q^2)/(1+q^2)$",
+                    False,
+                )
+            )
             # Prefer the half-light radius, which DP2 gives directly in arcsec
             # and which the size cut is made on; fall back to the moments trace
             # converted with the pixel scale.
@@ -272,8 +295,7 @@ def plot_hosts(shards, hosts=None, band: str = "r", out: Path | None = None):
             flux = np.asarray(hosts[fcol], dtype=float)
             with np.errstate(invalid="ignore", divide="ignore"):
                 mag = -2.5 * np.log10(np.where(flux > 0, flux, np.nan)) + 31.4
-            panels.append((f"host magnitude ({band})", mag, 40,
-                           f"{band} cModel mag", False))
+            panels.append((f"host magnitude ({band})", mag, 40, f"{band} cModel mag", False))
         # The one panel that would have made the blob investigation
         # unnecessary: surface brightness against the sky it has to be seen
         # above.  A population piled up to the right of the line is runaway
@@ -281,43 +303,83 @@ def plot_hosts(shards, hosts=None, band: str = "r", out: Path | None = None):
         if {"sersic_reff_major", "sersic_reff_minor", f"{band}_cModelFlux"} <= cols:
             from rubin_host_prior.rubin.extract import host_mu_e
 
-            panels.append(("host surface brightness", host_mu_e(hosts, band), 40,
-                           r"$\mu_e$ (mag/arcsec$^2$), sky $\approx$ 27", False))
+            panels.append(
+                (
+                    "host surface brightness",
+                    host_mu_e(hosts, band),
+                    40,
+                    r"$\mu_e$ (mag/arcsec$^2$), sky $\approx$ 27",
+                    False,
+                )
+            )
         if "sersic_index" in cols:
             # n ~ 1 is a disc, n ~ 4 an elliptical: the two kinds of host this
             # prior is meant to cover, so the balance between them matters.
-            panels.append(("host Sersic index",
-                           np.asarray(hosts["sersic_index"], dtype=float), 40,
-                           "n (1 = exponential, 4 = de Vaucouleurs)", False))
+            panels.append(
+                (
+                    "host Sersic index",
+                    np.asarray(hosts["sersic_index"], dtype=float),
+                    40,
+                    "n (1 = exponential, 4 = de Vaucouleurs)",
+                    False,
+                )
+            )
         bcol = f"{band}_blendedness"
         if bcol in cols:
-            panels.append(("host blendedness", np.asarray(hosts[bcol], dtype=float),
-                           40, "fraction of flux from neighbours", False))
+            panels.append(
+                (
+                    "host blendedness",
+                    np.asarray(hosts[bcol], dtype=float),
+                    40,
+                    "fraction of flux from neighbours",
+                    False,
+                )
+            )
 
     panels.append(("local sky noise", meta["sky_noise"], 40, "nJy / native pixel", False))
     if "variance_step" in meta:
         # 1.0 is a uniform stamp; a tail above it is depth stepping across a
         # coadd cell edge, which is what the gate is set against.
-        panels.append(("variance step", np.asarray(meta["variance_step"], dtype=float),
-                       40, "max/min block variance floor", False))
-    panels.append(("nearest galaxy", meta["nearest_galaxy_arcsec"], 40,
-                   "arcsec", False))
+        panels.append(
+            (
+                "variance step",
+                np.asarray(meta["variance_step"], dtype=float),
+                40,
+                "max/min block variance floor",
+                False,
+            )
+        )
+    panels.append(("nearest galaxy", meta["nearest_galaxy_arcsec"], 40, "arcsec", False))
     panels.append(("nearest star", meta["nearest_star_arcsec"], 40, "arcsec", False))
-    panels.append(("neighbours in frame", np.asarray(meta["n_neighbours"], dtype=float),
-                   30, "count within search radius", False))
+    panels.append(
+        (
+            "neighbours in frame",
+            np.asarray(meta["n_neighbours"], dtype=float),
+            30,
+            "count within search radius",
+            False,
+        )
+    )
     if "n_visits_min" in meta:
         # Exposure times are equal, so this is the depth of the shallowest cell
         # the stamp covers, straight from the coadd provenance.
         n_lo = np.asarray(meta["n_visits_min"], dtype=float)
         if np.any(n_lo > 0):
-            panels.append(("visits in shallowest cell", n_lo[n_lo > 0], 30,
-                           "distinct visits", False))
+            panels.append(
+                ("visits in shallowest cell", n_lo[n_lo > 0], 30, "distinct visits", False)
+            )
     if "n_cells_spanned" in meta:
         # Each 150 px coadd cell has its own input visits, so depth and PSF step
         # at cell edges.  Anything above 1 means the stamp contains such a step.
-        panels.append(("coadd cells spanned", np.asarray(meta["n_cells_spanned"],
-                                                         dtype=float),
-                       20, "150 px cells per stamp", False))
+        panels.append(
+            (
+                "coadd cells spanned",
+                np.asarray(meta["n_cells_spanned"], dtype=float),
+                20,
+                "150 px cells per stamp",
+                False,
+            )
+        )
     # DP2 covariates: recorded, never gated on.  Worth looking at, because if
     # INEXACT_PSF or REJECTED covers most of the accepted stamps then the PSF
     # the forward model relies on is approximate over most of the training set.
@@ -367,9 +429,7 @@ def plot_rejections(manifest, band: str = "r", out: Path | None = None):
     """
     plt = _plt()
     status = np.asarray(manifest["status"] if "status" in manifest else [])
-    reasons = np.asarray(
-        manifest["reasons"] if "reasons" in manifest else [""] * len(status)
-    )
+    reasons = np.asarray(manifest["reasons"] if "reasons" in manifest else [""] * len(status))
     accepted = status == "accepted"
 
     fig, axes = plt.subplots(1, 2, figsize=(12, 4.2))
@@ -387,23 +447,26 @@ def plot_rejections(manifest, band: str = "r", out: Path | None = None):
     else:
         axes[0].text(0.5, 0.5, "nothing rejected", ha="center", va="center")
         axes[0].set_axis_off()
-    axes[0].set_title(
-        f"rejection reasons ({int((~accepted).sum())} of {len(status)})", fontsize=10
-    )
+    axes[0].set_title(f"rejection reasons ({int((~accepted).sum())} of {len(status)})", fontsize=10)
 
     key = "diag_sky_noise"
     if key in manifest:
         v = np.asarray(manifest[key], dtype=float)
         bins = np.histogram_bin_edges(v[np.isfinite(v)], bins=40)
-        axes[1].hist(v[accepted & np.isfinite(v)], bins=bins, alpha=0.65,
-                     label="accepted", color="steelblue")
-        axes[1].hist(v[~accepted & np.isfinite(v)], bins=bins, alpha=0.65,
-                     label="rejected", color="indianred")
+        axes[1].hist(
+            v[accepted & np.isfinite(v)], bins=bins, alpha=0.65, label="accepted", color="steelblue"
+        )
+        axes[1].hist(
+            v[~accepted & np.isfinite(v)],
+            bins=bins,
+            alpha=0.65,
+            label="rejected",
+            color="indianred",
+        )
         axes[1].set_xlabel("sky noise at the patch (nJy)")
         axes[1].set_ylabel("count")
         axes[1].legend(fontsize=8)
-        axes[1].set_title("accepted vs rejected: look for a systematic offset",
-                          fontsize=10)
+        axes[1].set_title("accepted vs rejected: look for a systematic offset", fontsize=10)
     else:
         axes[1].set_axis_off()
     fig.tight_layout()
@@ -420,15 +483,17 @@ def make_all(
     manifest=None,
     out_dir: Path | str = "diagnostics",
     band: str = "r",
-    n_cutouts: int = 25,
+    n_cutouts: int = 100,
     seed: int = 0,
 ) -> list[Path]:
     """Write every figure that the available inputs support."""
     plt = _plt()
     out_dir = Path(out_dir)
     written: list[Path] = []
-    made = [plot_cutouts(shards, n=n_cutouts, seed=seed, out=out_dir),
-            plot_hosts(shards, hosts, band=band, out=out_dir)]
+    made = [
+        plot_cutouts(shards, n=n_cutouts, seed=seed, out=out_dir),
+        plot_hosts(shards, hosts, band=band, out=out_dir),
+    ]
     if dataset is not None:
         made.append(plot_training_batch(dataset, n=n_cutouts, seed=seed, out=out_dir))
         made.append(plot_transform(dataset, seed=seed, out=out_dir))
