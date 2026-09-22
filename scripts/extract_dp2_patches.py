@@ -109,11 +109,17 @@ def main() -> None:
         help="give up topping up towards --n-patches after this many rounds",
     )
     p.add_argument(
-        "--min-reff-arcsec", type=float, default=3.0,
-        help="host half-light major axis floor, from the multiband Sersic fit. "
-             "The catalogue is mostly galaxies a pixel or two across, which carry "
-             "no structure to learn. Galaxies above 3 arcsec are rare, so widen "
-             "--radius-deg rather than raising --n-hosts if the yield is short",
+        "--min-reff-arcsec", type=float, default=None,
+        help="host half-light major axis floor in arcsec, from the multiband "
+             "Sersic fit. Defaults to 0.7. This is NOT the cut that decides "
+             "whether a host looks like a galaxy -- see --max-mu-e",
+    )
+    p.add_argument(
+        "--max-mu-e", type=float, default=None,
+        help="faintest mean surface brightness inside the half-light ellipse, "
+             "mag/arcsec^2. Defaults to 24.5. This is the cut that separates a "
+             "galaxy from a Sersic fit that ran away around an invisible "
+             "envelope; a sigma of sky per square arcsecond is about 27",
     )
     p.add_argument(
         "--min-visits", type=int, default=None,
@@ -159,7 +165,9 @@ def main() -> None:
         n_hosts=args.n_hosts,
         n_patches=args.n_patches,
         max_rounds=args.max_rounds,
-        min_reff_arcsec=args.min_reff_arcsec,
+        **({"min_reff_arcsec": args.min_reff_arcsec}
+           if args.min_reff_arcsec is not None else {}),
+        **({"max_mu_e": args.max_mu_e} if args.max_mu_e is not None else {}),
         gate_kwargs={"max_variance_step": args.max_variance_step,
                      "min_visits": args.min_visits},
         jitter_arcsec=args.jitter_arcsec,

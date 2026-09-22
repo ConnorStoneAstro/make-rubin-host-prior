@@ -274,6 +274,15 @@ def plot_hosts(shards, hosts=None, band: str = "r", out: Path | None = None):
                 mag = -2.5 * np.log10(np.where(flux > 0, flux, np.nan)) + 31.4
             panels.append((f"host magnitude ({band})", mag, 40,
                            f"{band} cModel mag", False))
+        # The one panel that would have made the blob investigation
+        # unnecessary: surface brightness against the sky it has to be seen
+        # above.  A population piled up to the right of the line is runaway
+        # fits, not galaxies.
+        if {"sersic_reff_major", "sersic_reff_minor", f"{band}_cModelFlux"} <= cols:
+            from rubin_host_prior.rubin.extract import host_mu_e
+
+            panels.append(("host surface brightness", host_mu_e(hosts, band), 40,
+                           r"$\mu_e$ (mag/arcsec$^2$), sky $\approx$ 27", False))
         if "sersic_index" in cols:
             # n ~ 1 is a disc, n ~ 4 an elliptical: the two kinds of host this
             # prior is meant to cover, so the balance between them matters.

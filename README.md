@@ -643,30 +643,51 @@ than loudly, so `select_hosts` is built to fail loudly instead:
   `index`, `theta`, `rho`, and per-band `{band}_sersicFlux` for all six bands —
   which is what the size cut and the diagnostic plots use.
 
-**Hosts must be at least 3″ across.** `min_reff_arcsec` is the cut that decides
-what the prior sees: the catalogue is dominated by galaxies a pixel or two
-across, which carry no structure to learn from, and without it they are most of
-the sample. At the DP2 pixel of 0.2″ a 3″ half-light radius is 15 native pixels,
-or 5 after the 3× pooling, with the visible galaxy running several half-light
-radii beyond that.
+**Surface brightness is the cut that decides whether a host is a galaxy.** Not
+size. Nothing else in the selection requires the object to be *visible*: with a
+3″ half-light radius the old 360 nJy floor admitted objects at
+μ_e = 29.4 mag/arcsec², some 2.4 mag/arcsec² fainter than one sigma of sky per
+square arcsecond in r. At that signal-to-noise the multiband Sersic fit is
+degenerate along (n, R_e, flux) and walks off to a large radius around an
+invisible envelope while the real light stays in a few pixels. Those rows pass
+every size cut and arrive as point-like blobs — which is exactly what the
+cutouts figure was showing.
 
-The size is `sersic_reff_major`, from the **multiband Sersic fit**. That column
-carries no band prefix — one morphology fit to all six bands at once — so it
-neither inherits the band-to-band scatter of a per-band fit nor needs blending
-across components the way cModel's separate exponential and de Vaucouleurs radii
-do. Two things it does mean: it is in arcsec, unlike `sersic_reff_x` which is the
-same quantity in pixels; and it is measured *before* convolution with the PSF, so
-it is the galaxy's intrinsic size and the seen object is a little larger.
-`sersic_unknown_flag` and `sersic_no_data_flag` are read alongside it, because
-without them a failed fit contributes whatever happened to be in the column.
+So `--max-mu-e` (default **24.5**) is the primary cut, written server-side as
+`flux >= K · reff_major · reff_minor` — multiplication only, since `LOG10` and
+`POWER` are not guaranteed across ADQL dialects and a clause the service
+silently declines to apply is worse than one it refuses.
 
-The **major** axis is used rather than the circularised √(ab): the point is
-structure to learn from, and an inclined disc at a = 4″, b = 0.8″ has plenty of
-it while circularising would call it 1.8″ and throw it away.
+The sample is therefore **surface-brightness limited, not size limited**. The
+size bounds are wide — 0.7″ to 12″, a factor of 17 — because that is the range
+asked for, "a couple of arcsec across up to very large". A galaxy of ordinary
+brightness at R_e = 3″ covers about 30 pooled pixels of visible isophote, so 3″
+was never too small; it was the wrong knob.
 
-This is a demanding cut — galaxies this large are not common — so `--radius-deg`
-matters more than `--n-hosts` for reaching a target. The surviving count is
-logged, split by whether the object was too small or had no usable fit.
+**The point-source cut is referenced to the PSF.** `{band}_ixx` and friends are
+HSM adaptive moments on the *PSF-convolved* coadd, so a star's trace radius is
+whatever the seeing was — 2.0 px at median DP2 seeing, against a `min_trace_px`
+of 1.75, which therefore rejected nothing. The cut is now on
+`T² = ((ixx+iyy) − (ixxPSF+iyyPSF))/2`, which a point source makes exactly zero.
+
+**Two things worth knowing about the trace radius**, since it is what the old
+hosts figure plotted: adaptive moments are flux-weighted toward the core and
+run 1.4× smaller than R_e for an exponential and 4–9× smaller for a de
+Vaucouleurs. A sample correctly cut at R_e ≥ 3″ plots at 0.7–2.2″ in trace
+radius. Seeing sizes below the cut in that panel is what a *working* cut looks
+like in the wrong units.
+
+**The bright end is a saturation flag, not a flux ceiling.** The old 3e6 nJy
+ceiling (r = 15.2) sits 1.5–3 mag *below* where cores actually saturate, so it
+was blocking precisely the nearly-saturating galaxies wanted. The ceiling is now
+nominal and `{band}_pixelFlags_saturatedCenter` does the work, which is literally
+"this core is not saturated". `interpolatedCenter` goes with it: an interpolated
+core is synthetic structure exactly where the transient goes.
+
+**Stratification bins are fixed, not data-driven.** Edges taken from the
+sample's own min and max hand whole bins to whatever tail exists — so with
+runaway fits in the pool, the stratification written to rescue rare large
+galaxies was preferentially rescuing rare bad fits instead.
 
 `min_trace_px` stays as a second, non-parametric floor from the adaptive moments,
 a cross-check against a runaway fit.

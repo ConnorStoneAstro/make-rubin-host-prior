@@ -139,6 +139,7 @@ CENTRE_TOLERANCE_ARCSEC = 1.0
 #: extent.
 OBJECT_COLUMNS = [
     "objectId",
+    "refSizeExtendedness",
     "coord_ra",
     "coord_dec",
     "refExtendedness",
@@ -168,11 +169,24 @@ PHOTOMETRY_BANDS = ("u", "g", "r", "i", "z", "y")
 OBJECT_BAND_COLUMNS = [
     "{b}_cModelFlux",
     "{b}_cModelFluxErr",
+    "{b}_cModelMag",
     "{b}_blendedness",
+    # HSM adaptive moments, measured on the PSF-convolved coadd, and the same
+    # moments for the PSF itself.  The difference is what makes a size cut mean
+    # anything: a point source has ixx == ixxPSF, so an absolute pixel threshold
+    # on the moments alone rejects nothing at median seeing.
     "{b}_ixx",
     "{b}_iyy",
     "{b}_ixy",
+    "{b}_ixxPSF",
+    "{b}_iyyPSF",
+    # The real bright limit, and the real reason to drop a core.
+    "{b}_pixelFlags_saturatedCenter",
+    "{b}_pixelFlags_interpolatedCenter",
 ]
+
+#: AB zeropoint for DP2 fluxes: m = -2.5*log10(f_nJy) + 31.4.
+AB_ZEROPOINT = 31.4
 
 #: ECDFS, still in tract 5063 as on DP1, and the field the DP2 tutorials use
 #: throughout.  ELAISS1 (10.26, -44.49) and EDFS (59.10, -48.73) also appear.
@@ -330,6 +344,41 @@ def find_object_refs(butler, ra: float | None = None, dec: float | None = None,
     return refs
 
 
+#: Faintest mean surface brightness inside the half-light ellipse, in
+#: mag/arcsec^2, that a host may have.  This is the cut that decides whether a
+#: host is a galaxy or a fit that ran away.
+#:
+#: Nothing else in the selection requires the object to be *visible*.  At a 3"
+#: half-light radius the old 360 nJy floor permitted mu_e = 29.4, which is 2.4
+#: mag/arcsec^2 fainter than one sigma of sky per square arcsecond in r: not
+#: merely faint, unmeasurable.  The multiband Sersic fit is degenerate along
+#: (n, Re, flux) at that signal-to-noise and wanders off to a large radius with
+#: an invisible envelope while the real light stays in a few pixels -- which is
+#: exactly a stamp that looks like a point source.
+MAX_MU_E = 24.5
+
+#: Half-light radius bounds in arcsec.  The floor is about 1.75 PSF sigma, which
+#: is the "couple of arcsec across" end of the wanted range; the ceiling keeps
+#: 90% of the light inside an 83" stamp for any plausible profile and caps
+#: runaways from above.
+MIN_REFF_ARCSEC = 0.7
+MAX_REFF_ARCSEC = 12.0
+
+#: Minimum PSF-deconvolved moment radius, in native pixels.  A point source
+#: gives exactly 0 by construction.
+MIN_DECONVOLVED_PX = 1.0
+
+
+def surface_brightness_floor(max_mu_e: float = MAX_MU_E) -> float:
+    """nJy per arcsec^2 of half-light ellipse at ``max_mu_e``.
+
+    Written as a flux-per-area so the cut is ``flux >= K * a * b``: pure
+    multiplication, which every ADQL dialect has, where ``LOG10`` and ``POWER``
+    are not guaranteed.
+    """
+    return float(2.0 * np.pi * 10 ** ((AB_ZEROPOINT - max_mu_e) / 2.5))
+
+
 #: The TAP-side table.  The host cuts are a selection, and a selection is what a
 #: query service is for: the whole footprint is ~10^9 rows and the survivors are
 #: ~10^4, so the difference between filtering there and filtering here is the
@@ -338,10 +387,14 @@ TAP_TABLE = "dp2.Object"
 
 
 def host_adql(
-    bands: Sequence[str] = BANDS,
+    bands=BANDS,
     band: str = "r",
-    flux_range: tuple[float, float] = (360.0, 3.0e6),
-    min_reff_arcsec: float | None = 3.0,
+    flux_range: tuple[float, float] = (5750.0, 1.0e8),
+    min_reff_arcsec: float | None = MIN_REFF_ARCSEC,
+    max_reff_arcsec: float | None = MAX_REFF_ARCSEC,
+    max_mu_e: float | None = MAX_MU_E,
+    max_sersic_index: float | None = 6.0,
+    min_deconvolved_px: float | None = MIN_DECONVOLVED_PX,
     max_blendedness: float | None = None,
     ra: float | None = None,
     dec: float | None = None,
@@ -350,21 +403,41 @@ def host_adql(
 ) -> str:
     """The ADQL for the host selection.
 
-    Only the numeric cuts go into the WHERE clause.  The boolean Sersic failure
-    flags are fetched and applied here instead, because how a boolean column
-    compares in ADQL is backend-specific and a wrong guess silently returns
-    nothing; they cost nothing to apply locally on a result this size.  Nor is
-    there an ``ORDER BY``: the tutorial is explicit that sorting is expensive on
-    a shared service, and the stratified draw has to happen locally anyway.
+    Arithmetic here is multiplication and addition only.  ``LOG10`` and
+    ``POWER`` are not guaranteed across ADQL dialects, and a clause the service
+    silently declines to apply is worse than one it refuses outright -- so the
+    surface-brightness cut is written as a flux against an area rather than as a
+    magnitude, and the size cut against the moments is written on the squared
+    quantity.
+
+    The boolean flags are fetched and applied locally: how a boolean compares in
+    ADQL is backend-specific, and a wrong guess quietly returns nothing.  Nor is
+    there an ``ORDER BY`` -- sorting burdens a shared service and the stratified
+    draw has to happen here anyway.
     """
     columns = ", ".join(host_columns(bands))
     where = [f"{band}_cModelFlux > {float(flux_range[0])}",
              f"{band}_cModelFlux <= {float(flux_range[1])}",
              "refExtendedness > 0.5"]
+    # NaN and NULL both fail a > comparison, which is the behaviour wanted: an
+    # object with no fit is not a large object.
     if min_reff_arcsec is not None:
-        # NaN and NULL both fail a > comparison, which is the behaviour wanted:
-        # an object with no fit is not a large object.
         where.append(f"sersic_reff_major >= {float(min_reff_arcsec)}")
+    if max_reff_arcsec is not None:
+        where.append(f"sersic_reff_major <= {float(max_reff_arcsec)}")
+    if max_mu_e is not None:
+        where.append(
+            f"{band}_cModelFlux >= {surface_brightness_floor(max_mu_e):.1f} "
+            f"* sersic_reff_major * sersic_reff_minor"
+        )
+    if max_sersic_index is not None:
+        where.append(f"sersic_index <= {float(max_sersic_index)}")
+    if min_deconvolved_px is not None:
+        # T^2 = ((ixx+iyy) - (ixxPSF+iyyPSF))/2, so this is T >= the threshold.
+        where.append(
+            f"({band}_ixx + {band}_iyy - {band}_ixxPSF - {band}_iyyPSF) "
+            f">= {2.0 * float(min_deconvolved_px) ** 2}"
+        )
     if max_blendedness is not None:
         where.append(f"{band}_blendedness <= {float(max_blendedness)}")
     if radius_deg is not None and ra is not None and dec is not None:
@@ -751,6 +824,36 @@ def _colnames(table) -> set[str]:
     return set(getattr(table, "colnames", None) or getattr(table, "columns", []))
 
 
+def host_mu_e(table, band: str) -> np.ndarray:
+    """Mean surface brightness inside the half-light ellipse, mag/arcsec^2."""
+    flux = np.asarray(table[f"{band}_cModelFlux"], dtype=float)
+    a = host_half_light_arcsec(table, "major")
+    b = host_half_light_arcsec(table, "minor")
+    with np.errstate(invalid="ignore", divide="ignore"):
+        mag = AB_ZEROPOINT - 2.5 * np.log10(np.where(flux > 0, flux, np.nan))
+        return mag + 2.5 * np.log10(2.0 * np.pi * a * b)
+
+
+def host_deconvolved_px(table, band: str) -> np.ndarray:
+    """Moment radius with the PSF removed in quadrature, in native pixels.
+
+    ``T^2 = ((ixx + iyy) - (ixxPSF + iyyPSF)) / 2``.  A point source gives zero,
+    which is the property an absolute cut on the raw moments does not have: at
+    median DP2 seeing a star sits at 2.0 px, and ``min_trace_px = 1.75`` was
+    therefore rejecting nothing at all.
+    """
+    needed = [f"{band}_{c}" for c in ("ixx", "iyy", "ixxPSF", "iyyPSF")]
+    have = _colnames(table)
+    if not set(needed) <= have:
+        raise KeyError(
+            f"{[c for c in needed if c not in have]} not in the object table; "
+            f"the PSF moments are what make a size cut mean anything"
+        )
+    ixx, iyy, pxx, pyy = (np.asarray(table[c], dtype=float) for c in needed)
+    excess = 0.5 * ((ixx + iyy) - (pxx + pyy))
+    return np.sqrt(np.maximum(excess, 0.0))
+
+
 def host_trace_radius_px(table, band: str) -> np.ndarray:
     """Trace radius in pixels from the per-band adaptive moments.
 
@@ -810,59 +913,40 @@ def host_half_light_arcsec(table, axis: str = "major") -> np.ndarray:
 def select_hosts(
     table,
     band: str = "r",
-    flux_range: tuple[float, float] = (360.0, 3.0e6),
+    flux_range: tuple[float, float] = (5750.0, 1.0e8),
     max_blendedness: float | None = None,
     n_hosts: int | None = None,
     seed: int = 0,
     exclude_ids: set[int] | None = None,
     size_stratified: bool = True,
-    min_reff_arcsec: float = 3.0,
-    min_trace_px: float = 1.75,
+    min_reff_arcsec: float | None = MIN_REFF_ARCSEC,
+    max_reff_arcsec: float | None = MAX_REFF_ARCSEC,
+    max_mu_e: float | None = MAX_MU_E,
+    min_deconvolved_px: float | None = MIN_DECONVOLVED_PX,
     dedupe_radius_arcsec: float = 0.5,
     n_size_bins: int = 5,
 ):
-    """Extended objects in a flux range, stratified by apparent size.
+    """Galaxies bright enough per unit area to be real, stratified by size.
 
-    ``flux_range`` bounds are 360 nJy (r = 25.0) to 3e6 nJy (r = 15.2).  The
-    ceiling is high because it has to be: a galaxy with a 3" half-light radius
-    and an ordinary effective surface brightness of 22 mag/arcsec^2 has r ~ 17.6,
-    nine times brighter than the 36000 nJy ceiling this used to carry.  That
-    ceiling was set for a 1" population and would have annihilated the size cut.
-    Saturated cores are the gate's job, not this one's.
+    The cut that matters is ``max_mu_e``, not the size bounds.  Nothing else
+    here requires a host to be *visible*: the old 360 nJy floor with a 3"
+    half-light radius admitted objects at mu_e = 29.4 mag/arcsec^2, fainter than
+    a sigma of sky per square arcsecond, where the Sersic fit is degenerate and
+    runs away to a large radius around an invisible envelope.  Those rows pass
+    every size cut and arrive as point-like blobs.
 
-    ``min_reff_arcsec`` is the real size cut, on ``sersic_reff_major`` from the
-    multiband Sersic fit.  The catalogue is dominated by galaxies a pixel or two
-    across, which carry no structure for a prior to learn, and they would
-    otherwise be most of the sample.  At the DP2 pixel of 0.2 arcsec the default
-    3 arcsec is 15 native pixels of half-light radius, 5 after the 3x pooling,
-    with the visible galaxy running several half-light radii beyond that.
+    So the sample is **surface-brightness limited rather than size limited**:
+    the size bounds are wide (0.7" to 12", a factor of 17) and the brightness
+    per unit area is what decides.  ``min_deconvolved_px`` is the companion cut
+    on the image itself, PSF-referenced, since the raw moments of a point source
+    are whatever the seeing was.
 
-    That is a demanding cut: galaxies this large are rare, so a small field will
-    not supply many of them and ``--radius-deg`` is the knob that matters more
-    than ``--n-hosts``.  The count surviving is logged, split by whether the
-    object was too small or simply had no usable Sersic fit.
-
-    ``refExtendedness`` is a hard 0/1 threshold on a flux ratio, so it is
-    unreliable near the faint limit -- a cut on it alone at r > 23 admits a lot
-    of faint stars.  The size cross-check drops the point-like contaminants.
-    (DP2 also offers continuous ``{band}_sizeExtendedness`` and
-    ``{band}_model_extendedness``, either of which would be a better primary cut
-    if the sample turns out to need one.)
-
-    ``size_stratified`` draws equally from bins of equal *width* in log half-light
-    radius, so the sample is spread over size rather than following the
-    catalogue, in which small faint galaxies vastly outnumber well-resolved ones.
-    Note this must be equal-width bins: drawing equally from quantile bins is
-    exactly a uniform sample, since quantile bins hold equal numbers by
-    construction.  If the size columns are missing this **raises** rather than
-    quietly falling back to a uniform draw.
-
-    ``exclude_ids`` drops hosts that have already been tried, so repeated calls
-    walk through the catalogue rather than re-offering the same objects.
-
-    ``min_trace_px`` is a second, non-parametric size floor from the adaptive
-    moments, kept as a cross-check against a runaway cModel fit.  It is a DP1-era
-    ComCam PSF size; check it against the DP2 PSF before leaning on it.
+    ``size_stratified`` draws equally from bins of equal *width* in log size
+    over a **fixed** range, not over the data's own min and max.  Two ways to
+    get this wrong, both of which were here: quantile bins hold equal numbers by
+    construction, so drawing equally from them is exactly a uniform sample; and
+    data-driven edges hand entire bins to whatever tail the sample has, which
+    with runaway fits means stratification preferentially selects them.
     """
     rng = np.random.default_rng(seed)
     if band not in PHOTOMETRY_BANDS:
@@ -870,35 +954,45 @@ def select_hosts(
             f"band {band!r} has no DP2 Object photometry; choose from "
             f"{PHOTOMETRY_BANDS}"
         )
-    flux_col = f"{band}_cModelFlux"
     t = dedupe_hosts(table, dedupe_radius_arcsec)
-
     keep = np.ones(len(t), dtype=bool)
     if exclude_ids:
         # Topping up towards a target: these have already been tried, and
-        # offering them again would either duplicate a stamp or re-earn the same
-        # rejection.
+        # offering them again would either duplicate a stamp or re-earn the
+        # same rejection.
         keep &= ~np.isin(np.asarray(t["objectId"], dtype=np.int64),
                          np.fromiter(exclude_ids, dtype=np.int64,
                                      count=len(exclude_ids)))
-    if "refExtendedness" in t.colnames:
+    if "refExtendedness" in _colnames(t):
         ext = np.asarray(t["refExtendedness"], dtype=float)
         keep &= np.isfinite(ext) & (ext > 0.5)
-    flux = np.asarray(t[flux_col], dtype=float)
-    in_flux = np.isfinite(flux) & (flux > flux_range[0]) & (flux <= flux_range[1])
-    keep &= in_flux
-    if max_blendedness is not None and f"{band}_blendedness" in t.colnames:
+
+    flux = np.asarray(t[f"{band}_cModelFlux"], dtype=float)
+    keep &= np.isfinite(flux) & (flux > flux_range[0]) & (flux <= flux_range[1])
+    if max_blendedness is not None and f"{band}_blendedness" in _colnames(t):
         bl = np.asarray(t[f"{band}_blendedness"], dtype=float)
         keep &= ~(np.isfinite(bl) & (bl > max_blendedness))
 
-    trace = host_trace_radius_px(t, band)
-    keep &= np.isfinite(trace) & (trace > min_trace_px)
+    # A saturated core is the real bright limit; an interpolated one is
+    # synthetic structure sitting exactly where the transient goes.
+    for flag in ("saturatedCenter", "interpolatedCenter"):
+        column = f"{band}_pixelFlags_{flag}"
+        if column in _colnames(t):
+            keep &= ~np.asarray(t[column], dtype=bool)
 
     reff = host_half_light_arcsec(t)
+    if min_deconvolved_px is not None:
+        keep &= host_deconvolved_px(t, band) >= min_deconvolved_px
+    if max_reff_arcsec is not None:
+        keep &= np.isfinite(reff) & (reff <= max_reff_arcsec)
+    if max_mu_e is not None:
+        mu = host_mu_e(t, band)
+        bright_enough = np.isfinite(mu) & (mu <= max_mu_e)
+        log.info("surface-brightness cut at mu_e <= %.1f: %d of %d survive",
+                 max_mu_e, int((keep & bright_enough).sum()), int(keep.sum()))
+        keep &= bright_enough
     if min_reff_arcsec is not None:
         big_enough = np.isfinite(reff) & (reff >= min_reff_arcsec)
-        # Split the loss, because "no cModel fit" and "genuinely small" are very
-        # different statements about the selection function.
         log.info(
             "half-light cut at %.2f\": %d of %d survive; %d dropped as smaller, "
             "%d for having no usable Sersic fit",
@@ -906,21 +1000,6 @@ def select_hosts(
             int((keep & np.isfinite(reff) & ~big_enough).sum()),
             int((keep & ~np.isfinite(reff)).sum()),
         )
-        # Size and flux are not independent: a galaxy with a 3" half-light
-        # radius and any ordinary surface brightness is bright, so a ceiling set
-        # for small galaxies quietly annihilates a large size cut.  Rather than
-        # assume a surface brightness, notice when the two cuts are nearly
-        # disjoint and say so.
-        n_size_only = int((big_enough & ~in_flux).sum())
-        n_both = int((keep & big_enough).sum())
-        if n_size_only and n_both < 0.2 * n_size_only:
-            log.warning(
-                "%d objects pass the %.2f\" size cut but fail the flux range "
-                "%s, against %d that pass both: the flux ceiling is fighting the "
-                "size cut. Galaxies this large are bright -- raise "
-                "host_flux_range[1]",
-                n_size_only, min_reff_arcsec, flux_range, n_both,
-            )
         keep &= big_enough
 
     t = t[keep]
@@ -930,24 +1009,20 @@ def select_hosts(
     if not size_stratified:
         return t[rng.choice(len(t), size=n_hosts, replace=False)]
 
-    # Bins equally spaced in log size, NOT quantiles.  Quantile bins hold equal
-    # numbers by construction, so drawing equally from each is exactly a uniform
-    # sample and stratifies nothing -- which is what this used to do.  Equal-width
-    # bins hold wildly unequal numbers, so an equal draw from each is what
-    # actually flattens the size distribution and gets well-resolved hosts into
-    # the sample.
-    log_size = np.log10(np.maximum(reff, 1e-6))
-    edges = np.linspace(log_size.min(), log_size.max(), n_size_bins + 1)
+    lo = np.log10(min_reff_arcsec or max(np.nanmin(reff), 1e-3))
+    hi = np.log10(max_reff_arcsec or np.nanmax(reff))
+    edges = np.linspace(lo, hi, n_size_bins + 1)
     edges[-1] += 1e-9
+    log_size = np.log10(np.maximum(reff, 1e-6))
     per_bin = max(n_hosts // n_size_bins, 1)
     picks: list[int] = []
-    for lo, hi in zip(edges[:-1], edges[1:]):
-        idx = np.where((log_size >= lo) & (log_size < hi))[0]
+    for a, b in zip(edges[:-1], edges[1:]):
+        idx = np.where((log_size >= a) & (log_size < b))[0]
         if len(idx) == 0:
             continue
         picks += list(rng.choice(idx, size=min(per_bin, len(idx)), replace=False))
     # Sparse bins at the large end leave the quota unfilled; top up uniformly
-    # from whatever is left rather than returning fewer hosts than asked for.
+    # rather than returning fewer hosts than asked for.
     picks = list(dict.fromkeys(picks))
     if len(picks) < n_hosts:
         rest = np.setdiff1d(np.arange(len(t)), np.array(picks, dtype=int))
@@ -955,9 +1030,6 @@ def select_hosts(
         if extra:
             picks += list(rng.choice(rest, size=extra, replace=False))
     return t[np.array(picks[:n_hosts])]
-
-
-# -- image discovery -------------------------------------------------------
 
 
 def _tract_refs(butler, dataset_type: str, tract: int, bands=None) -> list:
@@ -1259,9 +1331,10 @@ def extract_patches(
     limit_tracts: int | None = None,
     limit_hosts: int | None = None,
     jitter_arcsec: float = 4.0,
-    host_flux_range: tuple[float, float] = (360.0, 3.0e6),
+    host_flux_range: tuple[float, float] = (5750.0, 1.0e8),
     max_blendedness: float | None = None,
-    min_reff_arcsec: float = 3.0,
+    min_reff_arcsec: float = MIN_REFF_ARCSEC,
+    max_mu_e: float | None = MAX_MU_E,
     patches_per_shard: int = 1024,
     max_patches: int | None = None,
     neighbour_radius_arcsec: float = 30.0,
@@ -1313,7 +1386,7 @@ def extract_patches(
         tap_url=tap_url,
         top=limit_hosts,
         flux_range=host_flux_range, max_blendedness=max_blendedness,
-        min_reff_arcsec=min_reff_arcsec,
+        min_reff_arcsec=min_reff_arcsec, max_mu_e=max_mu_e,
     )
 
     records: list[dict] = []
@@ -1583,6 +1656,7 @@ def extract_patches(
             flux_range=host_flux_range,
             max_blendedness=max_blendedness,
             min_reff_arcsec=min_reff_arcsec,
+            max_mu_e=max_mu_e,
             n_hosts=batch,
             exclude_ids=tried,
             seed=seed + rounds,

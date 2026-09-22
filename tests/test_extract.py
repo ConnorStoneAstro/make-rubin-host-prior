@@ -47,7 +47,7 @@ pytest.importorskip("pandas")
 # -- fixtures ---------------------------------------------------------------
 
 
-def _catalogue(tract, ra0, dec0, n=40, seed=1, patches=(0,), reff_range=(0.5, 1.0)):
+def _catalogue(tract, ra0, dec0, n=40, seed=1, patches=(0,), reff_range=(0.0, 0.5)):
     """Hosts placed well inside the given patches of one tract."""
     rng = np.random.default_rng(seed)
     patch = rng.choice(patches, n)
@@ -61,6 +61,7 @@ def _catalogue(tract, ra0, dec0, n=40, seed=1, patches=(0,), reff_range=(0.5, 1.
         "coord_ra": ra0 + px * fakes.PIXEL_SCALE / cosd,
         "coord_dec": dec0 + py * fakes.PIXEL_SCALE,
         "refExtendedness": np.ones(n),
+        "refSizeExtendedness": np.ones(n),
         "refBand": ["r"] * n,
         "tract": np.full(n, tract),
         "patch": patch.astype(int),
@@ -71,12 +72,17 @@ def _catalogue(tract, ra0, dec0, n=40, seed=1, patches=(0,), reff_range=(0.5, 1.
         "sersic_no_data_flag": np.zeros(n, bool),
         "sersic_chi2_reduced": np.ones(n),
         **{f"{b}_{c}": v for b in PHOTOMETRY_BANDS
-           for c, v in (("cModelFlux", 10 ** rng.uniform(4.5, 5.5, n)),
+           for c, v in (("cModelFlux", 10 ** rng.uniform(5.0, 5.8, n)),
                         ("cModelFluxErr", np.full(n, 10.0)),
+                        ("cModelMag", rng.uniform(17.0, 19.0, n)),
                         ("blendedness", rng.beta(1.2, 8, n)),
                         ("ixx", np.full(n, 30.0)),
                         ("iyy", np.full(n, 30.0)),
-                        ("ixy", np.zeros(n)))},
+                        ("ixy", np.zeros(n)),
+                        ("ixxPSF", np.full(n, 4.0)),
+                        ("iyyPSF", np.full(n, 4.0)),
+                        ("pixelFlags_saturatedCenter", np.zeros(n, bool)),
+                        ("pixelFlags_interpolatedCenter", np.zeros(n, bool)))},
     })
 
 
@@ -92,10 +98,10 @@ def butler(monkeypatch):
 
 def _run(butler, tmp_path, **kw):
     kw.setdefault("bands", ("r", "i"))
-    kw.setdefault("n_hosts", 20)
+    kw.setdefault("n_hosts", 40)
     kw.setdefault("n_patches", 12)
     return extract_patches(butler, out_dir=tmp_path, host_source="butler",
-                           native_size=416, min_reff_arcsec=3.0, seed=0, **kw)
+                           native_size=416, seed=0, **kw)
 
 
 # -- the sweep --------------------------------------------------------------
@@ -289,10 +295,14 @@ def _hosts(n=3000, scale=0.6, seed=1, tract=5063):
         "objectId": np.arange(n),
         "coord_ra": 53.13 + rng.normal(0, 0.3, n),
         "coord_dec": -28.10 + rng.normal(0, 0.3, n),
-        "refExtendedness": np.ones(n),
+        "refExtendedness": np.ones(n), "refSizeExtendedness": np.ones(n),
         "tract": np.full(n, tract), "patch": rng.integers(0, 100, n),
-        "r_cModelFlux": 10 ** ((31.4 - mag) / 2.5),
+        "r_cModelFlux": 10 ** ((31.4 - mag) / 2.5), "r_cModelMag": mag,
+        "r_blendedness": rng.beta(1.2, 8, n),
         "r_ixx": trace_sq, "r_iyy": trace_sq, "r_ixy": np.zeros(n),
+        "r_ixxPSF": np.full(n, 4.0), "r_iyyPSF": np.full(n, 4.0),
+        "r_pixelFlags_saturatedCenter": np.zeros(n, bool),
+        "r_pixelFlags_interpolatedCenter": np.zeros(n, bool),
         "sersic_reff_major": reff, "sersic_reff_minor": 0.7 * reff,
         "sersic_index": rng.uniform(0.5, 6.0, n),
         "sersic_unknown_flag": np.zeros(n, bool),
@@ -354,15 +364,6 @@ def test_duplicates_and_already_tried_hosts_are_not_offered():
     assert len(second) == 20 and not (ids & {int(i) for i in second["objectId"]})
 
 
-def test_a_flux_ceiling_that_fights_the_size_cut_is_called_out(caplog):
-    """A 3 arcsec galaxy at an ordinary 22 mag/arcsec^2 is r ~ 17.6, nine times
-    brighter than the ceiling this used to carry."""
-    with caplog.at_level("WARNING"):
-        select_hosts(_hosts(2000, seed=3), band="r", min_reff_arcsec=3.0,
-                     flux_range=(360.0, 36000.0))
-    assert "fighting the size cut" in caplog.text
-
-
 def test_the_top_up_loop_terminates_and_sizes_itself():
     """25 cutouts from 100 hosts with 90 still wanted is ~360 hosts plus
     headroom; a round that yielded nothing must widen rather than divide by
@@ -378,7 +379,7 @@ def test_the_top_up_loop_terminates_and_sizes_itself():
 def test_the_butler_scan_keeps_only_survivors(butler):
     """An object table is ~700k rows and the footprint ~1000 of them, so the
     cuts run per tract rather than on a concatenation of all of them."""
-    pool = build_host_catalogue(butler, source="butler", min_reff_arcsec=3.0)
+    pool = build_host_catalogue(butler, source="butler")
     assert 0 < len(pool) <= sum(len(t) for t in butler.objects.values())
     with pytest.raises(ValueError, match="butler"):
         build_host_catalogue(source="butler")
@@ -407,11 +408,11 @@ def test_tap_results_get_the_local_cuts_and_can_be_cached(tmp_path):
     table = _hosts(200, seed=4)
     table["sersic_no_data_flag"][:100] = True
     service = _Tap(table)
-    pool = build_host_catalogue(tap_service=service, min_reff_arcsec=3.0,
+    pool = build_host_catalogue(tap_service=service,
                                 cache=tmp_path / "hosts.parquet")
     assert len(pool) and np.all(np.asarray(pool["objectId"]) >= 100)
 
-    again = build_host_catalogue(tap_service=None, min_reff_arcsec=3.0,
+    again = build_host_catalogue(tap_service=None,
                                  cache=tmp_path / "hosts.parquet")
     assert len(again) == len(pool) and len(service.jobs) == 1
 
@@ -526,3 +527,70 @@ def test_null_catalogue_values_do_not_become_data():
     out = unmask(t)
     assert np.isnan(out["coord_ra"][1]) and out["patch"][1] == -1
     assert len(with_positions(out)) == 1
+
+
+def test_surface_brightness_is_what_separates_a_galaxy_from_a_runaway_fit():
+    """Nothing else in the selection requires a host to be visible.  At a 3"
+    half-light radius the old 360 nJy floor admitted mu_e = 29.4, fainter than a
+    sigma of sky per square arcsecond, where the Sersic fit is degenerate and
+    walks off to a large radius around an invisible envelope.  Those rows pass
+    every size cut and arrive as point-like blobs."""
+    # A real galaxy and a runaway: same radius, four magnitudes apart.
+    t = Table({
+        "objectId": [1, 2], "coord_ra": [53.1, 53.3], "coord_dec": [-28.1, -28.3],
+        "refExtendedness": [1.0, 1.0],
+        "tract": [5063, 5063], "patch": [0, 0],
+        "sersic_reff_major": [3.0, 3.0], "sersic_reff_minor": [1.8, 1.8],
+        "sersic_index": [1.0, 1.0],
+        "sersic_unknown_flag": [False, False],
+        "sersic_no_data_flag": [False, False],
+        "r_cModelFlux": [3.3e5, 3.6e2], "r_cModelMag": [17.6, 25.0],
+        "r_ixx": [30.0, 30.0], "r_iyy": [30.0, 30.0], "r_ixy": [0.0, 0.0],
+        "r_ixxPSF": [4.0, 4.0], "r_iyyPSF": [4.0, 4.0],
+        "r_pixelFlags_saturatedCenter": [False, False],
+        "r_pixelFlags_interpolatedCenter": [False, False],
+    })
+    # Over the half-light *ellipse*, a*b, not a circle of radius a: at
+    # b = 0.6a that is 0.55 mag/arcsec^2 brighter than the circular figure.
+    mu = ex.host_mu_e(t, "r")
+    assert mu[0] == pytest.approx(21.4, abs=0.1)
+    assert mu[1] == pytest.approx(28.8, abs=0.1)
+    kept = select_hosts(t, band="r", flux_range=(1.0, 1e9))
+    assert [int(i) for i in kept["objectId"]] == [1]
+
+
+def test_the_point_source_cut_is_referenced_to_the_psf():
+    """A star's raw moments are whatever the seeing was -- 2.0 px at median DP2
+    seeing -- so min_trace_px = 1.75 rejected nothing.  Deconvolved, a point
+    source is exactly zero."""
+    t = Table({"r_ixx": [4.0, 30.0], "r_iyy": [4.0, 30.0],
+               "r_ixxPSF": [4.0, 4.0], "r_iyyPSF": [4.0, 4.0]})
+    got = ex.host_deconvolved_px(t, "r")
+    assert got[0] == 0.0 and got[1] == pytest.approx(np.sqrt(26.0))
+    with pytest.raises(KeyError, match="ixxPSF"):
+        ex.host_deconvolved_px(Table({"r_ixx": [1.0], "r_iyy": [1.0]}), "r")
+
+
+def test_a_saturated_or_interpolated_core_disqualifies_a_host():
+    """The real bright limit, and the real reason to drop a core: an
+    interpolated centre is synthetic structure exactly where the transient
+    goes."""
+    t = _hosts(40, seed=9)
+    t["r_pixelFlags_saturatedCenter"][:10] = True
+    t["r_pixelFlags_interpolatedCenter"][10:20] = True
+    kept = select_hosts(t, band="r")
+    assert len(kept) and np.all(np.asarray(kept["objectId"]) >= 20)
+
+
+def test_stratification_bins_do_not_follow_the_sample_tail():
+    """Edges taken from the data's own min and max hand whole bins to whatever
+    tail exists -- with runaway fits, that means stratification preferentially
+    selects them."""
+    q = host_adql(bands=("r",))
+    assert "sersic_reff_major <= 12.0" in q  # the tail is bounded server-side
+
+    t = _hosts(2000, seed=10)
+    t["sersic_reff_major"][:5] = 200.0  # a handful of absurd fits
+    t["sersic_reff_minor"][:5] = 120.0
+    kept = select_hosts(t, band="r", n_hosts=100, seed=0)
+    assert np.all(host_half_light_arcsec(kept) <= 12.0)
