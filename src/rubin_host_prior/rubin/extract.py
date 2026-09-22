@@ -375,14 +375,14 @@ def find_object_refs(
 #: (n, Re, flux) at that signal-to-noise and wanders off to a large radius with
 #: an invisible envelope while the real light stays in a few pixels -- which is
 #: exactly a stamp that looks like a point source.
-MAX_MU_E = 24.5
+MAX_MU_E = 23.0
 
 #: Half-light radius bounds in arcsec.  The floor is about 1.75 PSF sigma, which
 #: is the "couple of arcsec across" end of the wanted range; the ceiling keeps
 #: 90% of the light inside an 83" stamp for any plausible profile and caps
 #: runaways from above.
 MIN_REFF_ARCSEC = 1.0
-MAX_REFF_ARCSEC = 12.0
+MAX_REFF_ARCSEC = 100.0
 
 #: Minimum PSF-deconvolved moment radius, in native pixels.  A point source
 #: gives exactly 0 by construction.
