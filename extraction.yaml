@@ -43,7 +43,7 @@ stamps:
 # per band and the gate rejects a share of those.  n_patches is a target the run
 # works towards, drawing fresh hosts until it has them.
 run:
-  n_hosts: 8000
+  n_hosts: 200
   n_patches: null
   max_patches: null
   max_rounds: 8
