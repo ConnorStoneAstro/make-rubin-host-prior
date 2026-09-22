@@ -101,6 +101,7 @@ DP2_ATTRS = {
     "schema": "schema",
     "origin": "yx0",
     "grid": "grid",
+    "bounds": "bounds",
     "provenance": "provenance",
 }
 
@@ -1225,6 +1226,21 @@ def cell_visit_counts(source) -> dict[tuple[int, int], int]:
     return {(int(i), int(j)): int(n) for (i, j), n in zip(cells, counts)}
 
 
+def missing_cells(bounds, cells: list[tuple[int, int]]) -> list[tuple[int, int]]:
+    """Which of ``cells`` were never built.
+
+    ``CellGridBounds.bbox`` is the populated *rectangle*; ``missing`` is the
+    handful of cells inside it that are absent anyway.  A corner test catches a
+    stamp hanging off the edge of coverage but not a hole in the middle of one,
+    and slicing across either raises rather than returning empty pixels.
+    """
+    absent = getattr(bounds, "missing", None)
+    if not absent or not cells:
+        return []
+    keys = {(int(c.i), int(c.j)) for c in absent}
+    return [c for c in cells if c in keys]
+
+
 def stamp_depth(counts: dict[tuple[int, int], int],
                 cells: list[tuple[int, int]]) -> tuple[int, int]:
     """``(min, max)`` visit count over the cells a stamp covers; ``(-1, -1)`` if
@@ -1345,6 +1361,7 @@ def extract_patches(
     tried: set[int] = set()
     component_reads_failed = False
     bbox_reads_failed = False
+    whole_patch_reason: str | None = None
     depth_logged = False
     depth_checked = False
     depth_usable = True
@@ -1364,6 +1381,7 @@ def extract_patches(
         """
         nonlocal writer, mask_mapping, n_accepted, component_reads_failed
         nonlocal bbox_reads_failed, n_empty_patches, n_matched_patches
+        nonlocal whole_patch_reason
         nonlocal depth_logged, depth_checked, depth_usable, n_refs
 
         by_patch: dict[tuple[int, int], list[int]] = {}
@@ -1402,9 +1420,16 @@ def extract_patches(
                 # fall back to reading patches whole.
                 coadd = None
 
-                def _whole_patch():
-                    nonlocal coadd
+                def _whole_patch(why: str = "?"):
+                    nonlocal coadd, whole_patch_reason
                     if coadd is None:
+                        if whole_patch_reason is None:
+                            whole_patch_reason = why
+                            log.warning(
+                                "reading whole patches because the %r component "
+                                "is not served; that is ~100x the pixel I/O of a "
+                                "bbox read", why,
+                            )
                         coadd = butler.get(ref)
                     return coadd
 
@@ -1418,7 +1443,7 @@ def extract_patches(
                         )
                         component_reads_failed = True
                     try:
-                        wcs = _attr(_whole_patch(), "wcs")
+                        wcs = _attr(_whole_patch("sky_projection"), "wcs")
                     except Exception as exc2:
                         records.append({**base, "status": "rejected",
                                         "reasons": f"read_failed:{exc2!r}"[:120]})
@@ -1438,11 +1463,22 @@ def extract_patches(
                 bbox = (_attr(coadd, "bbox") if coadd is not None
                         else read_component(butler, ref, "bbox"))
                 if bbox is None:
-                    bbox = _attr(_whole_patch(), "bbox")
+                    bbox = _attr(_whole_patch("bbox"), "bbox")
 
+                # A patch at the edge of coverage has cells that were never
+                # built: its image bbox is the full patch while its cell grid
+                # covers only part of it, and slicing outside that raises rather
+                # than returning empty pixels.  ``bounds`` is the populated
+                # region and excludes individually missing cells too, so it is
+                # the right predicate.  Fall back to the image bbox if the
+                # component is not served -- but never load the whole patch just
+                # to ask, since that is the I/O this avoids.
+                bounds = (_attr(coadd, "bounds") if coadd is not None
+                          else read_component(butler, ref, "bounds"))
+                region = bounds if bounds is not None else bbox
                 inside = [
                     (h, x, y) for h, x, y in zip(candidates, xs, ys)
-                    if _fits_in_patch(bbox, x, y, native_size)
+                    if _fits_in_patch(region, x, y, native_size)
                 ]
                 if not inside:
                     n_empty_patches += 1
@@ -1467,15 +1503,15 @@ def extract_patches(
                     psf_model = (_attr(coadd, "psf") if coadd is not None
                                  else read_component(butler, ref, "psf"))
                     if psf_model is None:
-                        psf_model = _attr(_whole_patch(), "psf")
+                        psf_model = _attr(_whole_patch("psf"), "psf")
                     grid_src = (coadd if coadd is not None
                                 else read_component(butler, ref, "grid"))
                     if grid_src is None:
-                        grid_src = _whole_patch()
+                        grid_src = _whole_patch("grid")
                     prov = (coadd if coadd is not None
                             else read_component(butler, ref, "provenance"))
                     if prov is None:
-                        prov = _whole_patch()
+                        prov = _whole_patch("provenance")
                 except Exception as exc:
                     records.append({**base, "status": "rejected",
                                     "reasons": f"read_failed:{exc!r}"[:120]})
@@ -1509,27 +1545,35 @@ def extract_patches(
                     # the parent stays pinned in memory and the stamp saves
                     # nothing.
                     box = _stamp_box(x, y, native_size)
-                    if coadd is not None or bbox_reads_failed:
-                        stamp = _whole_patch()[box].copy()
-                    else:
-                        try:
-                            stamp = butler.get(ref, parameters={"bbox": box})
-                            # A subset that has dropped a plane would be caught
-                            # later as a confusing AttributeError, hours in.
-                            missing = [r for r in ("image", "variance", "mask")
-                                       if not hasattr(stamp, DP2_ATTRS[r])]
-                            if missing:
-                                raise AttributeError(
-                                    f"bbox read returned no {missing}"
-                                )
-                        except Exception as exc:
-                            if not bbox_reads_failed:
-                                log.warning(
-                                    "bbox read failed (%r); reading whole patches "
-                                    "instead, which is ~100x the I/O", exc,
-                                )
-                                bbox_reads_failed = True
-                            stamp = _whole_patch()[box].copy()
+                    try:
+                        if coadd is not None or bbox_reads_failed:
+                            stamp = _whole_patch("pixels")[box].copy()
+                        else:
+                            try:
+                                stamp = butler.get(ref, parameters={"bbox": box})
+                                # A subset that had dropped a plane would surface
+                                # later as a confusing AttributeError, hours in.
+                                missing = [r for r in ("image", "variance", "mask")
+                                           if not hasattr(stamp, DP2_ATTRS[r])]
+                                if missing:
+                                    raise AttributeError(
+                                        f"bbox read returned no {missing}"
+                                    )
+                            except Exception as exc:
+                                if not bbox_reads_failed:
+                                    log.warning(
+                                        "bbox read failed (%r); reading whole "
+                                        "patches instead, ~100x the I/O", exc,
+                                    )
+                                    bbox_reads_failed = True
+                                stamp = _whole_patch("pixels")[box].copy()
+                    except Exception as exc:
+                        # Whatever is wrong with this one stamp, it is one
+                        # stamp.  Record it and keep the run.
+                        rec.update(status="rejected",
+                                   reasons=f"cut_failed:{exc!r}"[:160])
+                        records.append(rec)
+                        continue
                     image = np.asarray(_attr(stamp, "image").array, dtype=np.float32)
                     if image.shape != (native_size, native_size):
                         rec.update(status="rejected", reasons=f"clipped:{image.shape}")
@@ -1562,6 +1606,12 @@ def extract_patches(
                                 "variance step will catch depth boundaries",
                                 cells[:4], sorted(visit_counts)[:4],
                             )
+                    absent = missing_cells(bounds, cells)
+                    if absent:
+                        rec.update(status="rejected",
+                                   reasons=f"missing_cells:{len(absent)}")
+                        records.append(rec)
+                        continue
                     n_lo, n_hi = stamp_depth(visit_counts if depth_usable else {}, cells)
                     if n_lo > 0:
                         depth_ratio = n_hi / n_lo

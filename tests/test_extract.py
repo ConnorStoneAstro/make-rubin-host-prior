@@ -27,6 +27,7 @@ from rubin_host_prior.rubin.extract import (
     SKYMAP,
     object_refs_for_tract,
     read_component,
+    missing_cells,
     _fits_in_patch,
     _sky_to_pixel,
     _stamp_box,
@@ -1220,3 +1221,58 @@ def test_bands_are_filtered_client_side_too():
 
     got = coadd_refs_for_tract(_All({}, {}), 7, [1], bands=("r", "z"))
     assert sorted(str(_data_id_dict(r.dataId)["band"]) for r in got) == ["r", "z"]
+
+
+# -- patches with missing cells --------------------------------------------
+
+
+class _CellIJ:
+    """CellGridBounds.missing holds these, not tuples."""
+
+    def __init__(self, i, j):
+        self.i, self.j = i, j
+
+
+class _Bounds:
+    """CellGridBounds: the populated region, minus individually missing cells."""
+
+    def __init__(self, x0, x1, y0, y1, missing=()):
+        self.x0, self.x1, self.y0, self.y1 = x0, x1, y0, y1
+        self.missing = set(missing)
+
+    def contains(self, x, y):
+        if not (self.x0 <= x < self.x1 and self.y0 <= y < self.y1):
+            return False
+        return (x // 150, y // 150) not in self.missing
+
+
+def test_a_stamp_must_fit_the_cell_grid_not_just_the_image():
+    """A patch at the edge of coverage has cells that were never built: its
+    image bbox is the full patch while its cell grid covers only part of it, and
+    slicing outside that raises rather than returning empty pixels."""
+    image_bbox = _Bounds(24000, 27300, 17850, 21150)
+    cell_bounds = _Bounds(26100, 27150, 17850, 21150)
+    x, y = 24905.0, 20236.0  # inside the image, outside the cells
+    assert _fits_in_patch(image_bbox, x, y, 416) is True
+    assert _fits_in_patch(cell_bounds, x, y, 416) is False
+
+
+def test_a_missing_cell_inside_a_stamp_is_caught_separately():
+    """A corner test catches a stamp hanging off the edge of coverage but not a
+    hole in the middle of one, and slicing across either raises."""
+    bounds = SimpleNamespace(missing=[_CellIJ(5, 5)])
+    covered = [(4, 4), (4, 5), (5, 4), (5, 5)]
+    assert missing_cells(bounds, covered) == [(5, 5)]
+    assert missing_cells(bounds, [(1, 1), (1, 2)]) == []
+
+
+def test_a_patch_with_no_missing_cells_costs_nothing():
+    assert missing_cells(SimpleNamespace(missing=frozenset()), [(0, 0)]) == []
+    assert missing_cells(None, [(0, 0)]) == []
+
+
+def test_the_stamp_corners_are_what_is_tested():
+    """A centre inside the grid is not enough; the whole stamp has to be."""
+    bounds = _Bounds(0, 3300, 0, 3300)
+    assert _fits_in_patch(bounds, 1650.0, 1650.0, 416) is True
+    assert _fits_in_patch(bounds, 100.0, 1650.0, 416) is False

@@ -572,9 +572,20 @@ pixels either: `sky_projection`, `bbox`, `psf`, `grid` and `provenance`. So a
 patch that turns out to hold no usable host costs no pixel I/O at all.
 
 Both paths fall back. If components are refused the patch is read whole and its
-attributes used; if a bbox read is refused, or comes back missing a plane —
-checked on the spot, because an absent `variance` would otherwise surface as an
-`AttributeError` hours in — the run switches to whole patches and says so once.
+attributes used — and the run says **which** component forced that, once, because
+silently taking ~100× the pixel I/O is exactly the kind of thing that should be
+visible. If a bbox read is refused, or comes back missing a plane — checked on
+the spot, since an absent `variance` would otherwise surface as an
+`AttributeError` hours in — the run switches to whole patches and says so.
+
+**A stamp is tested against the cell grid, not the image.** A patch at the edge
+of coverage has cells that were never built: its image `bbox` is the full patch
+while `bounds.bbox` covers only the populated part, and slicing outside that
+raises rather than returning empty pixels. `bounds` is the right predicate and
+excludes individually missing cells too. Because the corner test cannot see a
+hole in the *middle* of a stamp, the cells the stamp covers are checked against
+`bounds.missing` separately. And whatever else goes wrong cutting one stamp is
+recorded as `cut_failed` and the run continues — one stamp is one stamp.
 
 `--n-patches` is the number to ask for when you want a training set of a given
 size. Extraction then works towards it: draw a batch of hosts, sweep every coadd
