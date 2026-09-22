@@ -631,6 +631,42 @@ rejects, it rejects preferentially, so a set filled over several rounds is drawn
 deeper into the catalogue than one filled by the first round. Read
 `rejection_counts` before deciding that is acceptable.
 
+### Every cut lives in one file
+
+```bash
+python scripts/extract_dp2_patches.py --write-selection selection.json
+$EDITOR selection.json
+python scripts/extract_dp2_patches.py --selection selection.json --out data/hosts
+```
+
+`selection.json` holds the whole selection function — host cuts and pixel cuts
+together. They used to be spread across defaults on `select_hosts`, defaults on
+`host_adql`, module constants in `rubin.quality` and command-line flags that
+sometimes overrode one and not the other. A mistyped key is refused rather than
+leaving the default quietly in place, since a cut that looks applied and is not
+is the worst of the three outcomes.
+
+Extraction prints `describe()` before it runs: the faint limit, the surface
+brightness limit, and **which of the two binds at each size**. Size and
+brightness are not independent — `mu_e = m + 2.5·log10(2π·a·b)` — so a magnitude
+limit and a surface-brightness limit can quietly exclude each other over exactly
+the range you care about, and the answer to "why did this find nothing" is
+usually in those four lines.
+
+### Visibility is magnitude; extent is size
+
+`max_mag` is the primary host cut. Surface brightness decides whether a *fit* is
+real, but it is a poor proxy for "I can see it": a tight `max_mu_e` selects
+**concentrated** light, which is the opposite of what a prior over galaxy
+structure wants — it favours exactly the compact objects that look like point
+sources. So `max_mu_e` is left loose, as a bound on runaway fits rather than a
+selector, and total flux does the work.
+
+Extent is `min_reff_arcsec` (intrinsic, from the multiband Sersic fit) together
+with `min_deconvolved_px`, which is the same claim made against the image:
+`T² = ((ixx+iyy) − (ixxPSF+iyyPSF))/2`, exactly zero for a point source at any
+seeing.
+
 ### Host selection on DP2
 
 The DP2 Object table differs from DP1 in ways that break code silently rather

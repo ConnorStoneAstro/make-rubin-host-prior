@@ -69,6 +69,7 @@ import numpy as np
 import requests
 
 from ..config import BANDS
+from ..selection import AB_ZEROPOINT, HostCuts, Selection
 from ..data.diagnostics import AutocorrelationAccumulator
 from ..data.shards import ShardWriter
 from .quality import gate
@@ -191,9 +192,6 @@ OBJECT_BAND_COLUMNS = [
     "{b}_pixelFlags_saturatedCenter",
     "{b}_pixelFlags_interpolatedCenter",
 ]
-
-#: AB zeropoint for DP2 fluxes: m = -2.5*log10(f_nJy) + 31.4.
-AB_ZEROPOINT = 31.4
 
 #: ECDFS, still in tract 5063 as on DP1, and the field the DP2 tutorials use
 #: throughout.  ELAISS1 (10.26, -44.49) and EDFS (59.10, -48.73) also appear.
@@ -364,41 +362,6 @@ def find_object_refs(
     return refs
 
 
-#: Faintest mean surface brightness inside the half-light ellipse, in
-#: mag/arcsec^2, that a host may have.  This is the cut that decides whether a
-#: host is a galaxy or a fit that ran away.
-#:
-#: Nothing else in the selection requires the object to be *visible*.  At a 3"
-#: half-light radius the old 360 nJy floor permitted mu_e = 29.4, which is 2.4
-#: mag/arcsec^2 fainter than one sigma of sky per square arcsecond in r: not
-#: merely faint, unmeasurable.  The multiband Sersic fit is degenerate along
-#: (n, Re, flux) at that signal-to-noise and wanders off to a large radius with
-#: an invisible envelope while the real light stays in a few pixels -- which is
-#: exactly a stamp that looks like a point source.
-MAX_MU_E = 23.0
-
-#: Half-light radius bounds in arcsec.  The floor is about 1.75 PSF sigma, which
-#: is the "couple of arcsec across" end of the wanted range; the ceiling keeps
-#: 90% of the light inside an 83" stamp for any plausible profile and caps
-#: runaways from above.
-MIN_REFF_ARCSEC = 1.0
-MAX_REFF_ARCSEC = 100.0
-
-#: Minimum PSF-deconvolved moment radius, in native pixels.  A point source
-#: gives exactly 0 by construction.
-MIN_DECONVOLVED_PX = 1.0
-
-
-def surface_brightness_floor(max_mu_e: float = MAX_MU_E) -> float:
-    """nJy per arcsec^2 of half-light ellipse at ``max_mu_e``.
-
-    Written as a flux-per-area so the cut is ``flux >= K * a * b``: pure
-    multiplication, which every ADQL dialect has, where ``LOG10`` and ``POWER``
-    are not guaranteed.
-    """
-    return float(2.0 * np.pi * 10 ** ((AB_ZEROPOINT - max_mu_e) / 2.5))
-
-
 #: The TAP-side table.  The host cuts are a selection, and a selection is what a
 #: query service is for: the whole footprint is ~10^9 rows and the survivors are
 #: ~10^4, so the difference between filtering there and filtering here is the
@@ -408,60 +371,51 @@ TAP_TABLE = "dp2.Object"
 
 def host_adql(
     bands=BANDS,
-    band: str = "r",
-    flux_range: tuple[float, float] = (5750.0, 1.0e8),
-    min_reff_arcsec: float | None = MIN_REFF_ARCSEC,
-    max_reff_arcsec: float | None = MAX_REFF_ARCSEC,
-    max_mu_e: float | None = MAX_MU_E,
-    max_sersic_index: float | None = 6.0,
-    min_deconvolved_px: float | None = MIN_DECONVOLVED_PX,
-    max_blendedness: float | None = None,
+    cuts: HostCuts | None = None,
     ra: float | None = None,
     dec: float | None = None,
     radius_deg: float | None = None,
     top: int | None = None,
 ) -> str:
-    """The ADQL for the host selection.
+    """The ADQL for the host selection, built from ``HostCuts``.
 
-    Arithmetic here is multiplication and addition only.  ``LOG10`` and
+    Arithmetic here is addition and multiplication only.  ``LOG10`` and
     ``POWER`` are not guaranteed across ADQL dialects, and a clause the service
     silently declines to apply is worse than one it refuses outright -- so the
-    surface-brightness cut is written as a flux against an area rather than as a
-    magnitude, and the size cut against the moments is written on the squared
-    quantity.
+    magnitude limits are written as fluxes and the surface-brightness limit as a
+    flux against an area.
 
     The boolean flags are fetched and applied locally: how a boolean compares in
-    ADQL is backend-specific, and a wrong guess quietly returns nothing.  Nor is
+    ADQL is backend-specific and a wrong guess quietly returns nothing.  Nor is
     there an ``ORDER BY`` -- sorting burdens a shared service and the stratified
-    draw has to happen here anyway.
+    draw happens here anyway.
     """
+    cuts = cuts or HostCuts()
+    band = cuts.band
+    faint, bright = cuts.flux_range
     columns = ", ".join(host_columns(bands))
-    where = [
-        f"{band}_cModelFlux > {float(flux_range[0])}",
-        f"{band}_cModelFlux <= {float(flux_range[1])}",
-        "refExtendedness > 0.5",
-    ]
-    # NaN and NULL both fail a > comparison, which is the behaviour wanted: an
-    # object with no fit is not a large object.
-    if min_reff_arcsec is not None:
-        where.append(f"sersic_reff_major >= {float(min_reff_arcsec)}")
-    if max_reff_arcsec is not None:
-        where.append(f"sersic_reff_major <= {float(max_reff_arcsec)}")
-    if max_mu_e is not None:
-        where.append(
-            f"{band}_cModelFlux >= {surface_brightness_floor(max_mu_e):.1f} "
-            f"* sersic_reff_major * sersic_reff_minor"
-        )
-    if max_sersic_index is not None:
-        where.append(f"sersic_index <= {float(max_sersic_index)}")
-    if min_deconvolved_px is not None:
+    where = [f"{band}_cModelFlux > {faint:.1f}",
+             f"{band}_cModelFlux <= {bright:.1f}"]
+    if cuts.min_extendedness is not None:
+        where.append(f"refExtendedness > {float(cuts.min_extendedness)}")
+    # NaN and NULL both fail a > comparison, which is what is wanted: an object
+    # with no fit is not a large object.
+    where.append(f"sersic_reff_major >= {float(cuts.min_reff_arcsec)}")
+    where.append(f"sersic_reff_major <= {float(cuts.max_reff_arcsec)}")
+    floor = cuts.surface_brightness_floor()
+    if floor is not None:
+        where.append(f"{band}_cModelFlux >= {floor:.1f} "
+                     f"* sersic_reff_major * sersic_reff_minor")
+    if cuts.max_sersic_index is not None:
+        where.append(f"sersic_index <= {float(cuts.max_sersic_index)}")
+    if cuts.min_deconvolved_px is not None:
         # T^2 = ((ixx+iyy) - (ixxPSF+iyyPSF))/2, so this is T >= the threshold.
         where.append(
             f"({band}_ixx + {band}_iyy - {band}_ixxPSF - {band}_iyyPSF) "
-            f">= {2.0 * float(min_deconvolved_px) ** 2}"
+            f">= {2.0 * float(cuts.min_deconvolved_px) ** 2}"
         )
-    if max_blendedness is not None:
-        where.append(f"{band}_blendedness <= {float(max_blendedness)}")
+    if cuts.max_blendedness is not None:
+        where.append(f"{band}_blendedness <= {float(cuts.max_blendedness)}")
     if radius_deg is not None and ra is not None and dec is not None:
         where.append(
             "CONTAINS(POINT('ICRS', coord_ra, coord_dec), "
@@ -680,7 +634,6 @@ def with_positions(table):
 def build_host_catalogue(
     butler=None,
     bands: Sequence[str] = BANDS,
-    band: str = "r",
     ra: float | None = None,
     dec: float | None = None,
     radius_deg: float | None = None,
@@ -691,7 +644,7 @@ def build_host_catalogue(
     tap_service=None,
     tap_url: str | None = None,
     top: int | None = None,
-    **cuts,
+    cuts: HostCuts | None = None,
 ):
     """Host candidates from every object table in reach, cut but not sampled.
 
@@ -720,6 +673,7 @@ def build_host_catalogue(
     """
     from astropy.table import vstack
 
+    cuts = cuts or HostCuts()
     if cache is not None:
         cache = Path(cache)
         if cache.exists():
@@ -731,27 +685,15 @@ def build_host_catalogue(
         raise ValueError(f"source must be 'tap' or 'butler', not {source!r}")
 
     if source == "tap":
-        query = host_adql(
-            bands=bands,
-            band=band,
-            ra=ra,
-            dec=dec,
-            radius_deg=radius_deg,
-            top=top,
-            # Only the cuts the query can express; the rest stay local.
-            **{
-                k: v
-                for k, v in cuts.items()
-                if k in ("flux_range", "min_reff_arcsec", "max_blendedness")
-            },
-        )
+        query = host_adql(bands=bands, cuts=cuts, ra=ra, dec=dec,
+                          radius_deg=radius_deg, top=top)
         log.info("querying %s:\n%s", TAP_TABLE, query)
         pool = with_positions(unmask(run_adql(tap_service or tap_client(url=tap_url), query)))
         log.info("TAP returned %d usable rows", len(pool))
         # The service applied the numeric cuts; these are the rest -- the Sersic
         # failure flags, the point-source cross-check, and the dedupe across
         # tracts, which the query cannot do.
-        pool = select_hosts(pool, band=band, n_hosts=None, **cuts)
+        pool = select_hosts(pool, cuts=cuts, n_hosts=None)
         log.info("host catalogue: %d candidates", len(pool))
         if cache is not None:
             _write_table(cache.with_suffix(""), pool)
@@ -783,7 +725,7 @@ def build_host_catalogue(
             table = _within_radius(table, ra, dec, radius_deg)
         if not len(table):
             continue
-        survivors = select_hosts(table, band=band, n_hosts=None, **cuts)
+        survivors = select_hosts(table, cuts=cuts, n_hosts=None)
         if len(survivors):
             kept.append(survivors)
         if i % report_every == 0 or i == len(refs):
@@ -798,7 +740,7 @@ def build_host_catalogue(
     if not kept:
         raise RuntimeError(
             f"no host passed the cuts in {len(refs)} object table(s) covering "
-            f"{n_rows} rows; loosen min_reff_arcsec or host_flux_range"
+            f"{n_rows} rows; loosen the host cuts"
         )
     pool = vstack(kept, metadata_conflicts="silent") if len(kept) > 1 else kept[0]
     # Tracts overlap, so a host in an overlap appears in two tables under two
@@ -955,115 +897,91 @@ def host_half_light_arcsec(table, axis: str = "major") -> np.ndarray:
 
 def select_hosts(
     table,
-    band: str = "r",
-    flux_range: tuple[float, float] = (5750.0, 1.0e8),
-    max_blendedness: float | None = None,
+    cuts: HostCuts | None = None,
     n_hosts: int | None = None,
     seed: int = 0,
     exclude_ids: set[int] | None = None,
-    size_stratified: bool = True,
-    min_reff_arcsec: float | None = MIN_REFF_ARCSEC,
-    max_reff_arcsec: float | None = MAX_REFF_ARCSEC,
-    max_mu_e: float | None = MAX_MU_E,
-    min_deconvolved_px: float | None = MIN_DECONVOLVED_PX,
-    dedupe_radius_arcsec: float = 0.5,
-    n_size_bins: int = 5,
 ):
-    """Galaxies bright enough per unit area to be real, stratified by size.
+    """Apply ``HostCuts`` to a catalogue and draw a size-stratified sample.
 
-    The cut that matters is ``max_mu_e``, not the size bounds.  Nothing else
-    here requires a host to be *visible*: the old 360 nJy floor with a 3"
-    half-light radius admitted objects at mu_e = 29.4 mag/arcsec^2, fainter than
-    a sigma of sky per square arcsecond, where the Sersic fit is degenerate and
-    runs away to a large radius around an invisible envelope.  Those rows pass
-    every size cut and arrive as point-like blobs.
-
-    So the sample is **surface-brightness limited rather than size limited**:
-    the size bounds are wide (0.7" to 12", a factor of 17) and the brightness
-    per unit area is what decides.  ``min_deconvolved_px`` is the companion cut
-    on the image itself, PSF-referenced, since the raw moments of a point source
-    are whatever the seeing was.
+    The same cuts the ADQL already applied are applied again here, because the
+    butler path does not go through ADQL at all and because booleans cannot be
+    trusted to the query.  Re-applying a cut the service already made is cheap
+    and keeps one definition of what a host is.
 
     ``size_stratified`` draws equally from bins of equal *width* in log size
-    over a **fixed** range, not over the data's own min and max.  Two ways to
-    get this wrong, both of which were here: quantile bins hold equal numbers by
-    construction, so drawing equally from them is exactly a uniform sample; and
-    data-driven edges hand entire bins to whatever tail the sample has, which
-    with runaway fits means stratification preferentially selects them.
+    over the **fixed** range in the cuts, not over the sample's own min and max.
+    Two ways to get this wrong, both of which were here: quantile bins hold
+    equal numbers by construction, so drawing equally from them is exactly a
+    uniform sample; and data-driven edges hand whole bins to whatever tail the
+    sample has, which with runaway fits means stratification selects them
+    preferentially.
     """
+    cuts = cuts or HostCuts()
+    band = cuts.band
     rng = np.random.default_rng(seed)
     if band not in PHOTOMETRY_BANDS:
         raise ValueError(
-            f"band {band!r} has no DP2 Object photometry; choose from " f"{PHOTOMETRY_BANDS}"
+            f"band {band!r} has no DP2 Object photometry; choose from "
+            f"{PHOTOMETRY_BANDS}"
         )
-    t = dedupe_hosts(table, dedupe_radius_arcsec)
+    t = dedupe_hosts(table, cuts.dedupe_radius_arcsec)
+    have = _colnames(t)
     keep = np.ones(len(t), dtype=bool)
     if exclude_ids:
-        # Topping up towards a target: these have already been tried, and
-        # offering them again would either duplicate a stamp or re-earn the
-        # same rejection.
-        keep &= ~np.isin(
-            np.asarray(t["objectId"], dtype=np.int64),
-            np.fromiter(exclude_ids, dtype=np.int64, count=len(exclude_ids)),
-        )
-    if "refExtendedness" in _colnames(t):
+        # Topping up towards a target: these have been tried, and offering them
+        # again would either duplicate a stamp or re-earn the same rejection.
+        keep &= ~np.isin(np.asarray(t["objectId"], dtype=np.int64),
+                         np.fromiter(exclude_ids, dtype=np.int64,
+                                     count=len(exclude_ids)))
+    if cuts.min_extendedness is not None and "refExtendedness" in have:
         ext = np.asarray(t["refExtendedness"], dtype=float)
-        keep &= np.isfinite(ext) & (ext > 0.5)
+        keep &= np.isfinite(ext) & (ext > cuts.min_extendedness)
 
+    faint, bright = cuts.flux_range
     flux = np.asarray(t[f"{band}_cModelFlux"], dtype=float)
-    keep &= np.isfinite(flux) & (flux > flux_range[0]) & (flux <= flux_range[1])
-    if max_blendedness is not None and f"{band}_blendedness" in _colnames(t):
+    keep &= np.isfinite(flux) & (flux > faint) & (flux <= bright)
+    if cuts.max_blendedness is not None and f"{band}_blendedness" in have:
         bl = np.asarray(t[f"{band}_blendedness"], dtype=float)
-        keep &= ~(np.isfinite(bl) & (bl > max_blendedness))
-
-    # A saturated core is the real bright limit; an interpolated one is
-    # synthetic structure sitting exactly where the transient goes.
-    for flag in ("saturatedCenter", "interpolatedCenter"):
+        keep &= ~(np.isfinite(bl) & (bl > cuts.max_blendedness))
+    for flag, wanted in (("saturatedCenter", cuts.reject_saturated_centre),
+                         ("interpolatedCenter", cuts.reject_interpolated_centre)):
         column = f"{band}_pixelFlags_{flag}"
-        if column in _colnames(t):
+        if wanted and column in have:
             keep &= ~np.asarray(t[column], dtype=bool)
 
     reff = host_half_light_arcsec(t)
-    if min_deconvolved_px is not None:
-        keep &= host_deconvolved_px(t, band) >= min_deconvolved_px
-    if max_reff_arcsec is not None:
-        keep &= np.isfinite(reff) & (reff <= max_reff_arcsec)
-    if max_mu_e is not None:
+    if cuts.min_deconvolved_px is not None:
+        keep &= host_deconvolved_px(t, band) >= cuts.min_deconvolved_px
+    in_size = (np.isfinite(reff) & (reff >= cuts.min_reff_arcsec)
+               & (reff <= cuts.max_reff_arcsec))
+    if cuts.max_mu_e is not None:
         mu = host_mu_e(t, band)
-        bright_enough = np.isfinite(mu) & (mu <= max_mu_e)
-        log.info(
-            "surface-brightness cut at mu_e <= %.1f: %d of %d survive",
-            max_mu_e,
-            int((keep & bright_enough).sum()),
-            int(keep.sum()),
-        )
+        bright_enough = np.isfinite(mu) & (mu <= cuts.max_mu_e)
+        log.info("mu_e <= %.1f: %d of %d survive", cuts.max_mu_e,
+                 int((keep & bright_enough).sum()), int(keep.sum()))
         keep &= bright_enough
-    if min_reff_arcsec is not None:
-        big_enough = np.isfinite(reff) & (reff >= min_reff_arcsec)
-        log.info(
-            'half-light cut at %.2f": %d of %d survive; %d dropped as smaller, '
-            "%d for having no usable Sersic fit",
-            min_reff_arcsec,
-            int((keep & big_enough).sum()),
-            int(keep.sum()),
-            int((keep & np.isfinite(reff) & ~big_enough).sum()),
-            int((keep & ~np.isfinite(reff)).sum()),
-        )
-        keep &= big_enough
+    log.info("size in [%.2f, %.2f]\": %d of %d survive; %d too small, %d too "
+             "large, %d with no usable Sersic fit",
+             cuts.min_reff_arcsec, cuts.max_reff_arcsec,
+             int((keep & in_size).sum()), int(keep.sum()),
+             int((keep & np.isfinite(reff) & (reff < cuts.min_reff_arcsec)).sum()),
+             int((keep & np.isfinite(reff) & (reff > cuts.max_reff_arcsec)).sum()),
+             int((keep & ~np.isfinite(reff)).sum()))
+    keep &= in_size
 
     t = t[keep]
     reff = reff[keep]
     if n_hosts is None or n_hosts >= len(t):
         return t
-    if not size_stratified:
+    if not cuts.size_stratified:
         return t[rng.choice(len(t), size=n_hosts, replace=False)]
 
-    lo = np.log10(min_reff_arcsec or max(np.nanmin(reff), 1e-3))
-    hi = np.log10(max_reff_arcsec or np.nanmax(reff))
-    edges = np.linspace(lo, hi, n_size_bins + 1)
+    edges = np.linspace(np.log10(cuts.min_reff_arcsec),
+                        np.log10(cuts.max_reff_arcsec), cuts.n_size_bins + 1)
     edges[-1] += 1e-9
     log_size = np.log10(np.maximum(reff, 1e-6))
-    per_bin = max(n_hosts // n_size_bins, 1)
+    per_bin = max(n_hosts // cuts.n_size_bins, 1)
     picks: list[int] = []
     for a, b in zip(edges[:-1], edges[1:]):
         idx = np.where((log_size >= a) & (log_size < b))[0]
@@ -1393,14 +1311,10 @@ def extract_patches(
     limit_tracts: int | None = None,
     limit_hosts: int | None = None,
     jitter_arcsec: float = 4.0,
-    host_flux_range: tuple[float, float] = (5750.0, 1.0e8),
-    max_blendedness: float | None = None,
-    min_reff_arcsec: float = MIN_REFF_ARCSEC,
-    max_mu_e: float | None = MAX_MU_E,
+    selection: Selection | None = None,
     patches_per_shard: int = 1024,
     max_patches: int | None = None,
     neighbour_radius_arcsec: float = 30.0,
-    gate_kwargs: dict | None = None,
     seed: int = 0,
     prefix: str = "patches",
 ) -> dict:
@@ -1436,7 +1350,8 @@ def extract_patches(
     rng = np.random.default_rng(seed)
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
-    gate_kwargs = dict(gate_kwargs or {})
+    selection = selection or Selection()
+    gate_kwargs = selection.patches.gate_kwargs()
     # ``n_patches`` is a target to work towards; ``max_patches`` is a hard stop.
     # Both end the sweep at the same place, only ``n_patches`` tops up.
     target = n_patches if n_patches is not None else max_patches
@@ -1444,7 +1359,7 @@ def extract_patches(
     field = build_host_catalogue(
         butler,
         bands=bands,
-        band="r" if "r" in bands else bands[0],
+        cuts=selection.hosts,
         ra=ra,
         dec=dec,
         radius_deg=radius_deg,
@@ -1454,10 +1369,6 @@ def extract_patches(
         tap_service=tap_service,
         tap_url=tap_url,
         top=limit_hosts,
-        flux_range=host_flux_range,
-        max_blendedness=max_blendedness,
-        min_reff_arcsec=min_reff_arcsec,
-        max_mu_e=max_mu_e,
     )
 
     records: list[dict] = []
@@ -1737,17 +1648,8 @@ def extract_patches(
     rounds = 0
     while True:
         rounds += 1
-        hosts = select_hosts(
-            field,
-            band="r" if "r" in bands else bands[0],
-            flux_range=host_flux_range,
-            max_blendedness=max_blendedness,
-            min_reff_arcsec=min_reff_arcsec,
-            max_mu_e=max_mu_e,
-            n_hosts=batch,
-            exclude_ids=tried,
-            seed=seed + rounds,
-        )
+        hosts = select_hosts(field, cuts=selection.hosts, n_hosts=batch,
+                             exclude_ids=tried, seed=seed + rounds)
         if not len(hosts):
             log.info("no untried hosts left in the catalogue after %d round(s)", rounds - 1)
             break

@@ -30,7 +30,7 @@ import json
 import logging
 from pathlib import Path
 
-from rubin_host_prior.rubin.quality import MAX_VARIANCE_STEP
+from rubin_host_prior.selection import Selection
 from rubin_host_prior.rubin.extract import (
     COLLECTION,
     ECDFS,
@@ -42,7 +42,16 @@ from rubin_host_prior.rubin.extract import (
 
 def main() -> None:
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("--out", required=True, help="output directory")
+    p.add_argument("--out", help="output directory")
+    p.add_argument(
+        "--selection", default=None,
+        help="JSON file holding every host and patch cut. Write the defaults "
+             "with --write-selection, edit it, pass it back here",
+    )
+    p.add_argument(
+        "--write-selection", default=None,
+        help="write the default cuts to this path and exit",
+    )
     p.add_argument("--repo", default=REPO, help="butler repo alias or path")
     p.add_argument("--collection", default=COLLECTION)
     p.add_argument("--ra", type=float, default=ECDFS[0])
@@ -108,32 +117,6 @@ def main() -> None:
         "--max-rounds", type=int, default=8,
         help="give up topping up towards --n-patches after this many rounds",
     )
-    p.add_argument(
-        "--min-reff-arcsec", type=float, default=None,
-        help="host half-light major axis floor in arcsec, from the multiband "
-             "Sersic fit. Defaults to 0.7. This is NOT the cut that decides "
-             "whether a host looks like a galaxy -- see --max-mu-e",
-    )
-    p.add_argument(
-        "--max-mu-e", type=float, default=None,
-        help="faintest mean surface brightness inside the half-light ellipse, "
-             "mag/arcsec^2. Defaults to 24.5. This is the cut that separates a "
-             "galaxy from a Sersic fit that ran away around an invisible "
-             "envelope; a sigma of sky per square arcsecond is about 27",
-    )
-    p.add_argument(
-        "--min-visits", type=int, default=None,
-        help="reject a stamp whose shallowest cell has fewer than this many "
-             "visits. Early DP2 outside the deep fields is 1-3 visits per cell, "
-             "which is a different sky from a deep coadd; off by default",
-    )
-    p.add_argument(
-        "--max-variance-step", type=float, default=MAX_VARIANCE_STEP,
-        help="reject a stamp whose block variance floors differ by more than "
-             "this ratio. Cell-based coadds step in depth at cell edges and no "
-             "mask plane flags it; set high to keep them and cut later from the "
-             "manifest, which records the ratio either way",
-    )
     p.add_argument("--jitter-arcsec", type=float, default=4.0)
     p.add_argument("--patches-per-shard", type=int, default=1024)
     p.add_argument("--max-patches", type=int, default=None)
@@ -147,6 +130,17 @@ def main() -> None:
         level=[logging.WARNING, logging.INFO, logging.DEBUG][min(args.verbose, 2)],
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
+
+    selection = (Selection.load(args.selection) if args.selection
+                 else Selection())
+    if not args.write_selection and not args.out:
+        p.error("--out is required unless --write-selection is given")
+    if args.write_selection:
+        selection.save(args.write_selection)
+        print(f"wrote {args.write_selection}")
+        print(selection.describe())
+        return
+    print(selection.describe())
 
     butler = open_butler(args.repo, args.collection)
     summary = extract_patches(
@@ -165,11 +159,7 @@ def main() -> None:
         n_hosts=args.n_hosts,
         n_patches=args.n_patches,
         max_rounds=args.max_rounds,
-        **({"min_reff_arcsec": args.min_reff_arcsec}
-           if args.min_reff_arcsec is not None else {}),
-        **({"max_mu_e": args.max_mu_e} if args.max_mu_e is not None else {}),
-        gate_kwargs={"max_variance_step": args.max_variance_step,
-                     "min_visits": args.min_visits},
+        selection=selection,
         jitter_arcsec=args.jitter_arcsec,
         patches_per_shard=args.patches_per_shard,
         max_patches=args.max_patches,

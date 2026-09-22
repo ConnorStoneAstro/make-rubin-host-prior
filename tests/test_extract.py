@@ -11,6 +11,7 @@ import numpy as np
 import pytest
 
 import rubin_host_prior.rubin.extract as ex
+from rubin_host_prior.selection import HostCuts, PatchCuts, Selection
 from rubin_host_prior.rubin.extract import (
     OBJECT_BAND_COLUMNS,
     OBJECT_COLUMNS,
@@ -187,7 +188,8 @@ def test_a_shallow_coadd_is_rejected_when_asked(monkeypatch, tmp_path):
     butler = fakes.FakeButler(TRACTS, objects, n_visits=2)
 
     summary = _run(butler, tmp_path, n_patches=None,
-                   gate_kwargs={"min_visits": 10})
+                   selection=Selection(hosts=HostCuts(**_LOOSE),
+                                       patches=PatchCuts(min_visits=10)))
     assert summary["n_accepted"] == 0
     assert "too_shallow" in summary["rejection_counts"]
 
@@ -283,6 +285,14 @@ def test_the_cells_a_stamp_covers_include_the_middle_ones():
 # -- host selection ---------------------------------------------------------
 
 
+#: Cuts wide enough that a fixture is not filtered by something it is not
+#: testing.  Each test then tightens the one cut it is about.
+_LOOSE_BUT_SIZE = dict(max_mag=30.0, min_mag=5.0, max_reff_arcsec=1e4,
+                       max_mu_e=None, min_deconvolved_px=None,
+                       max_sersic_index=None, min_extendedness=None)
+_LOOSE = dict(min_reff_arcsec=0.01, **_LOOSE_BUT_SIZE)
+
+
 def _hosts(n=3000, scale=0.6, seed=1, tract=5063):
     rng = np.random.default_rng(seed)
     trace_sq = 25.0 * 10 ** rng.exponential(scale, n)
@@ -328,21 +338,21 @@ def test_size_comes_from_the_multiband_sersic_fit():
 
 
 def test_small_hosts_are_cut_and_the_rest_are_spread_over_size():
-    """The catalogue is dominated by galaxies a pixel or two across, which carry
-    no structure to learn.  Stratification must use equal-width bins in log
-    size: quantile bins hold equal numbers by construction, so drawing equally
-    from them is exactly a uniform sample and stratifies nothing."""
+    """Stratification must use equal-width bins in log size over a *fixed*
+    range.  Quantile bins hold equal numbers by construction, so drawing equally
+    from them is exactly a uniform sample; and edges taken from the sample's own
+    min and max hand whole bins to whatever tail exists."""
     t = _hosts(seed=1)
-    kept = select_hosts(t, band="r", min_reff_arcsec=3.0)
+    kept = select_hosts(t, HostCuts(min_reff_arcsec=3.0, **_LOOSE_BUT_SIZE))
     assert len(kept) and np.all(host_half_light_arcsec(kept) >= 3.0)
-    assert len(kept) < len(select_hosts(t, band="r", min_reff_arcsec=None))
+    assert len(kept) < len(select_hosts(t, HostCuts(**_LOOSE)))
 
-    kw = dict(band="r", min_reff_arcsec=None)
+    kw = dict(cuts=HostCuts(**_LOOSE))
     parent = host_half_light_arcsec(select_hosts(t, **kw))
     big = np.percentile(parent, 90)
     strat = host_half_light_arcsec(select_hosts(t, n_hosts=50, seed=0, **kw))
-    flat = host_half_light_arcsec(
-        select_hosts(t, n_hosts=50, seed=0, size_stratified=False, **kw))
+    flat = host_half_light_arcsec(select_hosts(
+        t, HostCuts(size_stratified=False, **_LOOSE), n_hosts=50, seed=0))
     # The bug this guards was exactly a no-op: quantile bins gave ratio 1.0.
     assert np.mean(strat > big) > 2 * np.mean(flat > big)
     assert np.median(strat) > 1.4 * np.median(flat)
@@ -353,11 +363,11 @@ def test_duplicates_and_already_tried_hosts_are_not_offered():
     source two different objectIds, so sky coincidence is the only dedupe."""
     t = _hosts(200, seed=2)
     doubled = Table(np.concatenate([t.as_array(), t.as_array()]))
-    assert len(select_hosts(doubled, band="r")) == len(select_hosts(t, band="r"))
+    assert len(select_hosts(doubled, HostCuts(**_LOOSE))) == len(select_hosts(t, HostCuts(**_LOOSE)))
 
-    first = select_hosts(t, band="r", n_hosts=20, seed=0)
+    first = select_hosts(t, HostCuts(**_LOOSE), n_hosts=20, seed=0)
     ids = {int(i) for i in first["objectId"]}
-    second = select_hosts(t, band="r", n_hosts=20, seed=0, exclude_ids=ids)
+    second = select_hosts(t, HostCuts(**_LOOSE), n_hosts=20, seed=0, exclude_ids=ids)
     assert len(second) == 20 and not (ids & {int(i) for i in second["objectId"]})
 
 
@@ -376,7 +386,7 @@ def test_the_top_up_loop_terminates_and_sizes_itself():
 def test_the_butler_scan_keeps_only_survivors(butler):
     """An object table is ~700k rows and the footprint ~1000 of them, so the
     cuts run per tract rather than on a concatenation of all of them."""
-    pool = build_host_catalogue(butler, source="butler")
+    pool = build_host_catalogue(butler, source="butler", cuts=HostCuts(**_LOOSE))
     assert 0 < len(pool) <= sum(len(t) for t in butler.objects.values())
     with pytest.raises(ValueError, match="butler"):
         build_host_catalogue(source="butler")
@@ -385,10 +395,12 @@ def test_the_butler_scan_keeps_only_survivors(butler):
 
 
 def test_the_selective_cuts_go_into_the_adql_and_the_rest_do_not():
-    q = host_adql(bands=("r",), min_reff_arcsec=3.0, flux_range=(360.0, 3e6))
+    q = host_adql(bands=("r",), cuts=HostCuts(min_reff_arcsec=3.0))
     select, _, where = q.partition("WHERE")
     assert "sersic_reff_major >= 3.0" in where
-    assert "r_cModelFlux > 360.0" in where and "FROM dp2.Object" in q
+    # Magnitudes become fluxes: the ADQL has no LOG10 it can be trusted with.
+    assert f"r_cModelFlux > {HostCuts().flux_range[0]:.1f}" in where
+    assert "FROM dp2.Object" in q
     # Fetched but compared locally: how a boolean compares in ADQL is
     # backend-specific and a wrong guess silently returns nothing.
     assert "sersic_unknown_flag" in select and "sersic_unknown_flag" not in where
@@ -405,11 +417,11 @@ def test_tap_results_get_the_local_cuts_and_can_be_cached(tmp_path):
     table = _hosts(200, seed=4)
     table["sersic_no_data_flag"][:100] = True
     service = _Tap(table)
-    pool = build_host_catalogue(tap_service=service,
+    pool = build_host_catalogue(tap_service=service, cuts=HostCuts(**_LOOSE),
                                 cache=tmp_path / "hosts.parquet")
     assert len(pool) and np.all(np.asarray(pool["objectId"]) >= 100)
 
-    again = build_host_catalogue(tap_service=None,
+    again = build_host_catalogue(tap_service=None, cuts=HostCuts(**_LOOSE),
                                  cache=tmp_path / "hosts.parquet")
     assert len(again) == len(pool) and len(service.jobs) == 1
 
@@ -552,7 +564,8 @@ def test_surface_brightness_is_what_separates_a_galaxy_from_a_runaway_fit():
     mu = ex.host_mu_e(t, "r")
     assert mu[0] == pytest.approx(21.4, abs=0.1)
     assert mu[1] == pytest.approx(28.8, abs=0.1)
-    kept = select_hosts(t, band="r", flux_range=(1.0, 1e9))
+    kept = select_hosts(t, HostCuts(max_mag=30.0, min_mag=5.0, min_reff_arcsec=0.5,
+                             min_deconvolved_px=None, max_mu_e=25.5))
     assert [int(i) for i in kept["objectId"]] == [1]
 
 
@@ -575,7 +588,7 @@ def test_a_saturated_or_interpolated_core_disqualifies_a_host():
     t = _hosts(40, seed=9)
     t["r_pixelFlags_saturatedCenter"][:10] = True
     t["r_pixelFlags_interpolatedCenter"][10:20] = True
-    kept = select_hosts(t, band="r")
+    kept = select_hosts(t, HostCuts(**_LOOSE))
     assert len(kept) and np.all(np.asarray(kept["objectId"]) >= 20)
 
 
@@ -584,13 +597,15 @@ def test_stratification_bins_do_not_follow_the_sample_tail():
     tail exists -- with runaway fits, that means stratification preferentially
     selects them."""
     q = host_adql(bands=("r",))
-    assert "sersic_reff_major <= 12.0" in q  # the tail is bounded server-side
+    assert "sersic_reff_major <=" in q  # the tail is bounded server-side
 
     t = _hosts(2000, seed=10)
     t["sersic_reff_major"][:5] = 200.0  # a handful of absurd fits
     t["sersic_reff_minor"][:5] = 120.0
-    kept = select_hosts(t, band="r", n_hosts=100, seed=0)
-    assert np.all(host_half_light_arcsec(kept) <= 12.0)
+    kept = select_hosts(t, HostCuts(max_reff_arcsec=30.0, **{
+        k: v for k, v in _LOOSE.items() if k != "max_reff_arcsec"}),
+        n_hosts=100, seed=0)
+    assert np.all(host_half_light_arcsec(kept) <= 30.0)
 
 
 def test_the_butler_and_tap_column_lists_are_not_the_same():
@@ -627,3 +642,57 @@ def test_a_column_the_parquet_lacks_says_why(butler):
     butler.get = missing
     with pytest.raises(RuntimeError, match="not the same table"):
         ex._neighbour_index(butler, 5063, ["x_cModelMag"], ("r",))
+
+
+# -- one file holds every cut ----------------------------------------------
+
+
+def test_the_selection_round_trips_and_refuses_a_typo(tmp_path):
+    """A mistyped key in a hand-edited file must not leave the default quietly
+    in place: that is a cut that looks applied and is not."""
+    import json
+
+    sel = Selection(hosts=HostCuts(max_mag=19.0, min_reff_arcsec=2.0),
+                    patches=PatchCuts(min_visits=5, max_variance_step=None))
+    sel.save(tmp_path / "s.json")
+    back = Selection.load(tmp_path / "s.json")
+    assert back == sel
+    assert back.patches.gate_kwargs()["max_variance_step"] == float("inf")
+    assert back.patches.gate_kwargs()["min_visits"] == 5
+
+    raw = json.loads((tmp_path / "s.json").read_text())
+    raw["hosts"]["max_magnitude"] = 19.0  # near miss
+    (tmp_path / "bad.json").write_text(json.dumps(raw))
+    with pytest.raises(ValueError, match="max_magnitude"):
+        Selection.load(tmp_path / "bad.json")
+
+
+def test_magnitude_is_the_visibility_cut_and_becomes_a_flux():
+    """Total magnitude, not surface brightness.  A tight mu_e cut selects
+    *concentrated* light, which is the opposite of what a prior over galaxy
+    structure wants."""
+    cuts = HostCuts(max_mag=20.5)
+    faint, bright = cuts.flux_range
+    assert faint == pytest.approx(22909, rel=1e-3)   # r = 20.5
+    assert bright > faint
+    assert f"{faint:.1f}" in host_adql(cuts=cuts)
+
+
+def test_describe_shows_which_cut_binds_at_each_size():
+    """Size and brightness are not independent -- mu_e = m + 2.5log10(2 pi a b) --
+    so a magnitude limit and a surface-brightness limit can quietly exclude each
+    other over the range that matters."""
+    text = HostCuts(max_mag=20.5, max_mu_e=25.5).describe()
+    assert "magnitude" in text and "surface brightness" in text
+    # Bright and small: magnitude binds.  Large: surface brightness binds.
+    rows = [l.split() for l in text.splitlines() if l.strip().startswith(("2.0", "20.0"))]
+    assert rows[0][-1] == "magnitude" and rows[-1][-1] == "brightness"
+
+
+def test_no_data_is_gated_once_not_twice():
+    """It was both a zero-tolerance plane and a measured fraction with a 2%
+    tolerance, so the plane always won and the tolerance never did anything --
+    which on ragged coverage rejected most stamps that clipped a survey edge."""
+    cuts = PatchCuts()
+    assert "NO_DATA" not in cuts.zero_tolerance_planes
+    assert cuts.gate_kwargs()["max_no_data"] > 0
