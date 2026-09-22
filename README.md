@@ -823,7 +823,13 @@ agree on which one is x, so the first stamp checks that its cells appear in the
 table at all and, if they do not, says so and falls back rather than rejecting
 every stamp for the most confusing possible reason.
 
-`n_cells_spanned` is still recorded as the footprint.
+`n_cells_spanned` is still recorded as the footprint, and `visits_per_cell` in
+the summary gives the depth of the **whole run** — every cell of every patch
+swept. That replaces a log line that reported the first patch only: it read like
+a property of the run, so it moved whenever anything perturbed the RNG stream
+that decides which tract is visited first. Removing the per-host jitter did
+exactly that, and the reported depth went from 1–9 visits to 1–1 with no change
+to the data at all. The per-patch line is still printed, but it names its patch.
 
 **Absolute depth is a separate question from depth *variation*.** Early DP2
 outside the deep fields runs 1–3 visits per cell, which is a different sky from a

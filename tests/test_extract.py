@@ -737,3 +737,46 @@ def test_stamps_are_centred_on_the_host(butler, tmp_path):
                          accepted["coord_dec"] - dec).min() * 3600.0
         assert match < 1e-6
     assert "host_offset_arcsec" not in shards.meta
+
+
+class monkeypatch_noop:
+    """fakes.install only needs something with setattr."""
+
+    def setattr(self, obj, name, value):
+        setattr(obj, name, value)
+
+
+def test_depth_is_reported_for_the_run_not_for_whichever_patch_came_first(
+        butler, tmp_path, caplog):
+    """The old line described a single patch but read like a property of the
+    run, so it moved whenever anything perturbed the RNG stream that decides
+    which tract is visited first -- removing the per-host jitter changed it from
+    1-9 visits to 1-1 with no change to the data at all."""
+    import fakes as _f
+
+    objects = {t: _catalogue(t, *c, seed=t, patches=(0, 1, 2))
+               for t, c in TRACTS.items()}
+    _f.install(monkeypatch_noop(), ex)
+    wide = _f.FakeButler(TRACTS, objects)
+    with caplog.at_level("INFO"):
+        summary = _run(wide, tmp_path, n_patches=None, n_hosts=40)
+
+    dist = summary["visits_per_cell"]
+    assert dist["n"] > 0 and dist["min"] <= dist["p50"] <= dist["max"]
+    # Many patches contribute, not one.
+    assert dist["n"] > _f.CELLS_PER_PATCH**2, "should span more than one patch"
+    # And the per-patch line says which patch it is talking about.
+    assert "visits per cell" in caplog.text and "patch" in caplog.text
+
+
+def test_the_run_summary_survives_a_field_with_no_provenance(butler, tmp_path):
+    real = butler.get
+
+    def no_prov(what, dataId=None, parameters=None):
+        if isinstance(what, str) and what.endswith("provenance"):
+            raise RuntimeError("not served")
+        return real(what, dataId, parameters)
+
+    butler.get = no_prov
+    with pytest.raises(RuntimeError):
+        _run(butler, tmp_path)

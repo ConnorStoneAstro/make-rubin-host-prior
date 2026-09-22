@@ -1395,6 +1395,9 @@ def extract_patches(
     n_refs = 0
     neighbour_cols = neighbour_columns(bands)
     depth_logged = False
+    #: Every cell of every patch swept, so the run can report its own depth
+    #: rather than whichever patch happened to be visited first.
+    all_visit_counts: list[int] = []
 
     def depth_logged_once() -> bool:
         """True after the first time the per-cell depth line has been printed."""
@@ -1459,12 +1462,13 @@ def extract_patches(
                 wcs = read_component(butler, ref, "wcs")
                 bounds = read_component(butler, ref, "psf").bounds
                 visit_counts = cell_visit_counts(read_component(butler, ref, "provenance"))
-                if visit_counts and not depth_logged_once():
-                    log.info(
-                        "per-cell visit counts: %d cells, %d-%d visits",
-                        len(visit_counts),
-                        min(visit_counts.values()),
-                        max(visit_counts.values()),
+                if visit_counts:
+                    all_visit_counts.extend(visit_counts.values())
+                    log.log(
+                        logging.INFO if not depth_logged_once() else logging.DEBUG,
+                        "tract %d patch %d: %d cells, %d-%d visits per cell",
+                        tract, base["patch"], len(visit_counts),
+                        min(visit_counts.values()), max(visit_counts.values()),
                     )
 
                 xs, ys = _sky_to_pixel(wcs, tgt_ra[candidates], tgt_dec[candidates])
@@ -1718,6 +1722,7 @@ def extract_patches(
         n_hosts_tried=len(tried),
         n_hosts_attempted=len(attempted),
         n_hosts_no_stamp_fitted=never,
+        visits_per_cell=_distribution(all_visit_counts),
         n_patches_with_hosts=n_matched_patches,
         n_patches_without_hosts=n_empty_patches,
         field_radius_deg=radius_deg,
@@ -1733,6 +1738,16 @@ def extract_patches(
     )
     (out_dir / "summary.json").write_text(json.dumps(summary, indent=2, default=str))
     return summary
+
+
+def _distribution(values) -> dict:
+    """Percentiles of a list, for the summary.  Empty in, empty out."""
+    a = np.asarray(list(values), dtype=float)
+    if not a.size:
+        return {}
+    pcts = np.percentile(a, [0, 25, 50, 75, 100])
+    return {"n": int(a.size),
+            **{k: float(v) for k, v in zip(("min", "p25", "p50", "p75", "max"), pcts)}}
 
 
 def _within_radius(table, ra: float, dec: float, radius_deg: float):
