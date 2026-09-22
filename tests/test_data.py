@@ -675,3 +675,36 @@ def test_sky_scatter_matches_the_prediction(shard_dir):
             ss, config, LogFluxTransform.from_config(config.transform))
         assert ds.stats(48)["sky_scatter"] == pytest.approx(
             expected_sky_scatter(ss_val), rel=0.5)
+
+
+def test_shards_from_an_older_schema_are_refused(shard_dir, tmp_path):
+    """Schema 1 stored variance, mask and PSF arrays and a different metadata
+    set.  It still *opens* -- missing columns fill with -1 -- which is exactly
+    the problem, because a stale set then trains or plots without complaint."""
+    import shutil
+
+    import h5py
+
+    from rubin_host_prior.data.shards import SHARD_SCHEMA
+
+    copy = tmp_path / "old"
+    shutil.copytree(shard_dir, copy)
+    for path in sorted(copy.glob("*.h5")):
+        with h5py.File(path, "a") as f:
+            del f.attrs["schema"]
+    with pytest.raises(ValueError, match="shard schema 1"):
+        ShardSet.from_dir(copy)
+    assert SHARD_SCHEMA == 2
+
+
+def test_a_shard_missing_a_metadata_column_is_refused(shard_dir, tmp_path):
+    import shutil
+
+    import h5py
+
+    copy = tmp_path / "gappy"
+    shutil.copytree(shard_dir, copy)
+    with h5py.File(sorted(copy.glob("*.h5"))[0], "a") as f:
+        del f["meta"]["sky_noise"]
+    with pytest.raises(ValueError, match="sky_noise"):
+        ShardSet.from_dir(copy)

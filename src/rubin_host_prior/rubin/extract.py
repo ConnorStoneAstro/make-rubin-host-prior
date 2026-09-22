@@ -896,27 +896,34 @@ def host_trace_radius_px(table, band: str) -> np.ndarray:
 def host_half_light_arcsec(table, axis: str = "major") -> np.ndarray:
     """Half-light radius in arcsec, from the multiband Sersic fit.
 
-    ``sersic_reff_major`` carries no band prefix: it is one morphology fit to all
-    six bands at once, so it does not inherit the band-to-band scatter of a
-    per-band fit and does not have to be blended across components the way
-    cModel's separate exponential and de Vaucouleurs radii do.
+    ``sersic_reff_major`` carries no band prefix: it is one morphology fit to
+    all six bands at once, so it does not inherit the band-to-band scatter of a
+    per-band fit and does not need blending across components the way cModel's
+    separate exponential and de Vaucouleurs radii do.
 
     Two things to know about what it means.  It is in **arcsec** -- unlike
     ``sersic_reff_x``, which is the same quantity in pixels -- and it is measured
     *before* convolution with the PSF, so it is the galaxy's intrinsic size
     rather than its observed extent.  The seen object is a little larger.
 
-    NaN where the fit failed, had no data, or is absent, so a failure cannot
-    compare its way through a size cut.
+    NaN where the fit failed, had no data, or is nonsensical, so a failure
+    cannot compare its way through a size cut.
     """
     if axis not in ("major", "minor"):
         raise ValueError(f"axis must be 'major' or 'minor', not {axis!r}")
     col = f"sersic_reff_{axis}"
     have = _colnames(table)
     if col not in have:
+        stale = sorted(c for c in have if "_cModel_" in c and "reff" in c)
+        hint = (
+            " This table has per-band cModel radii and no Sersic fit, so it was "
+            "written before the switch to the multiband Sersic size -- it is an "
+            "older extraction. Re-extract, or point at the newer output "
+            "directory." if stale else ""
+        )
         raise KeyError(
-            f"{col!r} not in the object table. It is the multiband Sersic fit and "
-            f"carries no band prefix. Columns present: "
+            f"{col!r} not in the object table. It is the multiband Sersic fit "
+            f"and carries no band prefix.{hint} Columns present: "
             f"{sorted(c for c in have if 'sersic' in c or 'reff' in c)[:12]}"
         )
     r = np.asarray(table[col], dtype=float)

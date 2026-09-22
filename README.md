@@ -800,6 +800,15 @@ This is also why the cutout service stays the wrong tool even though it returns
 images only: the pixels are already on local disk, and the planes the gate needs
 come free with the read that fetches them.
 
+### Old output directories are refused, not silently read
+
+Shards carry a `schema` attribute. Schema 1 stored variance, mask and PSF arrays
+beside a different metadata set, and it would still *open* here — missing
+metadata columns fill with -1 — which is precisely the danger: a stale set
+trains or plots without complaint. `ShardSet.open` refuses it, and refuses a
+shard missing any metadata column too. A `hosts.parquet` written before the
+Sersic switch is recognised by its per-band cModel radii and says so.
+
 ### Nothing falls back
 
 A read either answers or ends the run. Every quiet degradation this code had

@@ -608,6 +608,17 @@ def test_the_butler_and_tap_column_lists_are_not_the_same():
                            "refExtendedness", "r_cModelFlux", "i_cModelFlux"}
 
 
+def test_a_hosts_table_from_before_the_sersic_switch_says_so():
+    """It still has per-band cModel radii, which is the fingerprint of an older
+    extraction rather than of a broken one."""
+    stale = Table({"r_cModel_exp_reff_major": [1.0], "g_cModel_dev_reff_minor": [1.0]})
+    with pytest.raises(KeyError, match="older extraction"):
+        host_half_light_arcsec(stale)
+    with pytest.raises(KeyError) as e:
+        host_half_light_arcsec(Table({"objectId": [1]}))
+    assert "older extraction" not in str(e.value)
+
+
 def test_a_column_the_parquet_lacks_says_why(butler):
     """The butler's own message names the column but not the reason."""
     def missing(what, dataId=None, parameters=None):

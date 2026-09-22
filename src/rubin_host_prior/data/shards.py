@@ -68,6 +68,13 @@ META_DTYPES: dict[str, str] = {
 IMAGE_KEYS = ("image",)
 IMAGE_DTYPES = {"image": "f4"}
 
+#: Bumped whenever the shard layout or the meaning of its metadata changes.
+#: Shards written before this existed carried variance, mask and PSF arrays and
+#: a different metadata set; they still *open* -- missing metadata columns fill
+#: with -1 -- which is precisely the problem, because a stale set then trains or
+#: plots without complaint.  ``ShardSet.open`` refuses them instead.
+SHARD_SCHEMA = 2
+
 
 class ShardWriter:
     """Buffer patches in memory and flush a shard when it is full."""
@@ -91,6 +98,7 @@ class ShardWriter:
         self.attrs = {
             "bands": json.dumps(list(BANDS)),
             "native_size": native_size,
+            "schema": SHARD_SCHEMA,
             "dataset_type": dataset_type,
             **{k: json.dumps(v) if isinstance(v, (dict, list)) else v
                for k, v in (attrs or {}).items()},
@@ -180,6 +188,16 @@ class ShardSet:
             with h5py.File(p, "r") as f:
                 counts.append(int(f.attrs["n_patches"]))
                 a = dict(f.attrs)
+                found = int(a.get("schema", 1))
+                if found != SHARD_SCHEMA:
+                    raise ValueError(
+                        f"{p} is shard schema {found}, this code writes and "
+                        f"reads {SHARD_SCHEMA}. Schema 1 stored variance, mask "
+                        f"and PSF arrays alongside a different metadata set; it "
+                        f"would open here with the new columns silently filled "
+                        f"with -1. Re-extract, or point at the newer output "
+                        f"directory."
+                    )
                 if attrs is None:
                     attrs = a
                 elif a.get("native_size") != attrs.get("native_size"):
@@ -187,9 +205,11 @@ class ShardSet:
                         f"{p} has native_size {a.get('native_size')} but "
                         f"{paths[0]} has {attrs.get('native_size')}"
                     )
+                missing = [k for k in META_DTYPES if k not in f["meta"]]
+                if missing:
+                    raise ValueError(f"{p} has no metadata for {missing}")
                 for k in META_DTYPES:
-                    meta[k].append(f["meta"][k][:] if k in f["meta"] else
-                                   np.full(counts[-1], -1))
+                    meta[k].append(f["meta"][k][:])
         counts = np.asarray(counts)
         return cls(
             paths=paths,
