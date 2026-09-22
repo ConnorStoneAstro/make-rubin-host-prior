@@ -197,13 +197,10 @@ def write_synthetic_shards(
                     "sersic_reff_minor": float(10 ** rng.uniform(0.1, 1.0)),
                     "sersic_index": float(rng.uniform(0.5, 6.0)),
                     "refExtendedness": 1.0,
-                    "refSizeExtendedness": 1.0,
                     "r_ixxPSF": 4.0, "r_iyyPSF": 4.0,
                     "r_pixelFlags_saturatedCenter": False,
                     "r_pixelFlags_interpolatedCenter": False,
-                    "refBand": "r",
                     "r_cModelFlux": float(10 ** rng.uniform(4.6, 5.8)),
-                    "r_cModelMag": float(rng.uniform(17.0, 20.0)),
                     "r_blendedness": float(rng.beta(1.2, 8)),
                 }
             )

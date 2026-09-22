@@ -139,11 +139,9 @@ CENTRE_TOLERANCE_ARCSEC = 1.0
 #: extent.
 OBJECT_COLUMNS = [
     "objectId",
-    "refSizeExtendedness",
     "coord_ra",
     "coord_dec",
     "refExtendedness",
-    "refBand",
     "tract",
     "patch",
     "sersic_reff_major",
@@ -155,6 +153,17 @@ OBJECT_COLUMNS = [
     "sersic_no_data_flag",
     "sersic_chi2_reduced",
 ]
+
+#: What the neighbour index needs, and nothing else.
+#:
+#: Deliberately not ``host_columns``.  The TAP ``dp2.Object`` view and the
+#: butler ``object`` parquet are **not the same table**: TAP serves derived
+#: columns the pipeline never wrote, ``{band}_cModelMag`` among them, and asking
+#: the butler for one fails the whole read.  The host selection runs against
+#: TAP; the neighbour index runs against the butler; so they get different
+#: lists, chosen for what each source has and each caller needs.
+NEIGHBOUR_COLUMNS = ["objectId", "coord_ra", "coord_dec", "refExtendedness"]
+NEIGHBOUR_BAND_COLUMNS = ["{b}_cModelFlux"]
 
 #: Bands for which the DP2 Object table carries photometry and shapes.  Verified
 #: against the schema YAML (``sdm_schemas``, ``drp_base.yaml``), which is the
@@ -168,8 +177,6 @@ PHOTOMETRY_BANDS = ("u", "g", "r", "i", "z", "y")
 #: ``sersic_reff_major`` in ``OBJECT_COLUMNS``, not from anything per band.
 OBJECT_BAND_COLUMNS = [
     "{b}_cModelFlux",
-    "{b}_cModelFluxErr",
-    "{b}_cModelMag",
     "{b}_blendedness",
     # HSM adaptive moments, measured on the PSF-convolved coadd, and the same
     # moments for the PSF itself.  The difference is what makes a size cut mean
@@ -300,6 +307,14 @@ def pack_mask(mask, max_planes: int = 32) -> tuple[np.ndarray, dict[str, int]]:
 
 
 # -- host selection --------------------------------------------------------
+
+
+def neighbour_columns(bands: Sequence[str] = BANDS) -> list[str]:
+    """Columns for the per-tract neighbour index, read through the butler."""
+    return list(NEIGHBOUR_COLUMNS) + [
+        c.format(b=b) for b in bands if b in PHOTOMETRY_BANDS
+        for c in NEIGHBOUR_BAND_COLUMNS
+    ]
 
 
 def host_columns(bands: Sequence[str] = BANDS,
@@ -738,6 +753,8 @@ def build_host_catalogue(
     if butler is None:
         raise ValueError("source='butler' needs a butler")
     refs = find_object_refs(butler, ra, dec, radius_deg, limit=limit_tracts)
+    # Through the butler, so the same caveat as the neighbour index: the parquet
+    # is the pipeline's own output and does not carry TAP's derived columns.
     columns = host_columns(bands)
     log.info("building host catalogue from %d object table(s)%s", len(refs),
              "" if radius_deg is None else f" within {radius_deg} deg")
@@ -1406,7 +1423,7 @@ def extract_patches(
     n_matched_patches = 0
 
     n_refs = 0
-    neighbour_columns = host_columns(bands)
+    neighbour_cols = neighbour_columns(bands)
     depth_logged = False
 
     def depth_logged_once() -> bool:
@@ -1445,7 +1462,7 @@ def extract_patches(
             refs = coadd_refs_for_tract(butler, tract, want, bands)
             rng.shuffle(refs)
             n_refs += len(refs)
-            neighbours = _neighbour_index(butler, tract, neighbour_columns, bands)
+            neighbours = _neighbour_index(butler, tract, neighbour_cols, bands)
 
             for ref in refs:
                 fields = _data_id_dict(ref.dataId)
@@ -1805,9 +1822,17 @@ def _neighbour_index(butler, tract: int, columns: Sequence[str],
             f"no object table for tract {tract}, yet hosts were selected from "
             f"it: the host catalogue and the repo disagree about what exists"
         )
-    return _NeighbourIndex(
-        butler.get(refs[0], parameters={"columns": list(columns)}), bands
-    )
+    try:
+        table = butler.get(refs[0], parameters={"columns": list(columns)})
+    except Exception as exc:
+        raise RuntimeError(
+            f"could not read the object table for tract {tract} with columns "
+            f"{list(columns)}: {exc}. Note the TAP dp2.Object view and the "
+            f"butler object parquet are not the same table -- TAP serves "
+            f"derived columns the pipeline never wrote, so a column that works "
+            f"in the ADQL can still be absent here."
+        ) from None
+    return _NeighbourIndex(table, bands)
 
 
 class _NeighbourIndex:

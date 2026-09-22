@@ -61,7 +61,6 @@ def _catalogue(tract, ra0, dec0, n=40, seed=1, patches=(0,), reff_range=(0.0, 0.
         "coord_ra": ra0 + px * fakes.PIXEL_SCALE / cosd,
         "coord_dec": dec0 + py * fakes.PIXEL_SCALE,
         "refExtendedness": np.ones(n),
-        "refSizeExtendedness": np.ones(n),
         "refBand": ["r"] * n,
         "tract": np.full(n, tract),
         "patch": patch.astype(int),
@@ -73,8 +72,6 @@ def _catalogue(tract, ra0, dec0, n=40, seed=1, patches=(0,), reff_range=(0.0, 0.
         "sersic_chi2_reduced": np.ones(n),
         **{f"{b}_{c}": v for b in PHOTOMETRY_BANDS
            for c, v in (("cModelFlux", 10 ** rng.uniform(5.0, 5.8, n)),
-                        ("cModelFluxErr", np.full(n, 10.0)),
-                        ("cModelMag", rng.uniform(17.0, 19.0, n)),
                         ("blendedness", rng.beta(1.2, 8, n)),
                         ("ixx", np.full(n, 30.0)),
                         ("iyy", np.full(n, 30.0)),
@@ -295,9 +292,9 @@ def _hosts(n=3000, scale=0.6, seed=1, tract=5063):
         "objectId": np.arange(n),
         "coord_ra": 53.13 + rng.normal(0, 0.3, n),
         "coord_dec": -28.10 + rng.normal(0, 0.3, n),
-        "refExtendedness": np.ones(n), "refSizeExtendedness": np.ones(n),
+        "refExtendedness": np.ones(n),
         "tract": np.full(n, tract), "patch": rng.integers(0, 100, n),
-        "r_cModelFlux": 10 ** ((31.4 - mag) / 2.5), "r_cModelMag": mag,
+        "r_cModelFlux": 10 ** ((31.4 - mag) / 2.5),
         "r_blendedness": rng.beta(1.2, 8, n),
         "r_ixx": trace_sq, "r_iyy": trace_sq, "r_ixy": np.zeros(n),
         "r_ixxPSF": np.full(n, 4.0), "r_iyyPSF": np.full(n, 4.0),
@@ -544,7 +541,7 @@ def test_surface_brightness_is_what_separates_a_galaxy_from_a_runaway_fit():
         "sersic_index": [1.0, 1.0],
         "sersic_unknown_flag": [False, False],
         "sersic_no_data_flag": [False, False],
-        "r_cModelFlux": [3.3e5, 3.6e2], "r_cModelMag": [17.6, 25.0],
+        "r_cModelFlux": [3.3e5, 3.6e2],
         "r_ixx": [30.0, 30.0], "r_iyy": [30.0, 30.0], "r_ixy": [0.0, 0.0],
         "r_ixxPSF": [4.0, 4.0], "r_iyyPSF": [4.0, 4.0],
         "r_pixelFlags_saturatedCenter": [False, False],
@@ -594,3 +591,28 @@ def test_stratification_bins_do_not_follow_the_sample_tail():
     t["sersic_reff_minor"][:5] = 120.0
     kept = select_hosts(t, band="r", n_hosts=100, seed=0)
     assert np.all(host_half_light_arcsec(kept) <= 12.0)
+
+
+def test_the_butler_and_tap_column_lists_are_not_the_same():
+    """TAP's dp2.Object view serves derived columns the pipeline never wrote --
+    {band}_cModelMag among them -- and asking the butler parquet for one fails
+    the whole read.  So the two callers get two lists."""
+    from rubin_host_prior.rubin.extract import neighbour_columns
+
+    butler_side = set(neighbour_columns(("r", "i")))
+    assert not any("Mag" in c for c in butler_side)
+    assert not any("Mag" in c for c in host_adql().split("FROM")[0])
+    # The neighbour index needs a position, an id, an extendedness and a flux,
+    # and reading more than that is what broke.
+    assert butler_side == {"objectId", "coord_ra", "coord_dec",
+                           "refExtendedness", "r_cModelFlux", "i_cModelFlux"}
+
+
+def test_a_column_the_parquet_lacks_says_why(butler):
+    """The butler's own message names the column but not the reason."""
+    def missing(what, dataId=None, parameters=None):
+        raise ValueError("Column x_cModelMag ... not available in parquet file.")
+
+    butler.get = missing
+    with pytest.raises(RuntimeError, match="not the same table"):
+        ex._neighbour_index(butler, 5063, ["x_cModelMag"], ("r",))

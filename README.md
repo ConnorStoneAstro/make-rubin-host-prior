@@ -624,7 +624,15 @@ than loudly, so `select_hosts` is built to fail loudly instead:
   (`{band}_ixx`, `{band}_iyy`, `{band}_ixy`, in pixel²). `host_trace_radius_px`
   raises if they are absent rather than returning NaN, because every caller uses
   it to avoid a sample dominated by the smallest, faintest galaxies.
-- **All six bands carry photometry and shapes.** `u` through `y` all have
+- **TAP's `dp2.Object` and the butler's `object` parquet are not the same table.**
+TAP serves derived columns the pipeline never wrote — `{band}_cModelMag` among
+them — and asking the butler for one fails the whole read with a formatter
+error. The SDM schema describes the TAP view. So the host selection (TAP) and
+the neighbour index (butler) get different column lists, each chosen for what
+its source has and its caller needs, and a butler read that fails on a column
+says which of the two tables it is talking to.
+
+**All six bands carry photometry and shapes.** `u` through `y` all have
   `_cModelFlux`, `_ixx` and `_sersicFlux`. An earlier version of this file said
   only `ugri` did; that came from reading the *rendered* schema page in excerpts,
   which is long enough to truncate mid-table and give a confidently wrong answer.
