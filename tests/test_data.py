@@ -114,9 +114,26 @@ def test_log_scale_rescales_x_and_nothing_else():
     assert b == pytest.approx(a / 3.0)
 
 
-def test_a_band_with_no_softening_scale_is_refused():
+def test_the_softening_is_always_indexed_by_the_global_band_index():
+    """`band_idx` in the shards is an index into BANDS, so the softening tuple
+    has to be too.  Building it over a subset silently re-bases the indexing:
+    with ('r','i','z','y') measured, index 4 runs off the end and index 2
+    quietly returns the i-band scale for an r-band patch."""
+    partial = LogFluxTransform.from_config(
+        TransformConfig(band_softening={"r": 12.0, "i": 16.0, "z": 24.0, "y": 40.0}))
+    assert len(partial.softening) == len(BANDS)
+    assert partial.softening[BANDS.index("r")] == 12.0
+    assert partial.softening[BANDS.index("y")] == 40.0
+    # Unmeasured bands are NaN, which is visible rather than wrong.
+    assert np.isnan(partial.softening[BANDS.index("u")])
+
+    # A caller that knows which bands its data has gets a named error instead.
+    with pytest.raises(ValueError, match="no patches in"):
+        LogFluxTransform.from_config(
+            TransformConfig(band_softening={"r": 12.0}), required_bands=BANDS)
     with pytest.raises(ValueError, match="prepare_config"):
-        LogFluxTransform.from_config(TransformConfig(band_softening={"r": 12.0}))
+        LogFluxTransform.from_config(TransformConfig(band_softening={}),
+                                     required_bands=BANDS)
 
 
 def test_log_softplus_is_stable_where_the_naive_form_is_not():
@@ -722,10 +739,13 @@ def test_a_band_with_no_patches_gets_no_softening_scale():
     assert set(got) == {"u"} and got["u"] == pytest.approx(12.0, rel=0.1)
 
 
-def test_a_config_prepared_without_a_band_says_which_shard_set_it_came_from():
-    """The old message told you to run the script that was raising it."""
-    with pytest.raises(ValueError, match="no patches in"):
-        LogFluxTransform.from_config(
-            TransformConfig(band_softening={"u": 12.0, "g": 11.0}), BANDS)
-    with pytest.raises(ValueError, match="prepare_config"):
-        LogFluxTransform.from_config(TransformConfig(band_softening={}), BANDS)
+def test_shards_whose_bands_the_config_never_saw_are_refused(shard_dir):
+    """Caught where the band can be named, rather than as a NaN that propagates
+    into training or an IndexError from inside the transform."""
+    ss = ShardSet.from_dir(shard_dir)
+    config = Config(patch=PatchConfig(native_size=ss.native_size,
+                                      nominal_crop=96, out_size=32, pool_factor=3))
+    config.transform.band_softening = {"u": 12.0}
+    with pytest.raises(ValueError, match="no softening scale"):
+        PatchDataset.from_shards(
+            ss, config, LogFluxTransform.from_config(config.transform))

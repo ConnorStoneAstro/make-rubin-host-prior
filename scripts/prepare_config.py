@@ -96,7 +96,7 @@ def main() -> None:
             f"their patches are probably all source or all masked"
         )
 
-    transform = LogFluxTransform.from_config(config.transform, present)
+    transform = LogFluxTransform.from_config(config.transform, required_bands=present)
     dataset = PatchDataset.from_shards(shards, config, transform)
     stats = dataset.stats(args.n_stats)
     sigma_min, sigma_max = suggest_sigma_range(stats)
@@ -113,7 +113,7 @@ def main() -> None:
     # The correlation length, measured on the pooled log-space patches the model
     # actually sees.  This is the authoritative version -- the one in the
     # extraction summary is native-resolution flux and is contaminated by the PSF.
-    t = LogFluxTransform.from_config(config.transform, present)
+    t = LogFluxTransform.from_config(config.transform, required_bands=present)
     ss = config.transform.softening_sigma
     print(f"\nlog transform:  x = log(softplus(f/s))/c,  model map f = s*exp(c*x)")
     print(f"  softening s = {ss:.2f} x pooled sky noise")

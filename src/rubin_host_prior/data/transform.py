@@ -44,6 +44,7 @@ whereas softplus converges to the identity exponentially.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass
 from math import log
 
@@ -102,29 +103,45 @@ def log_softplus(u, xp=None):
 
 @dataclass(frozen=True)
 class LogFluxTransform:
-    softening: tuple[float, ...]  # s_band in nJy, indexed like BANDS
+    #: One entry per band of ``BANDS``, in nJy, indexed by the same global
+    #: band index the shards store.  NaN for a band never measured.
+    softening: tuple[float, ...]
     log_scale: float = 1.0  # "c" above
     bands: tuple[str, ...] = BANDS
 
     @classmethod
-    def from_config(cls, config: TransformConfig, bands: tuple[str, ...] = BANDS):
-        missing = [b for b in bands if b not in config.band_softening]
-        if missing:
-            have = sorted(config.band_softening)
-            raise ValueError(
-                f"no softening scale for band(s) {missing}. "
-                + (f"The config has scales for {have}, so it was prepared "
-                   f"against a shard set that had no patches in {missing} -- "
-                   f"build the transform over the bands the data actually has, "
-                   f"or re-run scripts/prepare_config.py on the current shards."
-                   if have else
-                   "The config has no scales at all; run "
-                   "scripts/prepare_config.py on the shards first.")
-            )
+    def from_config(cls, config: TransformConfig,
+                    required_bands: Sequence[str] | None = None):
+        """Always indexed over the whole of ``BANDS``.
+
+        ``band_idx`` in the shards is a global index into ``BANDS``, so the
+        softening tuple has to be too.  Building it over a *subset* -- which is
+        what a ``bands`` argument invited -- silently re-bases the indexing: with
+        ('r','i','z','y') present, index 4 runs off the end, and index 2 quietly
+        returns the i-band scale for an r-band patch.  Absent bands hold NaN,
+        which makes an unmeasured band visible rather than wrong; callers that
+        know which bands their data contains pass ``required_bands`` and get a
+        named error instead.
+        """
+        if required_bands is not None:
+            missing = [b for b in required_bands if b not in config.band_softening]
+            if missing:
+                have = sorted(config.band_softening)
+                raise ValueError(
+                    f"no softening scale for band(s) {missing}. "
+                    + (f"The config has scales for {have}, so it was prepared "
+                       f"against a shard set with no patches in {missing}; "
+                       f"re-run scripts/prepare_config.py on the current shards."
+                       if have else
+                       "The config has no scales at all; run "
+                       "scripts/prepare_config.py on the shards first.")
+                )
         return cls(
-            softening=tuple(float(config.band_softening[b]) for b in bands),
+            softening=tuple(
+                float(config.band_softening.get(b, np.nan)) for b in BANDS
+            ),
             log_scale=config.log_scale,
-            bands=tuple(bands),
+            bands=tuple(BANDS),
         )
 
     def softening_for(self, band_index):

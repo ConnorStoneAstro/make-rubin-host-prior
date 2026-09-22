@@ -290,7 +290,9 @@ def pack_mask(mask, max_planes: int = 32) -> tuple[np.ndarray, dict[str, int]]:
     if len(names) > max_planes:
         log.warning(
             "mask has %d planes, packing only the first %d: %s dropped",
-            len(names), max_planes, names[max_planes:],
+            len(names),
+            max_planes,
+            names[max_planes:],
         )
         names = names[:max_planes]
     packed = None
@@ -312,29 +314,30 @@ def pack_mask(mask, max_planes: int = 32) -> tuple[np.ndarray, dict[str, int]]:
 def neighbour_columns(bands: Sequence[str] = BANDS) -> list[str]:
     """Columns for the per-tract neighbour index, read through the butler."""
     return list(NEIGHBOUR_COLUMNS) + [
-        c.format(b=b) for b in bands if b in PHOTOMETRY_BANDS
-        for c in NEIGHBOUR_BAND_COLUMNS
+        c.format(b=b) for b in bands if b in PHOTOMETRY_BANDS for c in NEIGHBOUR_BAND_COLUMNS
     ]
 
 
-def host_columns(bands: Sequence[str] = BANDS,
-                 extra: Sequence[str] = ()) -> list[str]:
+def host_columns(bands: Sequence[str] = BANDS, extra: Sequence[str] = ()) -> list[str]:
     """The column subset to read.  The table has 1248 columns, so this is not
     optional, and asking for one that does not exist fails the whole read."""
     usable = [b for b in bands if b in PHOTOMETRY_BANDS]
     unknown = [b for b in bands if b not in PHOTOMETRY_BANDS]
     if unknown:
-        raise ValueError(
-            f"band(s) {unknown} are not DP2 bands; choose from {PHOTOMETRY_BANDS}"
-        )
+        raise ValueError(f"band(s) {unknown} are not DP2 bands; choose from {PHOTOMETRY_BANDS}")
     columns = list(OBJECT_COLUMNS)
     for b in usable:
         columns += [c.format(b=b) for c in OBJECT_BAND_COLUMNS]
     return columns + list(extra)
 
 
-def find_object_refs(butler, ra: float | None = None, dec: float | None = None,
-                     radius_deg: float | None = None, limit: int | None = None):
+def find_object_refs(
+    butler,
+    ra: float | None = None,
+    dec: float | None = None,
+    radius_deg: float | None = None,
+    limit: int | None = None,
+):
     """``object`` table refs: every one in the repo, or those near a position.
 
     One per tract.  With no position this is the whole DP2 footprint, which is
@@ -348,14 +351,16 @@ def find_object_refs(butler, ra: float | None = None, dec: float | None = None,
     region = _lsst().sphgeom.Region.from_ivoa_pos(
         f"CIRCLE {float(ra)} {float(dec)} {float(radius_deg)}"
     )
-    refs = list(butler.query_datasets(
-        "object", where="tract.region OVERLAPS :region",
-        bind={"region": region}, limit=limit,
-    ))
-    if not refs:
-        raise RuntimeError(
-            f"no object table within {radius_deg} deg of ({ra}, {dec})"
+    refs = list(
+        butler.query_datasets(
+            "object",
+            where="tract.region OVERLAPS :region",
+            bind={"region": region},
+            limit=limit,
         )
+    )
+    if not refs:
+        raise RuntimeError(f"no object table within {radius_deg} deg of ({ra}, {dec})")
     return refs
 
 
@@ -376,7 +381,7 @@ MAX_MU_E = 24.5
 #: is the "couple of arcsec across" end of the wanted range; the ceiling keeps
 #: 90% of the light inside an 83" stamp for any plausible profile and caps
 #: runaways from above.
-MIN_REFF_ARCSEC = 0.7
+MIN_REFF_ARCSEC = 1.0
 MAX_REFF_ARCSEC = 12.0
 
 #: Minimum PSF-deconvolved moment radius, in native pixels.  A point source
@@ -431,9 +436,11 @@ def host_adql(
     draw has to happen here anyway.
     """
     columns = ", ".join(host_columns(bands))
-    where = [f"{band}_cModelFlux > {float(flux_range[0])}",
-             f"{band}_cModelFlux <= {float(flux_range[1])}",
-             "refExtendedness > 0.5"]
+    where = [
+        f"{band}_cModelFlux > {float(flux_range[0])}",
+        f"{band}_cModelFlux <= {float(flux_range[1])}",
+        "refExtendedness > 0.5",
+    ]
     # NaN and NULL both fail a > comparison, which is the behaviour wanted: an
     # object with no fit is not a large object.
     if min_reff_arcsec is not None:
@@ -535,18 +542,14 @@ def rsp_token(token: str | None = None) -> str:
     # "gt-<key>.<secret>", so the prefix alone says whether what was found is
     # even an RSP token, which is the usual answer when ACCESS_TOKEN was set by
     # something else entirely.
-    log.info("RSP token from %s (looks like %r)", source,
-             value.split("-", 1)[0] + "-...")
+    log.info("RSP token from %s (looks like %r)", source, value.split("-", 1)[0] + "-...")
     return value
 
 
 def token_info(token: str, base_url: str = "https://data.lsst.cloud") -> dict:
-    """What Gafaelfawr says about a token: username, scopes, expiry.
-
-    """
+    """What Gafaelfawr says about a token: username, scopes, expiry."""
     url = base_url.rstrip("/") + "/auth/api/v1/token-info"
-    response = requests.get(url, headers={"Authorization": f"Bearer {token}"},
-                            timeout=15)
+    response = requests.get(url, headers={"Authorization": f"Bearer {token}"}, timeout=15)
     if response.status_code in (401, 403):
         raise RuntimeError(
             f"Gafaelfawr rejected the token ({response.status_code}). It is "
@@ -571,8 +574,7 @@ def check_tap_scope(token: str, base_url: str = "https://data.lsst.cloud") -> No
     log.info("token for %s carries %s", who, TAP_SCOPE)
 
 
-def discover_tap_url(release: str = "dp2",
-                     discovery_url: str = RSP_DISCOVERY_URL) -> str:
+def discover_tap_url(release: str = "dp2", discovery_url: str = RSP_DISCOVERY_URL) -> str:
     """The TAP endpoint for a release, from the RSP's own discovery document."""
     response = requests.get(discovery_url, timeout=15)
     response.raise_for_status()
@@ -586,8 +588,7 @@ def discover_tap_url(release: str = "dp2",
     return url
 
 
-def tap_client(release: str = "dp2", url: str | None = None,
-               token: str | None = None):
+def tap_client(release: str = "dp2", url: str | None = None, token: str | None = None):
     """A TAP client for the RSP, from anywhere -- no ``lsst.rsp`` needed.
 
     TAP is an IVOA standard and the RSP's endpoint is an ordinary TAP service
@@ -654,8 +655,11 @@ def unmask(table):
         if column.dtype.kind == "f":
             table[name] = np.asarray(column.filled(np.nan), dtype=column.dtype)
         elif column.dtype.kind in "iu":
-            log.warning("%d row(s) have no %s; setting them to -1, which will "
-                        "not match any patch", n, name)
+            log.warning(
+                "%d row(s) have no %s; setting them to -1, which will " "not match any patch",
+                n,
+                name,
+            )
             table[name] = np.asarray(column.filled(-1), dtype=column.dtype)
         else:
             continue
@@ -669,8 +673,7 @@ def with_positions(table):
     dec = np.asarray(table["coord_dec"], dtype=float)
     ok = np.isfinite(ra) & np.isfinite(dec)
     if not ok.all():
-        log.warning("dropping %d host candidate(s) with no sky position",
-                    int((~ok).sum()))
+        log.warning("dropping %d host candidate(s) with no sky position", int((~ok).sum()))
     return table[ok]
 
 
@@ -721,8 +724,7 @@ def build_host_catalogue(
         cache = Path(cache)
         if cache.exists():
             table = _read_table(cache)
-            log.info("host catalogue: %d candidates from cache %s",
-                     len(table), cache)
+            log.info("host catalogue: %d candidates from cache %s", len(table), cache)
             return table
 
     if source not in ("tap", "butler"):
@@ -730,15 +732,21 @@ def build_host_catalogue(
 
     if source == "tap":
         query = host_adql(
-            bands=bands, band=band, ra=ra, dec=dec, radius_deg=radius_deg,
+            bands=bands,
+            band=band,
+            ra=ra,
+            dec=dec,
+            radius_deg=radius_deg,
             top=top,
             # Only the cuts the query can express; the rest stay local.
-            **{k: v for k, v in cuts.items()
-               if k in ("flux_range", "min_reff_arcsec", "max_blendedness")},
+            **{
+                k: v
+                for k, v in cuts.items()
+                if k in ("flux_range", "min_reff_arcsec", "max_blendedness")
+            },
         )
         log.info("querying %s:\n%s", TAP_TABLE, query)
-        pool = with_positions(unmask(run_adql(
-            tap_service or tap_client(url=tap_url), query)))
+        pool = with_positions(unmask(run_adql(tap_service or tap_client(url=tap_url), query)))
         log.info("TAP returned %d usable rows", len(pool))
         # The service applied the numeric cuts; these are the rest -- the Sersic
         # failure flags, the point-source cross-check, and the dedupe across
@@ -756,8 +764,11 @@ def build_host_catalogue(
     # Through the butler, so the same caveat as the neighbour index: the parquet
     # is the pipeline's own output and does not carry TAP's derived columns.
     columns = host_columns(bands)
-    log.info("building host catalogue from %d object table(s)%s", len(refs),
-             "" if radius_deg is None else f" within {radius_deg} deg")
+    log.info(
+        "building host catalogue from %d object table(s)%s",
+        len(refs),
+        "" if radius_deg is None else f" within {radius_deg} deg",
+    )
 
     kept: list = []
     n_rows = 0
@@ -776,8 +787,13 @@ def build_host_catalogue(
         if len(survivors):
             kept.append(survivors)
         if i % report_every == 0 or i == len(refs):
-            log.info("  %d/%d tables, %d rows scanned, %d candidates so far",
-                     i, len(refs), n_rows, sum(len(t) for t in kept))
+            log.info(
+                "  %d/%d tables, %d rows scanned, %d candidates so far",
+                i,
+                len(refs),
+                n_rows,
+                sum(len(t) for t in kept),
+            )
 
     if not kept:
         raise RuntimeError(
@@ -788,8 +804,9 @@ def build_host_catalogue(
     # Tracts overlap, so a host in an overlap appears in two tables under two
     # different objectIds.  The per-tract dedupe cannot see that; this can.
     pool = dedupe_hosts(with_positions(pool))
-    log.info("host catalogue: %d candidates from %d rows across %d tables",
-             len(pool), n_rows, len(refs))
+    log.info(
+        "host catalogue: %d candidates from %d rows across %d tables", len(pool), n_rows, len(refs)
+    )
     if cache is not None:
         _write_table(cache.with_suffix(""), pool)
         log.info("cached the host catalogue at %s", cache)
@@ -919,7 +936,9 @@ def host_half_light_arcsec(table, axis: str = "major") -> np.ndarray:
             " This table has per-band cModel radii and no Sersic fit, so it was "
             "written before the switch to the multiband Sersic size -- it is an "
             "older extraction. Re-extract, or point at the newer output "
-            "directory." if stale else ""
+            "directory."
+            if stale
+            else ""
         )
         raise KeyError(
             f"{col!r} not in the object table. It is the multiband Sersic fit "
@@ -975,8 +994,7 @@ def select_hosts(
     rng = np.random.default_rng(seed)
     if band not in PHOTOMETRY_BANDS:
         raise ValueError(
-            f"band {band!r} has no DP2 Object photometry; choose from "
-            f"{PHOTOMETRY_BANDS}"
+            f"band {band!r} has no DP2 Object photometry; choose from " f"{PHOTOMETRY_BANDS}"
         )
     t = dedupe_hosts(table, dedupe_radius_arcsec)
     keep = np.ones(len(t), dtype=bool)
@@ -984,9 +1002,10 @@ def select_hosts(
         # Topping up towards a target: these have already been tried, and
         # offering them again would either duplicate a stamp or re-earn the
         # same rejection.
-        keep &= ~np.isin(np.asarray(t["objectId"], dtype=np.int64),
-                         np.fromiter(exclude_ids, dtype=np.int64,
-                                     count=len(exclude_ids)))
+        keep &= ~np.isin(
+            np.asarray(t["objectId"], dtype=np.int64),
+            np.fromiter(exclude_ids, dtype=np.int64, count=len(exclude_ids)),
+        )
     if "refExtendedness" in _colnames(t):
         ext = np.asarray(t["refExtendedness"], dtype=float)
         keep &= np.isfinite(ext) & (ext > 0.5)
@@ -1012,15 +1031,21 @@ def select_hosts(
     if max_mu_e is not None:
         mu = host_mu_e(t, band)
         bright_enough = np.isfinite(mu) & (mu <= max_mu_e)
-        log.info("surface-brightness cut at mu_e <= %.1f: %d of %d survive",
-                 max_mu_e, int((keep & bright_enough).sum()), int(keep.sum()))
+        log.info(
+            "surface-brightness cut at mu_e <= %.1f: %d of %d survive",
+            max_mu_e,
+            int((keep & bright_enough).sum()),
+            int(keep.sum()),
+        )
         keep &= bright_enough
     if min_reff_arcsec is not None:
         big_enough = np.isfinite(reff) & (reff >= min_reff_arcsec)
         log.info(
-            "half-light cut at %.2f\": %d of %d survive; %d dropped as smaller, "
+            'half-light cut at %.2f": %d of %d survive; %d dropped as smaller, '
             "%d for having no usable Sersic fit",
-            min_reff_arcsec, int((keep & big_enough).sum()), int(keep.sum()),
+            min_reff_arcsec,
+            int((keep & big_enough).sum()),
+            int(keep.sum()),
             int((keep & np.isfinite(reff) & ~big_enough).sum()),
             int((keep & ~np.isfinite(reff)).sum()),
         )
@@ -1070,7 +1095,8 @@ def _tract_refs(butler, dataset_type: str, tract: int, bands=None) -> list:
     refs = butler.query_datasets(
         dataset_type,
         data_id={"skymap": SKYMAP, "tract": int(tract)},
-        limit=None, explain=False,
+        limit=None,
+        explain=False,
     )
     kept, wrong = [], 0
     want = set(bands) if bands else None
@@ -1086,14 +1112,19 @@ def _tract_refs(butler, dataset_type: str, tract: int, bands=None) -> list:
         # Belt and braces: if a server-side constraint ever stops applying
         # again, this is the line that says so instead of a run of empty
         # patches and a confusing projection.
-        log.warning("%d %s refs came back for tracts other than %d and were "
-                    "dropped here; the query is not constraining tract",
-                    wrong, dataset_type, tract)
+        log.warning(
+            "%d %s refs came back for tracts other than %d and were "
+            "dropped here; the query is not constraining tract",
+            wrong,
+            dataset_type,
+            tract,
+        )
     return kept
 
 
-def coadd_refs_for_tract(butler, tract: int, patches: Iterable[int],
-                         bands: Sequence[str] = BANDS) -> list:
+def coadd_refs_for_tract(
+    butler, tract: int, patches: Iterable[int], bands: Sequence[str] = BANDS
+) -> list:
     """``deep_coadd`` refs for the patches of one tract that hold a host.
 
     Driven by the host list rather than by a disc on the sky.  With a size cut
@@ -1104,8 +1135,11 @@ def coadd_refs_for_tract(butler, tract: int, patches: Iterable[int],
     patches = {int(p) for p in patches}
     if not patches:
         return []
-    return [r for r in _tract_refs(butler, DATASET_TYPE, tract, bands)
-            if int(_data_id_dict(r.dataId).get("patch", -1)) in patches]
+    return [
+        r
+        for r in _tract_refs(butler, DATASET_TYPE, tract, bands)
+        if int(_data_id_dict(r.dataId).get("patch", -1)) in patches
+    ]
 
 
 def object_refs_for_tract(butler, tract: int) -> list:
@@ -1135,9 +1169,7 @@ def _sky_to_pixel(wcs, ra, dec) -> tuple[np.ndarray, np.ndarray]:
             xs[i] = ys[i] = np.nan
             continue
         try:
-            xy = wcs.sky_to_pixel(
-                SkyCoord(ra=ra[i] * u.deg, dec=dec[i] * u.deg, frame="icrs")
-            )
+            xy = wcs.sky_to_pixel(SkyCoord(ra=ra[i] * u.deg, dec=dec[i] * u.deg, frame="icrs"))
             xs[i], ys[i] = float(xy.x), float(xy.y)
         except Exception as exc:
             # A projection can refuse a position far outside what it covers.
@@ -1217,9 +1249,7 @@ def cells_in_stamp(source, x: float, y: float, size: int) -> list[tuple[int, int
         ]
         ii = [c.i for c in corners]
         jj = [c.j for c in corners]
-        return [(i, j)
-                for i in range(min(ii), max(ii) + 1)
-                for j in range(min(jj), max(jj) + 1)]
+        return [(i, j) for i in range(min(ii), max(ii) + 1) for j in range(min(jj), max(jj) + 1)]
     except Exception as exc:
         log.debug("cell grid unavailable: %s", exc)
         return []
@@ -1264,8 +1294,7 @@ def cell_visit_counts(source) -> dict[tuple[int, int], int]:
         log.debug("no coadd provenance; falling back to the measured variance step")
         return {}
 
-    names = list(getattr(contributions, "colnames", None)
-                 or getattr(contributions, "columns", []))
+    names = list(getattr(contributions, "colnames", None) or getattr(contributions, "columns", []))
     cell_cols = next((c for c in CONTRIB_CELL_COLUMNS if set(c) <= set(names)), None)
     if cell_cols is None or "visit" not in names:
         raise RuntimeError(
@@ -1276,13 +1305,15 @@ def cell_visit_counts(source) -> dict[tuple[int, int], int]:
 
     # One row per (visit, detector, cell), so a visit crossing a detector
     # boundary inside a cell appears twice; count distinct visits, not rows.
-    keys = np.stack([
-        np.asarray(contributions[cell_cols[0]], dtype=np.int64),
-        np.asarray(contributions[cell_cols[1]], dtype=np.int64),
-        np.asarray(contributions["visit"], dtype=np.int64),
-    ], axis=1)
-    cells, counts = np.unique(np.unique(keys, axis=0)[:, :2], axis=0,
-                              return_counts=True)
+    keys = np.stack(
+        [
+            np.asarray(contributions[cell_cols[0]], dtype=np.int64),
+            np.asarray(contributions[cell_cols[1]], dtype=np.int64),
+            np.asarray(contributions["visit"], dtype=np.int64),
+        ],
+        axis=1,
+    )
+    cells, counts = np.unique(np.unique(keys, axis=0)[:, :2], axis=0, return_counts=True)
     return {(int(i), int(j)): int(n) for (i, j), n in zip(cells, counts)}
 
 
@@ -1301,8 +1332,9 @@ def missing_cells(bounds, cells: list[tuple[int, int]]) -> list[tuple[int, int]]
     return [c for c in cells if c in keys]
 
 
-def stamp_depth(counts: dict[tuple[int, int], int],
-                cells: list[tuple[int, int]]) -> tuple[int, int]:
+def stamp_depth(
+    counts: dict[tuple[int, int], int], cells: list[tuple[int, int]]
+) -> tuple[int, int]:
     """``(min, max)`` visit count over the cells a stamp covers; ``(-1, -1)`` if
     unknown.  Cells missing from the table contributed nothing and count as 0."""
     if not counts or not cells:
@@ -1314,9 +1346,15 @@ def stamp_depth(counts: dict[tuple[int, int], int],
 # -- the driver ------------------------------------------------------------
 
 
-def next_batch(batch: int | None, n_hosts: int, gained: int, shortfall: int,
-               headroom: float = 1.3, blind_growth: int = 4,
-               floor: int = 16) -> int:
+def next_batch(
+    batch: int | None,
+    n_hosts: int,
+    gained: int,
+    shortfall: int,
+    headroom: float = 1.3,
+    blind_growth: int = 4,
+    floor: int = 16,
+) -> int:
     """How many hosts to ask for in the next round.
 
     Sized from the yield actually observed rather than from an assumption, since
@@ -1404,13 +1442,22 @@ def extract_patches(
     target = n_patches if n_patches is not None else max_patches
 
     field = build_host_catalogue(
-        butler, bands=bands, band="r" if "r" in bands else bands[0],
-        ra=ra, dec=dec, radius_deg=radius_deg, limit_tracts=limit_tracts,
-        cache=host_cache, source=host_source, tap_service=tap_service,
+        butler,
+        bands=bands,
+        band="r" if "r" in bands else bands[0],
+        ra=ra,
+        dec=dec,
+        radius_deg=radius_deg,
+        limit_tracts=limit_tracts,
+        cache=host_cache,
+        source=host_source,
+        tap_service=tap_service,
         tap_url=tap_url,
         top=limit_hosts,
-        flux_range=host_flux_range, max_blendedness=max_blendedness,
-        min_reff_arcsec=min_reff_arcsec, max_mu_e=max_mu_e,
+        flux_range=host_flux_range,
+        max_blendedness=max_blendedness,
+        min_reff_arcsec=min_reff_arcsec,
+        max_mu_e=max_mu_e,
     )
 
     records: list[dict] = []
@@ -1456,8 +1503,9 @@ def extract_patches(
         nonlocal depth_checked, depth_usable, n_empty_patches, n_matched_patches
 
         by_patch: dict[tuple[int, int], list[int]] = {}
-        for h, (t, pa) in enumerate(zip(np.asarray(hosts["tract"], dtype=int),
-                                        np.asarray(hosts["patch"], dtype=int))):
+        for h, (t, pa) in enumerate(
+            zip(np.asarray(hosts["tract"], dtype=int), np.asarray(hosts["patch"], dtype=int))
+        ):
             by_patch.setdefault((int(t), int(pa)), []).append(h)
         tracts = sorted({t for t, _ in by_patch})
         # Shuffled, because the sweep stops the moment the target is reached;
@@ -1482,7 +1530,8 @@ def extract_patches(
                 }
 
                 candidates = [
-                    h for h in by_patch.get((tract, base["patch"]), [])
+                    h
+                    for h in by_patch.get((tract, base["patch"]), [])
                     if (int(host_id[h]), band_name) not in seen
                 ]
                 if not candidates:
@@ -1493,20 +1542,22 @@ def extract_patches(
                 # which is where CellCoadd reads them from too.
                 wcs = read_component(butler, ref, "wcs")
                 bounds = read_component(butler, ref, "psf").bounds
-                visit_counts = cell_visit_counts(
-                    read_component(butler, ref, "provenance")
-                )
+                visit_counts = cell_visit_counts(read_component(butler, ref, "provenance"))
                 if visit_counts and not depth_logged_once():
-                    log.info("per-cell visit counts: %d cells, %d-%d visits",
-                             len(visit_counts), min(visit_counts.values()),
-                             max(visit_counts.values()))
+                    log.info(
+                        "per-cell visit counts: %d cells, %d-%d visits",
+                        len(visit_counts),
+                        min(visit_counts.values()),
+                        max(visit_counts.values()),
+                    )
 
                 xs, ys = _sky_to_pixel(wcs, tgt_ra[candidates], tgt_dec[candidates])
                 # The cell grid, not the image bbox: a patch at the edge of
                 # coverage has cells that were never built, and slicing outside
                 # them raises rather than returning empty pixels.
                 inside = [
-                    (h, x, y) for h, x, y in zip(candidates, xs, ys)
+                    (h, x, y)
+                    for h, x, y in zip(candidates, xs, ys)
                     if _fits_in_patch(bounds, x, y, native_size)
                 ]
                 if not inside:
@@ -1519,24 +1570,27 @@ def extract_patches(
                             "positions even projected). If that continues, the "
                             "Object table's `patch` column and the deep_coadd "
                             "dataId `patch` are not the same numbering.",
-                            n_empty_patches, n_projected, len(xs),
+                            n_empty_patches,
+                            n_projected,
+                            len(xs),
                         )
                     continue
                 n_matched_patches += 1
-                log.debug("patch %s band %s: %d hosts", base["patch"], band_name,
-                          len(inside))
+                log.debug("patch %s band %s: %d hosts", base["patch"], band_name, len(inside))
 
                 for h, x, y in inside:
                     if target is not None and n_accepted >= target:
                         raise _Done
-                    rec = {**base, "host_id": int(host_id[h]),
-                           "host_offset_arcsec": float(r_jit[h])}
+                    rec = {
+                        **base,
+                        "host_id": int(host_id[h]),
+                        "host_offset_arcsec": float(r_jit[h]),
+                    }
 
                     sep = _verify_centre(wcs, x, y, float(tgt_ra[h]), float(tgt_dec[h]))
                     rec["centre_sep_arcsec"] = sep
                     if not np.isfinite(sep) or sep > CENTRE_TOLERANCE_ARCSEC:
-                        rec.update(status="rejected",
-                                   reasons=f"centre_mismatch:{sep:.2f}")
+                        rec.update(status="rejected", reasons=f"centre_mismatch:{sep:.2f}")
                         records.append(rec)
                         continue
 
@@ -1554,18 +1608,17 @@ def extract_patches(
                                 "none of the cells a stamp covers %s appear in "
                                 "provenance.contributions (which has e.g. %s); "
                                 "per-cell depth ignored for this run",
-                                cells[:4], sorted(visit_counts)[:4],
+                                cells[:4],
+                                sorted(visit_counts)[:4],
                             )
                     absent = missing_cells(bounds, cells)
                     if absent:
-                        rec.update(status="rejected",
-                                   reasons=f"missing_cells:{len(absent)}")
+                        rec.update(status="rejected", reasons=f"missing_cells:{len(absent)}")
                         records.append(rec)
                         continue
 
                     # One read, of just these pixels.
-                    stamp = butler.get(ref, parameters={"bbox":
-                                                        _stamp_box(x, y, native_size)})
+                    stamp = butler.get(ref, parameters={"bbox": _stamp_box(x, y, native_size)})
                     image = np.asarray(_attr(stamp, "image").array, dtype=np.float32)
                     if image.shape != (native_size, native_size):
                         rec.update(status="rejected", reasons=f"clipped:{image.shape}")
@@ -1574,8 +1627,7 @@ def extract_patches(
 
                     # Variance and mask are read, used, and dropped: they are
                     # what the gate is made of, and the prior never sees them.
-                    variance = np.asarray(_attr(stamp, "variance").array,
-                                          dtype=np.float32)
+                    variance = np.asarray(_attr(stamp, "variance").array, dtype=np.float32)
                     packed, mapping = pack_mask(_attr(stamp, "mask"))
                     if mask_mapping is None:
                         mask_mapping = mapping
@@ -1587,17 +1639,22 @@ def extract_patches(
                             f"mean different bits in different stamps."
                         )
 
-                    n_lo, n_hi = stamp_depth(
-                        visit_counts if depth_usable else {}, cells)
+                    n_lo, n_hi = stamp_depth(visit_counts if depth_usable else {}, cells)
                     if n_lo > 0:
                         depth_ratio = n_hi / n_lo
                     elif n_lo == 0:
                         depth_ratio = np.inf  # a cell with no visits at all
                     else:
                         depth_ratio = None  # provenance carried no such cell
-                    reasons, diag = gate(image, variance, packed, mask_mapping,
-                                         cell_depth_ratio=depth_ratio,
-                                         n_visits=n_lo, **gate_kwargs)
+                    reasons, diag = gate(
+                        image,
+                        variance,
+                        packed,
+                        mask_mapping,
+                        cell_depth_ratio=depth_ratio,
+                        n_visits=n_lo,
+                        **gate_kwargs,
+                    )
                     rec.update({f"diag_{k}": v for k, v in diag.items()})
                     if reasons:
                         rec.update(status="rejected", reasons=";".join(reasons))
@@ -1627,41 +1684,47 @@ def extract_patches(
                         )
 
                     nb = neighbours.near(
-                        float(tgt_ra[h]), float(tgt_dec[h]), neighbour_radius_arcsec,
-                        band_name, host_id=int(host_id[h]),
+                        float(tgt_ra[h]),
+                        float(tgt_dec[h]),
+                        neighbour_radius_arcsec,
+                        band_name,
+                        host_id=int(host_id[h]),
                     )
                     others = [n for n in nb if not n["is_host"]]
                     gal = [n["sep_arcsec"] for n in others if n["extendedness"] > 0.5]
                     star = [n["sep_arcsec"] for n in others if n["extendedness"] <= 0.5]
                     y0, x0 = _origin(stamp)
                     acf.add(image)
-                    writer.add(image, meta={
-                        "band_idx": BANDS.index(band_name),
-                        "x0": x0,
-                        "y0": y0,
-                        "ra": float(tgt_ra[h]),
-                        "dec": float(tgt_dec[h]),
-                        "pixel_scale": _pixel_scale(wcs, x, y),
-                        "sky_noise": diag["sky_noise"],
-                        "host_id": int(host_id[h]),
-                        "host_offset_arcsec": float(r_jit[h]),
-                        "tract": base["tract"],
-                        "patch": base["patch"],
-                        "n_cells_spanned": len(cells),
-                        "n_visits_min": n_lo,
-                        "n_visits_max": n_hi,
-                        "cell_depth_ratio": diag.get("cell_depth_ratio", np.nan),
-                        "variance_step": diag["variance_step"],
-                        "frac_no_data": diag["frac_no_data"],
-                        "frac_inexact_psf": diag["frac_INEXACT_PSF"],
-                        "frac_rejected": diag["frac_REJECTED"],
-                        "n_neighbours": len(others),
-                        "neighbour_flux_max": float(
-                            max([n["flux"] for n in others], default=np.nan)
-                        ),
-                        "nearest_galaxy_arcsec": float(min(gal, default=np.nan)),
-                        "nearest_star_arcsec": float(min(star, default=np.nan)),
-                    })
+                    writer.add(
+                        image,
+                        meta={
+                            "band_idx": BANDS.index(band_name),
+                            "x0": x0,
+                            "y0": y0,
+                            "ra": float(tgt_ra[h]),
+                            "dec": float(tgt_dec[h]),
+                            "pixel_scale": _pixel_scale(wcs, x, y),
+                            "sky_noise": diag["sky_noise"],
+                            "host_id": int(host_id[h]),
+                            "host_offset_arcsec": float(r_jit[h]),
+                            "tract": base["tract"],
+                            "patch": base["patch"],
+                            "n_cells_spanned": len(cells),
+                            "n_visits_min": n_lo,
+                            "n_visits_max": n_hi,
+                            "cell_depth_ratio": diag.get("cell_depth_ratio", np.nan),
+                            "variance_step": diag["variance_step"],
+                            "frac_no_data": diag["frac_no_data"],
+                            "frac_inexact_psf": diag["frac_INEXACT_PSF"],
+                            "frac_rejected": diag["frac_REJECTED"],
+                            "n_neighbours": len(others),
+                            "neighbour_flux_max": float(
+                                max([n["flux"] for n in others], default=np.nan)
+                            ),
+                            "nearest_galaxy_arcsec": float(min(gal, default=np.nan)),
+                            "nearest_star_arcsec": float(min(star, default=np.nan)),
+                        },
+                    )
                     for n in others:
                         neighbour_rows.append({"patch_index": n_accepted, **n})
                     rec.update(status="accepted", patch_index=n_accepted)
@@ -1686,13 +1749,11 @@ def extract_patches(
             seed=seed + rounds,
         )
         if not len(hosts):
-            log.info("no untried hosts left in the catalogue after %d round(s)",
-                     rounds - 1)
+            log.info("no untried hosts left in the catalogue after %d round(s)", rounds - 1)
             break
         tried.update(int(i) for i in hosts["objectId"])
         host_tables.append(hosts)
-        log.info("round %d: %d hosts selected from %d candidates",
-                 rounds, len(hosts), len(field))
+        log.info("round %d: %d hosts selected from %d candidates", rounds, len(hosts), len(field))
 
         host_ra = np.asarray(hosts["coord_ra"], dtype=float)
         host_dec = np.asarray(hosts["coord_dec"], dtype=float)
@@ -1712,8 +1773,14 @@ def extract_patches(
             log.info("reached the target of %d cutouts", target)
             break
         gained = n_accepted - before
-        log.info("round %d: %d cutouts from %d hosts (%.2f per host), %d total",
-                 rounds, gained, len(hosts), gained / max(len(hosts), 1), n_accepted)
+        log.info(
+            "round %d: %d cutouts from %d hosts (%.2f per host), %d total",
+            rounds,
+            gained,
+            len(hosts),
+            gained / max(len(hosts), 1),
+            n_accepted,
+        )
 
         if target is None or n_accepted >= target:
             break
@@ -1721,7 +1788,10 @@ def extract_patches(
             log.warning(
                 "stopping after %d rounds with %d of %d cutouts; raise max_rounds, "
                 "widen --radius-deg, or loosen the gate -- read rejection_counts "
-                "in the summary first", rounds, n_accepted, target,
+                "in the summary first",
+                rounds,
+                n_accepted,
+                target,
             )
             break
         batch = next_batch(batch, len(hosts), gained, target - n_accepted)
@@ -1814,8 +1884,7 @@ def _pixel_scale(wcs, x: float, y: float) -> float:
         return float("nan")
 
 
-def _neighbour_index(butler, tract: int, columns: Sequence[str],
-                     bands: Sequence[str]):
+def _neighbour_index(butler, tract: int, columns: Sequence[str], bands: Sequence[str]):
     """Neighbour index for one tract.
 
     Neighbours must come from the *whole* tract, not from the host pool: a host
@@ -1860,13 +1929,12 @@ class _NeighbourIndex:
             else np.full(len(self.ra), np.nan)
         )
 
-    def near(self, ra: float, dec: float, radius_arcsec: float, band: str,
-             host_id: int | None = None):
+    def near(
+        self, ra: float, dec: float, radius_arcsec: float, band: str, host_id: int | None = None
+    ):
         cosd = max(np.cos(np.deg2rad(dec)), 1e-6)
         r_deg = radius_arcsec / 3600.0
-        box = (np.abs(self.dec - dec) < r_deg) & (
-            np.abs(self.ra - ra) * cosd < r_deg
-        )
+        box = (np.abs(self.dec - dec) < r_deg) & (np.abs(self.ra - ra) * cosd < r_deg)
         idx = np.where(box)[0]
         if idx.size == 0:
             return []
@@ -1910,9 +1978,7 @@ def _read_table(path):
     return Table.read(path if path.suffix else path.with_suffix(".parquet"))
 
 
-def _write_manifest(
-    out_dir: Path, records: Iterable[dict], neighbour_rows: Iterable[dict]
-) -> dict:
+def _write_manifest(out_dir: Path, records: Iterable[dict], neighbour_rows: Iterable[dict]) -> dict:
     """Parquet if pandas is available, CSV otherwise.  Never lose the records."""
     records = list(records)
     # A stamp can fail several gates at once, and ``gate`` returns them in a

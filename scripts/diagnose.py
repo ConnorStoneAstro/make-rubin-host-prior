@@ -105,7 +105,7 @@ def main() -> None:
                 bands=shards.bands,
             )
         dataset = PatchDataset.from_shards(
-            shards, config, LogFluxTransform.from_config(config.transform, shards.bands)
+            shards, config, LogFluxTransform.from_config(config.transform)
         )
     else:
         print("no --config: skipping the loader figures")

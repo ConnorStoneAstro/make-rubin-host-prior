@@ -113,12 +113,20 @@ lag 1 to exclude it, because a naive 1/e crossing on the raw profile returns
 ξ ≈ 1 regardless of galaxy size (measured: wrong by 4×).
 
 The softening scale is **measured per band**, so a band the shards contain no
-patches in gets no scale, and the transform is built over the bands the data
-actually has rather than the ones extraction was asked for — inventing a scale
-for an absent band would put its turnover wherever the guess landed. The script
-prints the patch count per band and says so when one is empty; a band missing
-entirely usually means the run hit its `--n-patches` target before reaching it,
-or that no coadds exist for those tracts.
+patches in gets no scale — inventing one would put its turnover wherever the
+guess landed. The script prints the patch count per band and says so when one is
+empty; a band missing entirely usually means the run hit its `--n-patches` target
+before reaching it, or that no coadds exist for those tracts.
+
+The transform is nonetheless **always indexed over the whole of `BANDS`**, with
+NaN where a scale was never measured. `band_idx` in the shards is a global index
+into `BANDS`, so the softening tuple has to be too: building it over the subset
+that happened to have patches silently re-bases the indexing, and with
+`('r','i','z','y')` measured, index 4 runs off the end while index 2 quietly
+returns the i-band scale for an r-band patch. `PatchDataset.from_shards` checks
+that every band actually present has a finite scale and names the ones that do
+not, so the failure arrives where the band can be identified rather than as a
+NaN in training.
 
 ### 4. Train
 

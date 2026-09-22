@@ -29,7 +29,7 @@ from typing import Iterator
 import h5py
 import numpy as np
 
-from ..config import Config
+from ..config import BANDS, Config
 from .augment import random_dihedral
 from .diagnostics import correlation_length
 from .pooling import pool_to_training_grid
@@ -87,6 +87,20 @@ class PatchDataset:
             raise ValueError(
                 f"shards hold {shards.native_size}-pixel stamps but the config "
                 f"asks for {config.patch.native_size}"
+            )
+        # The softening is measured per band, so a band the shards contain but
+        # the config never saw has no scale.  Catch it here, where the band can
+        # be named, rather than as a NaN that propagates into training or an
+        # IndexError from deep inside the transform.
+        present = sorted({int(i) for i in shards.meta["band_idx"]})
+        unscaled = [BANDS[i] for i in present
+                    if i < len(transform.softening)
+                    and not np.isfinite(transform.softening[i])]
+        if unscaled or any(i >= len(transform.softening) for i in present):
+            raise ValueError(
+                f"these shards contain band(s) {unscaled or 'beyond the config'} "
+                f"with no softening scale. The config was prepared against a "
+                f"different shard set; re-run scripts/prepare_config.py on these."
             )
         gb = shards.nbytes("image") / 1024**3
         if in_memory == "auto":
