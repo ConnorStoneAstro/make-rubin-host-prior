@@ -1310,8 +1310,9 @@ def extract_patches(
     tap_url: str | None = None,
     limit_tracts: int | None = None,
     limit_hosts: int | None = None,
-    jitter_arcsec: float = 4.0,
-    selection: Selection | None = None,
+    selection=None,   # ExtractionConfig or Selection: anything with
+                      # .hosts and .patches
+
     patches_per_shard: int = 1024,
     max_patches: int | None = None,
     neighbour_radius_arcsec: float = 30.0,
@@ -1325,9 +1326,13 @@ def extract_patches(
     falls inside it.  Iterating hosts instead reloads the same patch repeatedly
     and dominates the runtime.
 
-    Positions are **jittered** around each host rather than centred on it.  A
-    prior trained on centred galaxies learns that galaxies are always centred,
-    which is useless for a transient that can sit anywhere in the scene.
+    Stamps are **centred on the host**.  A prior trained on centred galaxies
+    would learn that galaxies are always centred, which is useless for a
+    transient that can sit anywhere in the scene -- but the decentring belongs in
+    the loader, not here: it crops ``nominal_crop`` out of ``native_size`` at a
+    random offset, so the same stamp is seen at a different offset every epoch
+    instead of at one offset fixed at extraction time.  The reach of that is
+    ``(native_size - nominal_crop)/2``; widen ``native_size`` for more.
 
     ``n_hosts`` is a number of *hosts*; each can yield up to one cutout per band,
     and the gate rejects a good share of those, so it does not set the size of
@@ -1350,7 +1355,7 @@ def extract_patches(
     rng = np.random.default_rng(seed)
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
-    selection = selection or Selection()
+    selection = selection if selection is not None else Selection()
     gate_kwargs = selection.patches.gate_kwargs()
     # ``n_patches`` is a target to work towards; ``max_patches`` is a hard stop.
     # Both end the sweep at the same place, only ``n_patches`` tops up.
@@ -1397,7 +1402,7 @@ def extract_patches(
         was, depth_logged = depth_logged, True
         return was
 
-    def _sweep(hosts, host_id, tgt_ra, tgt_dec, r_jit):
+    def _sweep(hosts, host_id, tgt_ra, tgt_dec):
         """One pass for one batch of hosts, tract by tract.
 
         Tract-major, not patch-major: the object table is per tract, so the
@@ -1495,7 +1500,6 @@ def extract_patches(
                     rec = {
                         **base,
                         "host_id": int(host_id[h]),
-                        "host_offset_arcsec": float(r_jit[h]),
                     }
 
                     sep = _verify_centre(wcs, x, y, float(tgt_ra[h]), float(tgt_dec[h]))
@@ -1583,7 +1587,6 @@ def extract_patches(
                                 "release": "DP2",
                                 "skymap": SKYMAP,
                                 "bands": json.dumps(list(bands)),
-                                "jitter_arcsec": jitter_arcsec,
                                 "flux_units": "nJy",
                                 "correlated_noise": 1,  # coadds are warped
                                 "pixel_origin": PIXEL_ORIGIN,
@@ -1617,7 +1620,6 @@ def extract_patches(
                             "pixel_scale": _pixel_scale(wcs, x, y),
                             "sky_noise": diag["sky_noise"],
                             "host_id": int(host_id[h]),
-                            "host_offset_arcsec": float(r_jit[h]),
                             "tract": base["tract"],
                             "patch": base["patch"],
                             "n_cells_spanned": len(cells),
@@ -1660,17 +1662,10 @@ def extract_patches(
         host_ra = np.asarray(hosts["coord_ra"], dtype=float)
         host_dec = np.asarray(hosts["coord_dec"], dtype=float)
         host_id = np.asarray(hosts["objectId"], dtype=np.int64)
-        # Jitter once per host, not once per (host, patch): the same physical
-        # scene should be cut the same way in every band.
-        r_jit = jitter_arcsec * np.sqrt(rng.uniform(size=len(hosts)))
-        th_jit = rng.uniform(0, 2 * np.pi, size=len(hosts))
-        cosd = np.maximum(np.cos(np.deg2rad(host_dec)), 1e-6)
-        tgt_ra = host_ra + r_jit * np.cos(th_jit) / 3600.0 / cosd
-        tgt_dec = host_dec + r_jit * np.sin(th_jit) / 3600.0
 
         before = n_accepted
         try:
-            _sweep(hosts, host_id, tgt_ra, tgt_dec, r_jit)
+            _sweep(hosts, host_id, host_ra, host_dec)
         except _Done:
             log.info("reached the target of %d cutouts", target)
             break
@@ -1853,8 +1848,8 @@ class _NeighbourIndex:
                 "flux": float(flux[i]) if flux is not None else float("nan"),
                 "extendedness": float(self.extendedness[i]),
                 # The host is in the catalogue too, so it appears in its own
-                # neighbour list.  Flagged rather than dropped: its separation
-                # here is the jitter offset, which is worth being able to check.
+                # neighbour list.  Flagged rather than dropped, so a caller can
+                # see that the centre really is the object it asked for.
                 "is_host": bool(host_id is not None and int(self.ids[i]) == host_id),
             }
             for i, s in zip(idx, sep)

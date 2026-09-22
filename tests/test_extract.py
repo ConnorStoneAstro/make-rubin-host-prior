@@ -7,6 +7,8 @@ over ``tests/fakes``.  The rest covers the handful of pure functions whose
 failures would not be obvious from a traceback.
 """
 
+from pathlib import Path
+
 import numpy as np
 import pytest
 
@@ -647,24 +649,39 @@ def test_a_column_the_parquet_lacks_says_why(butler):
 # -- one file holds every cut ----------------------------------------------
 
 
-def test_the_selection_round_trips_and_refuses_a_typo(tmp_path):
-    """A mistyped key in a hand-edited file must not leave the default quietly
-    in place: that is a cut that looks applied and is not."""
-    import json
+def test_the_run_is_described_entirely_by_one_file(tmp_path):
+    """The script has no defaults of its own, so nothing about a run can differ
+    between the file and the command line."""
+    import yaml
 
-    sel = Selection(hosts=HostCuts(max_mag=19.0, min_reff_arcsec=2.0),
-                    patches=PatchCuts(min_visits=5, max_variance_step=None))
-    sel.save(tmp_path / "s.json")
-    back = Selection.load(tmp_path / "s.json")
-    assert back == sel
-    assert back.patches.gate_kwargs()["max_variance_step"] == float("inf")
-    assert back.patches.gate_kwargs()["min_visits"] == 5
+    from rubin_host_prior.selection import ExtractionConfig
 
-    raw = json.loads((tmp_path / "s.json").read_text())
-    raw["hosts"]["max_magnitude"] = 19.0  # near miss
-    (tmp_path / "bad.json").write_text(json.dumps(raw))
+    shipped = ExtractionConfig.load(
+        Path(__file__).resolve().parent.parent / "extraction.yaml")
+    assert shipped.out and shipped.stamps.bands and shipped.hosts.band == "r"
+    assert shipped.patches.gate_kwargs()["max_no_data"] > 0
+
+    path = tmp_path / "e.yaml"
+    shipped.save(path)
+    assert ExtractionConfig.load(path) == shipped
+
+    raw = yaml.safe_load(path.read_text())
+    raw["hosts"]["max_magnitude"] = 19.0     # near miss for max_mag
+    path.write_text(yaml.safe_dump(raw))
     with pytest.raises(ValueError, match="max_magnitude"):
-        Selection.load(tmp_path / "bad.json")
+        ExtractionConfig.load(path)
+
+    raw.pop("hosts")
+    raw["host"] = {}                          # near miss for a whole section
+    path.write_text(yaml.safe_dump(raw))
+    with pytest.raises(ValueError, match="unknown section"):
+        ExtractionConfig.load(path)
+
+
+def test_disabling_a_patch_cut_means_disabled_not_zero():
+    cuts = PatchCuts(min_visits=5, max_variance_step=None)
+    assert cuts.gate_kwargs()["max_variance_step"] == float("inf")
+    assert cuts.gate_kwargs()["min_visits"] == 5
 
 
 def test_magnitude_is_the_visibility_cut_and_becomes_a_flux():
@@ -696,3 +713,27 @@ def test_no_data_is_gated_once_not_twice():
     cuts = PatchCuts()
     assert "NO_DATA" not in cuts.zero_tolerance_planes
     assert cuts.gate_kwargs()["max_no_data"] > 0
+
+
+def test_stamps_are_centred_on_the_host(butler, tmp_path):
+    """Decentring belongs in the loader, which crops at a random offset every
+    epoch, rather than being fixed once at extraction time."""
+    import pandas as pd
+
+    _run(butler, tmp_path)
+    manifest = pd.read_parquet(tmp_path / "manifest.parquet")
+    hosts = pd.read_parquet(tmp_path / "hosts.parquet")
+    accepted = manifest[manifest["status"] == "accepted"].merge(
+        hosts[["objectId", "coord_ra", "coord_dec"]],
+        left_on="host_id", right_on="objectId")
+    assert len(accepted)
+
+    from rubin_host_prior.data.shards import ShardSet
+
+    shards = ShardSet.from_dir(tmp_path / "shards")
+    # The recorded stamp centre is the host's catalogue position exactly.
+    for ra, dec in zip(shards.meta["ra"], shards.meta["dec"]):
+        match = np.hypot((accepted["coord_ra"] - ra) * np.cos(np.deg2rad(dec)),
+                         accepted["coord_dec"] - dec).min() * 3600.0
+        assert match < 1e-6
+    assert "host_offset_arcsec" not in shards.meta

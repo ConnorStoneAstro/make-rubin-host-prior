@@ -1,14 +1,17 @@
-"""Every cut, in one place.
+"""How an extraction run is configured: all of it, from one YAML file.
+
+``extraction.yaml`` lives in the repository and is the single description of a
+run -- where to look, what to keep, how much of it to write.  The extraction
+script has no defaults of its own; change the file, not the command line, and
+the run is reproducible from a thing you can read and diff.
+
+    $EDITOR extraction.yaml
+    python scripts/extract_dp2_patches.py --config extraction.yaml
 
 The cuts used to be scattered across four files: defaults on ``select_hosts``,
 defaults on ``host_adql``, module constants in ``rubin.quality``, and command
-line flags that sometimes overrode one and not the other.  Changing what counts
-as a host meant editing code in several places and hoping they agreed.  This is
-the whole selection, host and pixel, in one serialisable object.
-
-    python scripts/extract_dp2_patches.py --write-selection selection.json
-    $EDITOR selection.json
-    python scripts/extract_dp2_patches.py --selection selection.json ...
+line flags that sometimes overrode one and not the other.  Changing what counted
+as a host meant editing code in several places and hoping they agreed.
 
 **The cuts, and why they are these.**
 
@@ -36,7 +39,6 @@ the tolerance is decorative.
 from __future__ import annotations
 
 import dataclasses
-import json
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -229,28 +231,116 @@ class PatchCuts:
 
 
 @dataclass
-class Selection:
-    """Host cuts and patch cuts together: the whole selection function."""
+class SkyRegion:
+    """Where to look.  ``radius_deg: null`` means the whole DP2 footprint."""
 
+    ra: float | None = 53.13
+    dec: float | None = -28.10
+    radius_deg: float | None = None
+
+
+@dataclass
+class Catalogue:
+    """Where the host list comes from."""
+
+    #: "tap" sends the cuts to the RSP as one ADQL query; "butler" scans the
+    #: repo's object tables instead and needs no network.
+    source: str = "tap"
+    #: Written once and reused; delete the file if the host cuts change.
+    cache: str | None = None
+    #: TOP N on the TAP query.  null for no limit.
+    limit_hosts: int | None = None
+    #: Scan only this many object tables (butler source only).
+    limit_tracts: int | None = None
+    #: Found from the RSP discovery document when null.
+    tap_url: str | None = None
+
+
+@dataclass
+class Stamps:
+    """What each cutout is."""
+
+    bands: tuple[str, ...] = ("u", "g", "r", "i", "z", "y")
+
+    def __post_init__(self) -> None:
+        # YAML has no tuples, so a loaded file would compare unequal to the
+        # object it was written from.
+        self.bands = tuple(self.bands)
+    #: Native pixels cut from the coadd.  Deliberately larger than the training
+    #: crop: the slack is what the loader translates within, which is where
+    #: decentring comes from now that extraction centres on the host.
+    native_size: int = 416
+    patches_per_shard: int = 1024
+    #: Catalogue radius for the neighbour covariates, arcsec.
+    neighbour_radius_arcsec: float = 30.0
+
+
+@dataclass
+class Run:
+    """How much to do."""
+
+    #: Hosts drawn per round.  Each yields at most one cutout per band.
+    n_hosts: int = 8000
+    #: Target number of accepted cutouts; null to take what the hosts give.
+    n_patches: int | None = None
+    #: Hard stop, no topping up.
+    max_patches: int | None = None
+    max_rounds: int = 8
+    seed: int = 0
+    prefix: str = "patches"
+
+
+@dataclass
+class ExtractionConfig:
+    """One run, described completely."""
+
+    out: str = "data/hosts"
+    sky: SkyRegion = field(default_factory=SkyRegion)
+    catalogue: Catalogue = field(default_factory=Catalogue)
+    stamps: Stamps = field(default_factory=Stamps)
+    run: Run = field(default_factory=Run)
     hosts: HostCuts = field(default_factory=HostCuts)
     patches: PatchCuts = field(default_factory=PatchCuts)
 
-    def save(self, path: str | Path) -> None:
-        Path(path).write_text(json.dumps(dataclasses.asdict(self), indent=2) + "\n")
+    _SECTIONS = {"sky": SkyRegion, "catalogue": Catalogue, "stamps": Stamps,
+                 "run": Run, "hosts": HostCuts, "patches": PatchCuts}
 
     @classmethod
-    def load(cls, path: str | Path) -> "Selection":
-        raw = json.loads(Path(path).read_text())
-        unknown = set(raw) - {f.name for f in dataclasses.fields(cls)}
+    def load(cls, path: str | Path) -> "ExtractionConfig":
+        import yaml
+
+        raw = yaml.safe_load(Path(path).read_text()) or {}
+        known = {f.name for f in dataclasses.fields(cls)}
+        unknown = set(raw) - known
         if unknown:
-            raise ValueError(f"unknown selection sections {sorted(unknown)}")
-        return cls(
-            hosts=_build(HostCuts, raw.get("hosts", {})),
-            patches=_build(PatchCuts, raw.get("patches", {})),
+            raise ValueError(
+                f"{path} has unknown section(s) {sorted(unknown)}; it may have "
+                f"{sorted(known)}"
+            )
+        sections = {name: _build(kind, raw.get(name) or {})
+                    for name, kind in cls._SECTIONS.items()}
+        return cls(out=raw.get("out", cls.out), **sections)
+
+    def save(self, path: str | Path) -> None:
+        import yaml
+
+        Path(path).write_text(
+            yaml.safe_dump(dataclasses.asdict(self), sort_keys=False)
         )
 
     def describe(self) -> str:
-        return "host cuts:\n" + self.hosts.describe()
+        where = ("the whole DP2 footprint" if self.sky.radius_deg is None
+                 else f"{self.sky.radius_deg} deg of "
+                      f"({self.sky.ra}, {self.sky.dec})")
+        return (f"extracting from {where} via {self.catalogue.source}\n"
+                f"host cuts:\n" + self.hosts.describe())
+
+
+#: Kept as an alias: the cuts alone are still a useful thing to pass around.
+@dataclass
+class Selection:
+    hosts: HostCuts = field(default_factory=HostCuts)
+    patches: PatchCuts = field(default_factory=PatchCuts)
 
 
 def _build(cls, raw: dict):

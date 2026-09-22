@@ -1,0 +1,107 @@
+# How an extraction run is configured.  All of it.
+#
+#   python scripts/extract_dp2_patches.py --config extraction.yaml
+#
+# The extraction script has no defaults of its own: everything it does is here,
+# so a run is reproducible from a file you can read, diff and check in.  A key
+# this file does not recognise is an error rather than a silently ignored line --
+# a cut that looks applied and is not is the worst of the three outcomes.
+
+out: data/hosts
+
+# Where to look.  radius_deg: null is the whole DP2 footprint, which is what you
+# want for a selective size cut: big galaxies are rare per square degree, so the
+# way to get more of them is more sky.
+sky:
+  ra: 53.13
+  dec: -28.10
+  radius_deg: null
+
+# Where the host list comes from.  "tap" sends the cuts to the RSP as one ADQL
+# query, which is far less work than reading every row of ~1000 object tables,
+# but needs network and a token with read:tap.  "butler" scans the repo instead
+# and needs nothing else.  Either way the cache means it happens once.
+catalogue:
+  source: tap
+  cache: data/host_catalogue.parquet
+  limit_hosts: null      # TOP N on the query; null for no limit
+  limit_tracts: null     # butler source only
+  tap_url: null          # found from the RSP discovery document
+
+# What each cutout is.  native_size is deliberately larger than the training
+# crop: that slack is what the loader translates within, and since extraction
+# centres every stamp on its host, it is the only source of decentring.  At
+# native 416 and a 384 crop the host stays within +-16 native px (3.2") of the
+# centre; widen native_size if the model should see hosts further off-centre.
+stamps:
+  bands: [u, g, r, i, z, y]
+  native_size: 416
+  patches_per_shard: 1024
+  neighbour_radius_arcsec: 30.0
+
+# How much to do.  n_hosts counts hosts, not cutouts: each yields at most one
+# per band and the gate rejects a share of those.  n_patches is a target the run
+# works towards, drawing fresh hosts until it has them.
+run:
+  n_hosts: 8000
+  n_patches: null
+  max_patches: null
+  max_rounds: 8
+  seed: 0
+  prefix: patches
+
+# Which catalogue rows may become hosts.
+#
+# max_mag is the cut that decides visibility.  Surface brightness decides
+# whether a *fit* is real, but it is a poor proxy for "I can see it": a tight
+# max_mu_e selects concentrated light, which is the opposite of what a prior
+# over galaxy structure wants.  So max_mu_e stays loose, as a bound on fits that
+# ran away around an invisible envelope.
+#
+# Extent is min_reff_arcsec, the intrinsic half-light radius from the multiband
+# Sersic fit, together with min_deconvolved_px, which is the same claim made
+# against the image: T^2 = ((ixx+iyy)-(ixxPSF+iyyPSF))/2, exactly zero for a
+# point source at any seeing.
+hosts:
+  band: r
+  max_mag: 19.0          # faint limit
+  min_mag: 11.5          # nominal; the saturated-core flag is the real one
+  min_reff_arcsec: 1.5
+  max_reff_arcsec: 30.0
+  max_mu_e: 25.5         # mag/arcsec^2; sky is about 27
+  min_deconvolved_px: 2.5
+  max_sersic_index: 6.0
+  min_extendedness: 0.5
+  max_blendedness: null
+  reject_saturated_centre: true
+  reject_interpolated_centre: false
+  dedupe_radius_arcsec: 0.5
+  size_stratified: false
+  n_size_bins: 5
+
+# Which stamps survive, given the pixels.  Tolerances are fractions of the
+# stamp, and of its central region where the transient goes.
+#
+# NO_DATA is deliberately not a zero-tolerance plane: it is measured from the
+# inf-variance fraction instead, and having both meant the stricter always won
+# and max_no_data never did anything.
+#
+# The depth thresholds are set for shallow, ragged coverage.  Early DP2 outside
+# the deep fields runs one visit per cell, where a single-visit difference
+# between neighbouring cells is a ratio of 2 or 3.
+patches:
+  zero_tolerance_planes: [DETECTION_EDGE]
+  max_plane_fraction:
+    SATURATED: 0.01
+    COSMIC_RAY: 0.01
+    INTERPOLATED: 0.01
+  max_inner_plane_fraction:
+    SATURATED: 0.001
+    COSMIC_RAY: 0.01
+    INTERPOLATED: 0.001
+  inner_fraction: 0.34
+  max_no_data: 0.02
+  max_inner_no_data: 0.0
+  max_cell_depth_ratio: 3.5
+  max_variance_step: 4.0
+  min_visits: null

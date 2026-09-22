@@ -215,7 +215,6 @@ def write_synthetic_shards(
                     "pixel_scale": 0.2003,
                     "sky_noise": noise[band],
                     "host_id": i,
-                    "host_offset_arcsec": float(rng.uniform(0, 3)),
                     "tract": 5063,
                     "patch": int(rng.integers(100)),
                     "n_neighbours": int(rng.poisson(3)),

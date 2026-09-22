@@ -2,7 +2,7 @@
 
 The pieces, in the order they are used:
 
-``rubin``      DP2 extraction: host selection, jittered cutouts, the artefact gate.
+``rubin``      DP2 extraction: host selection, host-centred cutouts, the artefact gate.
 ``data``       Shards, the log-space flux transform, pooling, augmentation, loader.
 ``nn``         The valid-convolution energy network; ``score`` is ``-grad_x E``.
 ``diffusion``  VE SDE, denoising score matching, samplers.

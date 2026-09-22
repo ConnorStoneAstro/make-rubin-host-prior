@@ -631,20 +631,25 @@ rejects, it rejects preferentially, so a set filled over several rounds is drawn
 deeper into the catalogue than one filled by the first round. Read
 `rejection_counts` before deciding that is acceptable.
 
-### Every cut lives in one file
+### One file describes the whole run
 
 ```bash
-python scripts/extract_dp2_patches.py --write-selection selection.json
-$EDITOR selection.json
-python scripts/extract_dp2_patches.py --selection selection.json --out data/hosts
+$EDITOR extraction.yaml
+python scripts/extract_dp2_patches.py --config extraction.yaml
 ```
 
-`selection.json` holds the whole selection function — host cuts and pixel cuts
-together. They used to be spread across defaults on `select_hosts`, defaults on
+`extraction.yaml` is **checked into the repository**, not generated. It holds
+everything a run does — where to look, which catalogue to ask, what a host is,
+what a usable stamp is, how much to write. The script has no defaults of its
+own, so a run is reproducible from a file you can read, diff and check in, and a
+flag and a config key cannot disagree.
+
+The cuts used to be spread across defaults on `select_hosts`, defaults on
 `host_adql`, module constants in `rubin.quality` and command-line flags that
-sometimes overrode one and not the other. A mistyped key is refused rather than
-leaving the default quietly in place, since a cut that looks applied and is not
-is the worst of the three outcomes.
+sometimes overrode one and not the other. A key the file does not recognise — or
+a whole mistyped section — is an error rather than a silently ignored line, since
+a cut that looks applied and is not is the worst of the three outcomes. YAML
+rather than JSON so the reasoning can sit next to the numbers.
 
 Extraction prints `describe()` before it runs: the faint limit, the surface
 brightness limit, and **which of the two binds at each size**. Size and

@@ -40,7 +40,6 @@ META_DTYPES: dict[str, str] = {
     "pixel_scale": "f4",
     "sky_noise": "f4",  # sqrt(median variance) at native resolution, nJy
     "host_id": "i8",
-    "host_offset_arcsec": "f4",
     "tract": "i4",
     "patch": "i4",
     "n_neighbours": "i2",

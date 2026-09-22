@@ -305,8 +305,6 @@ def plot_hosts(shards, hosts=None, band: str = "r", out: Path | None = None):
     panels.append(("nearest star", meta["nearest_star_arcsec"], 40, "arcsec", False))
     panels.append(("neighbours in frame", np.asarray(meta["n_neighbours"], dtype=float),
                    30, "count within search radius", False))
-    panels.append(("host offset from centre", meta["host_offset_arcsec"], 30,
-                   "arcsec (extraction jitter)", False))
     if "n_visits_min" in meta:
         # Exposure times are equal, so this is the depth of the shallowest cell
         # the stamp covers, straight from the coadd provenance.

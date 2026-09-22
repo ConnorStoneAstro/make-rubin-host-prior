@@ -3,24 +3,16 @@
 
 Runs on NERSC, inside the LSST stack.
 
-    python scripts/extract_dp2_patches.py --out data/ecdfs --bands r i --n-hosts 2000
+    python scripts/extract_dp2_patches.py --config extraction.yaml
 
-Writes ``<out>/shards/*.h5``, ``<out>/manifest.parquet``, ``<out>/summary.json``.
-Read the rejection counts in the summary before trusting the set: if bright
-dense centres are being rejected, the training set is biased against the regime
-this project cares about and the gate needs loosening.
+Everything the run does comes from that file -- where to look, what to keep, how
+much of it to write.  This script has no defaults of its own, so a run is
+reproducible from a thing you can read, diff and check in, and there is no
+possibility of a command-line flag and a config key disagreeing.
 
-``--n-hosts`` counts *hosts*, not cutouts: each yields at most one per band and
-the gate rejects a share of those, so 128 hosts is nowhere near 128 cutouts.  Use
-``--n-patches`` to ask for a number of cutouts and let extraction keep drawing
-hosts until it has them.
-
-Hosts are drawn from the whole DP2 footprint by default.  Pass ``--host-cache``
-so the scan over the footprint's object tables happens once.
-
-Early DP2 publishes ``deep_coadd`` and nothing else -- no ``visit_image``, no
-``difference_image`` -- which suits this project, since the prior trains on
-coadds anyway.
+Writes ``<out>/shards/*.h5``, ``<out>/manifest.parquet``, ``<out>/hosts.parquet``
+and ``<out>/summary.json``.  Read ``rejection_counts`` in the summary before
+trusting the set: what the gate throws away *is* the selection function.
 """
 
 from __future__ import annotations
@@ -30,97 +22,19 @@ import json
 import logging
 from pathlib import Path
 
-from rubin_host_prior.selection import Selection
-from rubin_host_prior.rubin.extract import (
-    COLLECTION,
-    ECDFS,
-    REPO,
-    extract_patches,
-    open_butler,
-)
+from rubin_host_prior.selection import ExtractionConfig
+from rubin_host_prior.rubin.extract import extract_patches, open_butler
+
+#: Shipped with the repository, not generated.
+DEFAULT_CONFIG = Path(__file__).resolve().parent.parent / "extraction.yaml"
 
 
 def main() -> None:
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("--out", help="output directory")
-    p.add_argument(
-        "--selection", default=None,
-        help="JSON file holding every host and patch cut. Write the defaults "
-             "with --write-selection, edit it, pass it back here",
-    )
-    p.add_argument(
-        "--write-selection", default=None,
-        help="write the default cuts to this path and exit",
-    )
-    p.add_argument("--repo", default=REPO, help="butler repo alias or path")
-    p.add_argument("--collection", default=COLLECTION)
-    p.add_argument("--ra", type=float, default=ECDFS[0])
-    p.add_argument("--dec", type=float, default=ECDFS[1])
-    p.add_argument(
-        "--radius-deg", type=float, default=None,
-        help="restrict host selection to this many degrees of --ra/--dec. "
-             "Omit to use the whole DP2 footprint, which is what you want for a "
-             "selective size cut: big galaxies are rare per square degree",
-    )
-    p.add_argument(
-        "--host-cache", default=None,
-        help="path to cache the host catalogue. Scanning the footprint's object "
-             "tables takes minutes; with this it happens once. Delete the file "
-             "if the host cuts change",
-    )
-    p.add_argument(
-        "--host-source", choices=["tap", "butler"], default="tap",
-        help="where the host list comes from. 'tap' sends the cuts to the TAP "
-             "service as one ADQL query, which is far less work than reading "
-             "every row, but needs network and an RSP token. 'butler' scans the "
-             "object tables through the repo and needs nothing else. Cache the "
-             "result and a later run needs neither",
-    )
-    p.add_argument(
-        "--tap-url", default=None,
-        help="TAP endpoint. Found from the RSP discovery document by default. "
-             "The token is NOT an argument: export ACCESS_TOKEN or put it in "
-             "~/.rsp-token, so it stays out of shell history and process lists",
-    )
-    p.add_argument(
-        "--limit-hosts", type=int, default=None,
-        help="TOP N on the TAP query. For a quick test run",
-    )
-    p.add_argument(
-        "--limit-tracts", type=int, default=None,
-        help="scan only this many object tables (--host-source butler). For a "
-             "quick test run",
-    )
-    p.add_argument("--bands", nargs="+", default=["u", "g", "r", "i", "z", "y"])
-    p.add_argument(
-        "--native-size",
-        type=int,
-        default=416,
-        help="native pixels per stamp. This is what caps the training patch "
-        "size: out_size <= native_size // pool_factor. 416 targets 128 px "
-        "patches (56%% of each clears the loss crop) with slack left for "
-        "translation augmentation",
-    )
-    p.add_argument(
-        "--n-hosts", type=int, default=8000,
-        help="hosts per round. Each can yield up to one cutout per band, and the "
-             "gate rejects a share of those, so this is not the size of the "
-             "training set -- see --n-patches",
-    )
-    p.add_argument(
-        "--n-patches", type=int, default=None,
-        help="target number of accepted cutouts. Keeps drawing fresh hosts, in "
-             "batches sized from the yield observed so far, until it has this "
-             "many or the catalogue runs out",
-    )
-    p.add_argument(
-        "--max-rounds", type=int, default=8,
-        help="give up topping up towards --n-patches after this many rounds",
-    )
-    p.add_argument("--jitter-arcsec", type=float, default=4.0)
-    p.add_argument("--patches-per-shard", type=int, default=1024)
-    p.add_argument("--max-patches", type=int, default=None)
-    p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--config", default=str(DEFAULT_CONFIG),
+                   help=f"run description (default: {DEFAULT_CONFIG})")
+    p.add_argument("--repo", default="dp2", help="butler repo alias or path")
+    p.add_argument("--collection", default="dp2")
     p.add_argument("--no-plots", action="store_true",
                    help="skip the diagnostic figures written to <out>/diagnostics")
     p.add_argument("--verbose", "-v", action="count", default=0)
@@ -131,39 +45,33 @@ def main() -> None:
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
 
-    selection = (Selection.load(args.selection) if args.selection
-                 else Selection())
-    if not args.write_selection and not args.out:
-        p.error("--out is required unless --write-selection is given")
-    if args.write_selection:
-        selection.save(args.write_selection)
-        print(f"wrote {args.write_selection}")
-        print(selection.describe())
-        return
-    print(selection.describe())
+    config = ExtractionConfig.load(args.config)
+    print(f"config: {args.config}")
+    print(config.describe())
 
     butler = open_butler(args.repo, args.collection)
     summary = extract_patches(
         butler,
-        out_dir=args.out,
-        ra=args.ra,
-        dec=args.dec,
-        radius_deg=args.radius_deg,
-        host_cache=args.host_cache,
-        host_source=args.host_source,
-        tap_url=args.tap_url,
-        limit_tracts=args.limit_tracts,
-        limit_hosts=args.limit_hosts,
-        bands=args.bands,
-        native_size=args.native_size,
-        n_hosts=args.n_hosts,
-        n_patches=args.n_patches,
-        max_rounds=args.max_rounds,
-        selection=selection,
-        jitter_arcsec=args.jitter_arcsec,
-        patches_per_shard=args.patches_per_shard,
-        max_patches=args.max_patches,
-        seed=args.seed,
+        out_dir=config.out,
+        ra=config.sky.ra,
+        dec=config.sky.dec,
+        radius_deg=config.sky.radius_deg,
+        bands=config.stamps.bands,
+        native_size=config.stamps.native_size,
+        patches_per_shard=config.stamps.patches_per_shard,
+        neighbour_radius_arcsec=config.stamps.neighbour_radius_arcsec,
+        host_source=config.catalogue.source,
+        host_cache=config.catalogue.cache,
+        limit_hosts=config.catalogue.limit_hosts,
+        limit_tracts=config.catalogue.limit_tracts,
+        tap_url=config.catalogue.tap_url,
+        n_hosts=config.run.n_hosts,
+        n_patches=config.run.n_patches,
+        max_patches=config.run.max_patches,
+        max_rounds=config.run.max_rounds,
+        seed=config.run.seed,
+        prefix=config.run.prefix,
+        selection=config,
     )
     print(json.dumps(summary, indent=2, default=str))
 
@@ -172,34 +80,24 @@ def main() -> None:
         # scales, which prepare_config.py has not produced yet.  Never let a
         # plotting failure cost a completed extraction.
         try:
-            _write_plots(Path(args.out), args.bands)
+            _write_plots(Path(config.out), config.stamps.bands)
         except Exception as exc:
             logging.getLogger(__name__).warning(
-                "diagnostic plots failed (%s); the extraction itself is fine", exc
-            )
+                "diagnostic plots failed (%r); the data is fine", exc)
 
 
-def _write_plots(root: Path, bands) -> None:
-    import matplotlib
+def _write_plots(out: Path, bands) -> None:
+    import pandas as pd
 
-    matplotlib.use("Agg")
     from rubin_host_prior import plots
     from rubin_host_prior.data import ShardSet
 
-    shards = ShardSet.from_dir(root / "shards")
-    hosts = manifest = None
-    try:
-        import pandas as pd
-
-        if (root / "hosts.parquet").exists():
-            hosts = pd.read_parquet(root / "hosts.parquet")
-        if (root / "manifest.parquet").exists():
-            manifest = pd.read_parquet(root / "manifest.parquet")
-    except Exception:
-        pass
+    shards = ShardSet.from_dir(out / "shards")
+    hosts = pd.read_parquet(out / "hosts.parquet")
+    manifest = pd.read_parquet(out / "manifest.parquet")
     band = "r" if "r" in bands else bands[0]
     for path in plots.make_all(shards, hosts=hosts, manifest=manifest,
-                               out_dir=root / "diagnostics", band=band):
+                               out_dir=out / "diagnostics", band=band):
         print(f"  wrote {path}")
     print("  run scripts/diagnose.py --config <config.json> for the loader figures")
 
