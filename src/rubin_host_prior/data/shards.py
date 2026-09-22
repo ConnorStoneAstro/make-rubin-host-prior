@@ -8,12 +8,14 @@ forward models:
 * **Store physical units at native resolution.**  Pooling, the log transform and
   the per-band offsets all happen in the loader, so any of them can change
   without re-extracting terabytes.
-* **Keep the variance plane, the mask, the mask plane dictionary, the PSF and
-  the origin.**  A patch without variance and PSF cannot be forward-modelled,
-  and a mask without its plane dictionary is uninterpretable -- DP2 bit
-  assignments are dynamic, so extraction repacks the mask and records the
-  mapping it used.  ``x0``/``y0`` is the stamp origin; without it an array index
-  cannot be mapped back to the sky.
+* **Store the image and nothing else.**  The prior is a distribution over
+  pixels; it never sees a variance plane, a mask or a PSF, so carrying them
+  triples the storage to no purpose.  They are still *read* during extraction --
+  they are what the quality gate is made of -- and then discarded.  What
+  survives of them is a handful of scalars per stamp, which is what a later cut
+  from the manifest needs.
+* **Keep the origin.**  ``x0``/``y0`` is the stamp origin in tract pixels;
+  without it an array index cannot be mapped back to the sky.
 """
 
 from __future__ import annotations
@@ -33,17 +35,10 @@ META_DTYPES: dict[str, str] = {
     "band_idx": "u1",
     "x0": "i4",
     "y0": "i4",
-    "center_x": "f8",
-    "center_y": "f8",
     "ra": "f8",
     "dec": "f8",
-    "psf_sigma": "f4",
-    "psf_fwhm": "f4",
-    "psf_ixx": "f4",
-    "psf_iyy": "f4",
-    "psf_ixy": "f4",
     "pixel_scale": "f4",
-    "sky_noise": "f4",  # sqrt(median variance), native resolution, nJy
+    "sky_noise": "f4",  # sqrt(median variance) at native resolution, nJy
     "host_id": "i8",
     "host_offset_arcsec": "f4",
     "tract": "i4",
@@ -54,30 +49,24 @@ META_DTYPES: dict[str, str] = {
     # split by extendedness.  NaN where there is none inside the search radius.
     "nearest_galaxy_arcsec": "f4",
     "nearest_star_arcsec": "f4",
-    # DP2 covariates: recorded for every stamp, never gated on.  INEXACT_PSF and
-    # REJECTED cover a large fraction of the coadd, so a cut on them keeps
-    # almost nothing; frac_no_data is DP2's inf-variance regions, which include
-    # the cores of saturated stars.
-    # Cells are coadded from different input visits, so depth and PSF step at
-    # cell edges; any stamp over 150 native px straddles them.
+    # Depth.  Cells are coadded from different input visits, so a stamp over
+    # 150 native px straddles a boundary between two of them; exposure times are
+    # equal, so the ratio of visit counts is the depth step exactly, and
+    # variance_step is the same thing measured off the pixels.
     "n_cells_spanned": "i2",
-    # Distinct visits contributing to the shallowest and deepest cell the stamp
-    # covers, from the coadd provenance.  -1 where provenance was unavailable.
-    # Exposure times are equal, so their ratio is the depth step exactly.
     "n_visits_min": "i2",
     "n_visits_max": "i2",
     "cell_depth_ratio": "f4",
-    # Ratio of the highest to the lowest block variance floor: 1.0 is a uniform
-    # stamp, more than that is a depth step between cells.  Nothing flags this,
-    # so it is measured from the variance plane.
     "variance_step": "f4",
+    # What the gate saw, kept so a later cut can be made from the manifest
+    # without re-reading pixels.
     "frac_no_data": "f4",
     "frac_inexact_psf": "f4",
     "frac_rejected": "f4",
 }
 
-IMAGE_KEYS = ("image", "variance", "mask")
-IMAGE_DTYPES = {"image": "f4", "variance": "f4", "mask": "u4"}
+IMAGE_KEYS = ("image",)
+IMAGE_DTYPES = {"image": "f4"}
 
 
 class ShardWriter:
@@ -87,26 +76,21 @@ class ShardWriter:
         self,
         out_dir: str | Path,
         native_size: int,
-        psf_size: int,
-        mask_plane_dict: dict[str, int],
         prefix: str = "patches",
         patches_per_shard: int = 1024,
-        dataset_type: str = "visit_image",
+        dataset_type: str = "deep_coadd",
         attrs: dict | None = None,
         compression: str | None = "lzf",
     ):
         self.out_dir = Path(out_dir)
         self.out_dir.mkdir(parents=True, exist_ok=True)
         self.native_size = native_size
-        self.psf_size = psf_size
         self.prefix = prefix
         self.patches_per_shard = patches_per_shard
         self.compression = compression
         self.attrs = {
-            "mask_plane_dict": json.dumps(dict(mask_plane_dict)),
             "bands": json.dumps(list(BANDS)),
             "native_size": native_size,
-            "psf_size": psf_size,
             "dataset_type": dataset_type,
             **{k: json.dumps(v) if isinstance(v, (dict, list)) else v
                for k, v in (attrs or {}).items()},
@@ -116,29 +100,15 @@ class ShardWriter:
         self.paths: list[Path] = []
         self.n_written = 0
 
-    def add(
-        self,
-        image: np.ndarray,
-        variance: np.ndarray,
-        mask: np.ndarray,
-        psf: np.ndarray,
-        meta: dict,
-    ) -> None:
+    def add(self, image: np.ndarray, meta: dict) -> None:
         n = self.native_size
-        for name, arr in (("image", image), ("variance", variance), ("mask", mask)):
-            if arr.shape != (n, n):
-                raise ValueError(f"{name} has shape {arr.shape}, expected {(n, n)}")
+        if image.shape != (n, n):
+            raise ValueError(f"image has shape {image.shape}, expected {(n, n)}")
         unknown = set(meta) - set(META_DTYPES)
         if unknown:
             raise ValueError(f"unknown meta keys {sorted(unknown)}")
         self._buf.append(
-            {
-                "image": np.asarray(image, dtype=np.float32),
-                "variance": np.asarray(variance, dtype=np.float32),
-                "mask": np.asarray(mask, dtype=np.uint32),
-                "psf": _pad_to(np.asarray(psf, dtype=np.float32), self.psf_size),
-                "meta": meta,
-            }
+            {"image": np.asarray(image, dtype=np.float32), "meta": meta}
         )
         if len(self._buf) >= self.patches_per_shard:
             self.flush()
@@ -160,12 +130,6 @@ class ShardWriter:
                     compression=self.compression,
                     chunks=(1, self.native_size, self.native_size),
                 )
-            f.create_dataset(
-                "psf",
-                data=np.stack([b["psf"] for b in self._buf]),
-                dtype="f4",
-                compression=self.compression,
-            )
             g = f.create_group("meta")
             for name, dtype in META_DTYPES.items():
                 fill = -1 if dtype[0] in "iu" else np.nan
@@ -190,24 +154,6 @@ class ShardWriter:
 
     def __exit__(self, *exc) -> None:
         self.close()
-
-
-def _pad_to(psf: np.ndarray, size: int) -> np.ndarray:
-    """Centre-pad or centre-crop a PSF stamp to a common size.
-
-    LSST PSF kernel size varies with focal-plane position, so stamps from one
-    visit are not all the same shape.  The true size is recoverable from the
-    non-zero support; pad rather than resample.
-    """
-    h, w = psf.shape
-    if (h, w) == (size, size):
-        return psf
-    out = np.zeros((size, size), dtype=np.float32)
-    ch, cw = min(h, size), min(w, size)
-    sy, sx = (h - ch) // 2, (w - cw) // 2
-    dy, dx = (size - ch) // 2, (size - cw) // 2
-    out[dy : dy + ch, dx : dx + cw] = psf[sy : sy + ch, sx : sx + cw]
-    return out
 
 
 @dataclass
@@ -263,10 +209,6 @@ class ShardSet:
     @property
     def native_size(self) -> int:
         return int(self.attrs["native_size"])
-
-    @property
-    def mask_plane_dict(self) -> dict[str, int]:
-        return json.loads(self.attrs["mask_plane_dict"])
 
     @property
     def bands(self) -> tuple[str, ...]:

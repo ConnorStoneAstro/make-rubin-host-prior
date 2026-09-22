@@ -88,9 +88,10 @@ DATASET_TYPE = "deep_coadd"
 #: Coadds are tiled by patch, so this is the predicate that finds one.
 COADD_REGION = "patch.region OVERLAPS :region"
 
-#: Attribute names on a ``CellCoadd``.  DP2 turned DP1's getters into attributes
-#: and camelCase into snake_case.  Access goes through ``_attr``, which reports
-#: what the object actually offers if a name is ever wrong.
+#: Attribute names on a ``CellCoadd``, and the names of the butler components
+#: that serve them.  Note what is *absent*: ``grid`` and ``bounds`` are Python
+#: properties reading through to ``psf.bounds``, not components, so they come
+#: off the PSF object rather than from the butler.
 DP2_ATTRS = {
     "image": "image",
     "variance": "variance",
@@ -100,8 +101,6 @@ DP2_ATTRS = {
     "bbox": "bbox",
     "schema": "schema",
     "origin": "yx0",
-    "grid": "grid",
-    "bounds": "bounds",
     "provenance": "provenance",
 }
 
@@ -195,18 +194,26 @@ def _lsst() -> SimpleNamespace:
 
 
 def read_component(butler, ref, role: str):
-    """A ``deep_coadd`` component, or ``None`` if the repo will not serve it.
+    """A ``deep_coadd`` component.  Raises if the repo will not serve it.
 
     Components move no pixels, so everything needed to place and characterise a
-    stamp -- WCS, bounding box, PSF, cell grid, provenance -- can be had without
-    reading the patch.  The pixels then come from a bbox read of just the stamp.
+    stamp -- WCS, PSF, provenance -- comes this way and the pixels then come
+    from a bbox read of just the stamp.  A component that does not answer is a
+    bug in this mapping, not a condition to work around: ``grid`` and ``bounds``
+    were assumed to be components here for a while, silently forced a whole-patch
+    read on every stamp, and cost the run two orders of magnitude in I/O before
+    anyone noticed.
     """
     name = DP2_ATTRS[role]
     try:
         return butler.get(f"{DATASET_TYPE}.{name}", dataId=ref.dataId)
     except Exception as exc:
-        log.debug("component %s.%s unavailable: %r", DATASET_TYPE, name, exc)
-        return None
+        raise RuntimeError(
+            f"{DATASET_TYPE}.{name} (role {role!r}) is not served by this repo: "
+            f"{exc!r}. Fix DP2_ATTRS[{role!r}] in rubin/extract.py -- note that "
+            f"CellCoadd.grid and .bounds are properties reading through to "
+            f"psf.bounds, not components."
+        ) from None
 
 
 def _attr(obj, role: str):
@@ -224,31 +231,13 @@ def _attr(obj, role: str):
 
 
 def _data_id_dict(data_id) -> dict[str, object]:
-    """A ``DataCoordinate`` as a plain dict, across daf_butler versions.
+    """A ``DataCoordinate`` as a plain dict.
 
-    ``DataCoordinate`` stopped being a ``Mapping`` in daf_butler v27, so
-    ``dict(data_id)`` no longer takes the mapping path: it falls through to
-    *sequence* iteration, asks for ``data_id[0]``, and dies with ``KeyError: 0``
-    -- an error that names neither the object nor the problem.  ``.mapping``
-    (every dimension) and ``.required`` (the required ones) are the
-    replacements; the old path stays for older stacks.
+    Through ``.mapping``, not ``dict()``: ``DataCoordinate`` stopped being a
+    ``Mapping`` in daf_butler v27, so ``dict()`` falls through to sequence
+    iteration, asks for ``data_id[0]``, and dies with ``KeyError: 0``.
     """
-    for attr in ("mapping", "required"):
-        view = getattr(data_id, attr, None)
-        if view is not None:
-            try:
-                return {str(k): v for k, v in dict(view).items()}
-            except (TypeError, ValueError, KeyError):
-                pass
-    try:
-        return {str(k): v for k, v in dict(data_id).items()}
-    except (TypeError, ValueError, KeyError):
-        # Worth keeping the provenance even unparsed.  The caller reads only
-        # band/tract/patch out of this and has defaults for all three.
-        return {"repr": str(data_id)}
-
-
-# -- repo ------------------------------------------------------------------
+    return {str(k): v for k, v in data_id.mapping.items()}
 
 
 def open_butler(repo: str = REPO, collection: str = COLLECTION):
@@ -391,10 +380,6 @@ def host_adql(
 #: it means the endpoint below does not have to be hard-coded forever.
 RSP_DISCOVERY_URL = "https://data.lsst.cloud/repertoire/discovery"
 
-#: What discovery returned for DP2 when this was written.  Used only if
-#: discovery cannot be reached.
-TAP_URL_FALLBACK = "https://data.lsst.cloud/api/tap"
-
 #: Where a Gafaelfawr token is looked for, in order.  Same precedence as
 #: ``lsst.rsp`` uses, so a notebook and a login node behave the same.  Never a
 #: command-line argument: that would put the token in shell history and in every
@@ -470,37 +455,23 @@ def rsp_token(token: str | None = None) -> str:
 def token_info(token: str, base_url: str = "https://data.lsst.cloud") -> dict:
     """What Gafaelfawr says about a token: username, scopes, expiry.
 
-    Returns ``{}`` if the question could not be asked -- no network, endpoint
-    moved -- because failing to *check* a token is not the same as the token
-    being bad, and should not stop a run that might have worked.
     """
     url = base_url.rstrip("/") + "/auth/api/v1/token-info"
-    try:
-        response = requests.get(url, headers={"Authorization": f"Bearer {token}"},
-                                timeout=15)
-    except Exception as exc:
-        log.debug("could not reach %s: %r", url, exc)
-        return {}
+    response = requests.get(url, headers={"Authorization": f"Bearer {token}"},
+                            timeout=15)
     if response.status_code in (401, 403):
         raise RuntimeError(
             f"Gafaelfawr rejected the token ({response.status_code}). It is "
             f"expired, revoked, or not an RSP token at all. Make a new one at "
             f"{base_url} under Security tokens with the {TAP_SCOPE!r} scope."
         )
-    if not response.ok:
-        log.debug("%s returned %d", url, response.status_code)
-        return {}
-    try:
-        return response.json()
-    except Exception:
-        return {}
+    response.raise_for_status()
+    return response.json()
 
 
 def check_tap_scope(token: str, base_url: str = "https://data.lsst.cloud") -> None:
     """Fail now, with the reason, rather than as a 401 inside a TAP job."""
     info = token_info(token, base_url)
-    if not info:
-        return
     scopes = list(info.get("scopes") or [])
     who = info.get("username", "?")
     if TAP_SCOPE not in scopes:
@@ -515,19 +486,15 @@ def check_tap_scope(token: str, base_url: str = "https://data.lsst.cloud") -> No
 def discover_tap_url(release: str = "dp2",
                      discovery_url: str = RSP_DISCOVERY_URL) -> str:
     """The TAP endpoint for a release, from the RSP's own discovery document."""
-    try:
-        response = requests.get(discovery_url, timeout=15)
-        response.raise_for_status()
-        url = (response.json().get("datasets", {}).get(release, {})
-               .get("services", {}).get("tap", {}).get("url"))
-    except Exception as exc:
-        log.warning("RSP discovery at %s failed (%r); falling back to %s",
-                    discovery_url, exc, TAP_URL_FALLBACK)
-        return TAP_URL_FALLBACK
+    response = requests.get(discovery_url, timeout=15)
+    response.raise_for_status()
+    datasets = response.json().get("datasets", {})
+    url = datasets.get(release, {}).get("services", {}).get("tap", {}).get("url")
     if not url:
-        log.warning("RSP discovery lists no TAP service for %r; falling back to %s",
-                    release, TAP_URL_FALLBACK)
-        return TAP_URL_FALLBACK
+        raise RuntimeError(
+            f"{discovery_url} lists no TAP service for {release!r}; it offers "
+            f"{sorted(datasets)}"
+        )
     return url
 
 
@@ -1205,14 +1172,11 @@ def cell_visit_counts(source) -> dict[tuple[int, int], int]:
                  or getattr(contributions, "columns", []))
     cell_cols = next((c for c in CONTRIB_CELL_COLUMNS if set(c) <= set(names)), None)
     if cell_cols is None or "visit" not in names:
-        log.warning(
-            "provenance.contributions has columns %s; expected a visit column and "
-            "one of %s. Per-cell depth is unavailable and only the measured "
-            "variance step will catch depth boundaries. Add the real spelling to "
-            "CONTRIB_CELL_COLUMNS in rubin/extract.py.",
-            names, [list(c) for c in CONTRIB_CELL_COLUMNS],
+        raise RuntimeError(
+            f"provenance.contributions has columns {names}; expected a visit "
+            f"column and one of {[list(c) for c in CONTRIB_CELL_COLUMNS]}. Add "
+            f"the real spelling to CONTRIB_CELL_COLUMNS in rubin/extract.py."
         )
-        return {}
 
     # One row per (visit, detector, cell), so a visit crossing a detector
     # boundary inside a cell appears twice; count distinct visits, not rows.
@@ -1271,6 +1235,10 @@ def next_batch(batch: int | None, n_hosts: int, gained: int, shortfall: int,
         return max((batch or floor) * blind_growth, floor)
     per_host = gained / n_hosts
     return max(int(np.ceil(max(shortfall, 0) / per_host * headroom)), floor)
+
+
+class _Done(Exception):
+    """Raised to leave the sweep the moment the target is reached."""
 
 
 def extract_patches(
@@ -1359,10 +1327,6 @@ def extract_patches(
     # the same band -- duplicates that a training set would silently weight up.
     seen: set[tuple[int, str]] = set()
     tried: set[int] = set()
-    component_reads_failed = False
-    bbox_reads_failed = False
-    whole_patch_reason: str | None = None
-    depth_logged = False
     depth_checked = False
     depth_usable = True
     n_empty_patches = 0
@@ -1370,46 +1334,29 @@ def extract_patches(
 
     n_refs = 0
     neighbour_columns = host_columns(bands)
-    # Whether per-cell depth is worth a whole-patch read if provenance is not
-    # served as a component.  ``min_visits`` is asked for explicitly, so it is;
-    # the ratio gate has a measured equivalent in ``variance_step``, so it is
-    # not, and the run says which it fell back to.
-    depth_required = gate_kwargs.get("min_visits") is not None
-    provenance_missing = False
+    depth_logged = False
 
-    def _provenance_for(ref, coadd, load_whole):
-        """``load_whole`` is passed in: the patch loader is per-ref, and closing
-        over a name defined inside the loop would only work by accident."""
-        nonlocal provenance_missing
-        if coadd is not None:
-            return coadd
-        prov = read_component(butler, ref, "provenance")
-        if prov is not None:
-            return prov
-        if depth_required:
-            return load_whole("provenance")
-        if not provenance_missing:
-            provenance_missing = True
-            log.warning(
-                "provenance is not served as a component, so per-cell visit "
-                "counts are unavailable; depth boundaries will be caught by the "
-                "measured variance_step instead. Pass --min-visits to load whole "
-                "patches and get the exact counts, at ~100x the pixel I/O."
-            )
-        return None
+    def depth_logged_once() -> bool:
+        """True after the first time the per-cell depth line has been printed."""
+        nonlocal depth_logged
+        was, depth_logged = depth_logged, True
+        return was
 
     def _sweep(hosts, host_id, tgt_ra, tgt_dec, r_jit):
         """One pass for one batch of hosts, tract by tract.
 
         Tract-major, not patch-major: the object table is per tract, so the
-        neighbour index can be built once per tract and thrown away, which is
-        what makes a footprint-wide host list affordable.  Within a tract only
-        the patches that actually hold a host are asked for.
+        neighbour index is built once per tract and thrown away, which is what
+        makes a footprint-wide host list affordable.  Within a tract only the
+        patches that actually hold a host are asked for.
+
+        Nothing here falls back.  Every read either answers or ends the run,
+        because the alternatives -- a whole-patch read standing in for a
+        component, a mask plane quietly absent -- are indistinguishable from
+        working until you look at the clock or the training set.
         """
-        nonlocal writer, mask_mapping, n_accepted, component_reads_failed
-        nonlocal bbox_reads_failed, n_empty_patches, n_matched_patches
-        nonlocal whole_patch_reason, provenance_missing
-        nonlocal depth_logged, depth_checked, depth_usable, n_refs
+        nonlocal writer, mask_mapping, n_accepted, n_refs
+        nonlocal depth_checked, depth_usable, n_empty_patches, n_matched_patches
 
         by_patch: dict[tuple[int, int], list[int]] = {}
         for h, (t, pa) in enumerate(zip(np.asarray(hosts["tract"], dtype=int),
@@ -1426,89 +1373,44 @@ def extract_patches(
             rng.shuffle(refs)
             n_refs += len(refs)
             neighbours = _neighbour_index(butler, tract, neighbour_columns, bands)
+
             for ref in refs:
-                data_id = ref.dataId
-                fields = _data_id_dict(data_id)
-                band_name = str(fields.get("band", "?"))
+                fields = _data_id_dict(ref.dataId)
+                band_name = str(fields["band"])
                 base = {
                     "dataId": json.dumps({k: str(v) for k, v in fields.items()}),
                     "band": band_name,
-                    "tract": int(fields.get("tract", -1)),
-                    "patch": int(fields.get("patch", -1)),
+                    "tract": int(fields["tract"]),
+                    "patch": int(fields["patch"]),
                 }
 
-                # Components move no pixels, so a patch is characterised without
-                # being read: WCS, bounding box, PSF, cell grid and provenance all
-                # come this way, and the pixels then come from a bbox read of just
-                # the stamp.  A patch is ~4100 px square and a stamp is 416, so
-                # that is two orders of magnitude less I/O -- and with hosts this
-                # thinly spread there is rarely a second stamp in a patch to
-                # amortise a whole read against.  If the repo refuses components,
-                # fall back to reading patches whole.
-                coadd = None
-
-                def _whole_patch(why: str = "?"):
-                    nonlocal coadd, whole_patch_reason
-                    if coadd is None:
-                        if whole_patch_reason is None:
-                            whole_patch_reason = why
-                            log.warning(
-                                "reading whole patches because the %r component "
-                                "is not served; that is ~100x the pixel I/O of a "
-                                "bbox read", why,
-                            )
-                        coadd = butler.get(ref)
-                    return coadd
-
-                wcs = read_component(butler, ref, "wcs")
-                if wcs is None:
-                    if not component_reads_failed:
-                        log.warning(
-                            "component read of %s.sky_projection failed; loading "
-                            "whole patches instead, which is slower but equivalent",
-                            DATASET_TYPE,
-                        )
-                        component_reads_failed = True
-                    try:
-                        wcs = _attr(_whole_patch("sky_projection"), "wcs")
-                    except Exception as exc2:
-                        records.append({**base, "status": "rejected",
-                                        "reasons": f"read_failed:{exc2!r}"[:120]})
-                        continue
-
-                # Only the hosts the catalogue assigned to this patch.  Testing
-                # every host against every patch is quadratic and unaffordable once
-                # the host list spans the footprint rather than one field.
                 candidates = [
                     h for h in by_patch.get((tract, base["patch"]), [])
                     if (int(host_id[h]), band_name) not in seen
                 ]
                 if not candidates:
                     continue
-                xs, ys = _sky_to_pixel(wcs, tgt_ra[candidates], tgt_dec[candidates])
 
-                bbox = (_attr(coadd, "bbox") if coadd is not None
-                        else read_component(butler, ref, "bbox"))
-                if bbox is None:
-                    bbox = _attr(_whole_patch("bbox"), "bbox")
-
-                # A patch at the edge of coverage has cells that were never
-                # built: its image bbox is the full patch while its cell grid
-                # covers only part of it, and slicing outside that raises rather
-                # than returning empty pixels.  ``bounds`` is the populated
-                # region and excludes individually missing cells too, so it is
-                # the right predicate.  Fall back to the image bbox if the
-                # component is not served -- but never load the whole patch just
-                # to ask, since that is the I/O this avoids.
-                bounds = getattr(
-                    _attr(coadd, "psf") if coadd is not None
-                    else read_component(butler, ref, "psf"),
-                    "bounds", None,
+                # Components only: no pixels move until a host is known to land
+                # inside the cells.  `bounds` and the cell grid come off the PSF,
+                # which is where CellCoadd reads them from too.
+                wcs = read_component(butler, ref, "wcs")
+                bounds = read_component(butler, ref, "psf").bounds
+                visit_counts = cell_visit_counts(
+                    read_component(butler, ref, "provenance")
                 )
-                region = bounds if bounds is not None else bbox
+                if visit_counts and not depth_logged_once():
+                    log.info("per-cell visit counts: %d cells, %d-%d visits",
+                             len(visit_counts), min(visit_counts.values()),
+                             max(visit_counts.values()))
+
+                xs, ys = _sky_to_pixel(wcs, tgt_ra[candidates], tgt_dec[candidates])
+                # The cell grid, not the image bbox: a patch at the edge of
+                # coverage has cells that were never built, and slicing outside
+                # them raises rather than returning empty pixels.
                 inside = [
                     (h, x, y) for h, x, y in zip(candidates, xs, ys)
-                    if _fits_in_patch(region, x, y, native_size)
+                    if _fits_in_patch(bounds, x, y, native_size)
                 ]
                 if not inside:
                     n_empty_patches += 1
@@ -1517,44 +1419,13 @@ def extract_patches(
                         log.warning(
                             "%d patches so far have held none of the hosts the "
                             "catalogue assigned to them (this one: %d of %d "
-                            "positions even projected; patch x spans %s, hosts "
-                            "project to x in [%.1f, %.1f]). If that continues, "
-                            "the Object table's `patch` column and the deep_coadd "
-                            "dataId `patch` are not the same numbering and every "
-                            "host is being matched to the wrong patch.",
+                            "positions even projected). If that continues, the "
+                            "Object table's `patch` column and the deep_coadd "
+                            "dataId `patch` are not the same numbering.",
                             n_empty_patches, n_projected, len(xs),
-                            (bbox.x.start, bbox.x.stop),
-                            float(np.nanmin(xs)) if n_projected else float("nan"),
-                            float(np.nanmax(xs)) if n_projected else float("nan"),
                         )
                     continue
                 n_matched_patches += 1
-                try:
-                    psf_model = (_attr(coadd, "psf") if coadd is not None
-                                 else read_component(butler, ref, "psf"))
-                    if psf_model is None:
-                        psf_model = _attr(_whole_patch("psf"), "psf")
-                    # The cell grid is not a dataset component -- CellCoadd.grid
-                    # and .bounds are properties reading through to the PSF's own
-                    # bounds -- so asking the butler for them forces a whole-patch
-                    # read for something the psf component already carries.
-                    # cells_in_stamp takes either, since CellGridBounds has .grid.
-                    grid_src = getattr(psf_model, "bounds", None)
-                    if grid_src is None:
-                        grid_src = _whole_patch("grid")
-                    prov = _provenance_for(ref, coadd, _whole_patch)
-                except Exception as exc:
-                    records.append({**base, "status": "rejected",
-                                    "reasons": f"read_failed:{exc!r}"[:120]})
-                    continue
-                # Once per patch: which visits went into which cell.  This is the
-                # depth step stated exactly, rather than inferred from the noise.
-                visit_counts = cell_visit_counts(prov)
-                if visit_counts and not depth_logged:
-                    log.info("per-cell visit counts available: %d cells, %d-%d visits",
-                             len(visit_counts), min(visit_counts.values()),
-                             max(visit_counts.values()))
-                    depth_logged = True
                 log.debug("patch %s band %s: %d hosts", base["patch"], band_name,
                           len(inside))
 
@@ -1567,74 +1438,25 @@ def extract_patches(
                     sep = _verify_centre(wcs, x, y, float(tgt_ra[h]), float(tgt_dec[h]))
                     rec["centre_sep_arcsec"] = sep
                     if not np.isfinite(sep) or sep > CENTRE_TOLERANCE_ARCSEC:
-                        rec.update(status="rejected", reasons=f"centre_mismatch:{sep:.2f}")
-                        records.append(rec)
-                        continue
-
-                    # One read of just these pixels.  Falling back to slicing a
-                    # whole patch, `coadd[box]` is a VIEW, so it must be copied or
-                    # the parent stays pinned in memory and the stamp saves
-                    # nothing.
-                    box = _stamp_box(x, y, native_size)
-                    try:
-                        if coadd is not None or bbox_reads_failed:
-                            stamp = _whole_patch("pixels")[box].copy()
-                        else:
-                            try:
-                                stamp = butler.get(ref, parameters={"bbox": box})
-                                # A subset that had dropped a plane would surface
-                                # later as a confusing AttributeError, hours in.
-                                missing = [r for r in ("image", "variance", "mask")
-                                           if not hasattr(stamp, DP2_ATTRS[r])]
-                                if missing:
-                                    raise AttributeError(
-                                        f"bbox read returned no {missing}"
-                                    )
-                            except Exception as exc:
-                                if not bbox_reads_failed:
-                                    log.warning(
-                                        "bbox read failed (%r); reading whole "
-                                        "patches instead, ~100x the I/O", exc,
-                                    )
-                                    bbox_reads_failed = True
-                                stamp = _whole_patch("pixels")[box].copy()
-                    except Exception as exc:
-                        # Whatever is wrong with this one stamp, it is one
-                        # stamp.  Record it and keep the run.
                         rec.update(status="rejected",
-                                   reasons=f"cut_failed:{exc!r}"[:160])
-                        records.append(rec)
-                        continue
-                    image = np.asarray(_attr(stamp, "image").array, dtype=np.float32)
-                    if image.shape != (native_size, native_size):
-                        rec.update(status="rejected", reasons=f"clipped:{image.shape}")
-                        records.append(rec)
-                        continue
-                    variance = np.asarray(_attr(stamp, "variance").array, dtype=np.float32)
-                    packed, mapping = pack_mask(_attr(stamp, "mask"))
-                    if mask_mapping is None:
-                        mask_mapping = mapping
-                    elif mapping != mask_mapping:
-                        rec.update(status="rejected", reasons="mask_schema_changed")
+                                   reasons=f"centre_mismatch:{sep:.2f}")
                         records.append(rec)
                         continue
 
-                    cells = cells_in_stamp(grid_src, x, y, native_size)
+                    cells = cells_in_stamp(bounds, x, y, native_size)
                     if visit_counts and cells and not depth_checked:
-                        # The grid's (i, j) and the provenance table's cell columns
-                        # are two independent conventions, and nothing guarantees
-                        # they agree on which one is x.  If they are transposed every
-                        # lookup misses, every stamp reads as zero-visit, and the run
-                        # rejects everything for the most confusing possible reason.
+                        # The grid's (i, j) and the provenance table's cell
+                        # columns are two independent conventions and nothing
+                        # guarantees they agree on which one is x.  Transposed,
+                        # every lookup misses and every stamp reads as
+                        # zero-visit.
                         depth_checked = True
                         depth_usable = any(c in visit_counts for c in cells)
                         if not depth_usable:
                             log.warning(
                                 "none of the cells a stamp covers %s appear in "
-                                "provenance.contributions (which has e.g. %s): the "
-                                "cell index conventions do not match, so per-cell "
-                                "depth is ignored for this run and only the measured "
-                                "variance step will catch depth boundaries",
+                                "provenance.contributions (which has e.g. %s); "
+                                "per-cell depth ignored for this run",
                                 cells[:4], sorted(visit_counts)[:4],
                             )
                     absent = missing_cells(bounds, cells)
@@ -1643,20 +1465,43 @@ def extract_patches(
                                    reasons=f"missing_cells:{len(absent)}")
                         records.append(rec)
                         continue
-                    n_lo, n_hi = stamp_depth(visit_counts if depth_usable else {}, cells)
+
+                    # One read, of just these pixels.
+                    stamp = butler.get(ref, parameters={"bbox":
+                                                        _stamp_box(x, y, native_size)})
+                    image = np.asarray(_attr(stamp, "image").array, dtype=np.float32)
+                    if image.shape != (native_size, native_size):
+                        rec.update(status="rejected", reasons=f"clipped:{image.shape}")
+                        records.append(rec)
+                        continue
+
+                    # Variance and mask are read, used, and dropped: they are
+                    # what the gate is made of, and the prior never sees them.
+                    variance = np.asarray(_attr(stamp, "variance").array,
+                                          dtype=np.float32)
+                    packed, mapping = pack_mask(_attr(stamp, "mask"))
+                    if mask_mapping is None:
+                        mask_mapping = mapping
+                    elif mapping != mask_mapping:
+                        raise RuntimeError(
+                            f"mask schema changed mid-run: {mapping} after "
+                            f"{mask_mapping}. The packing is per-shard, so a "
+                            f"changing schema would make the gate's plane names "
+                            f"mean different bits in different stamps."
+                        )
+
+                    n_lo, n_hi = stamp_depth(
+                        visit_counts if depth_usable else {}, cells)
                     if n_lo > 0:
                         depth_ratio = n_hi / n_lo
                     elif n_lo == 0:
                         depth_ratio = np.inf  # a cell with no visits at all
                     else:
-                        depth_ratio = None  # provenance unavailable
+                        depth_ratio = None  # provenance carried no such cell
                     reasons, diag = gate(image, variance, packed, mask_mapping,
                                          cell_depth_ratio=depth_ratio,
                                          n_visits=n_lo, **gate_kwargs)
                     rec.update({f"diag_{k}": v for k, v in diag.items()})
-                    psf = psf_bundle(psf_model, x, y)
-                    if psf is None:
-                        reasons = list(reasons) + ["psf_unavailable"]
                     if reasons:
                         rec.update(status="rejected", reasons=";".join(reasons))
                         records.append(rec)
@@ -1666,30 +1511,25 @@ def extract_patches(
                         writer = ShardWriter(
                             out_dir / "shards",
                             native_size=native_size,
-                            psf_size=psf["psf"].shape[0],
-                            mask_plane_dict=mask_mapping,
                             prefix=prefix,
                             patches_per_shard=patches_per_shard,
                             dataset_type=DATASET_TYPE,
                             attrs={
                                 "release": "DP2",
                                 "skymap": SKYMAP,
-                                "field_ra": ra,
-                                "field_dec": dec,
                                 "bands": json.dumps(list(bands)),
                                 "jitter_arcsec": jitter_arcsec,
                                 "flux_units": "nJy",
                                 "correlated_noise": 1,  # coadds are warped
                                 "pixel_origin": PIXEL_ORIGIN,
-                                # DP2 coadds get a final background subtraction that
-                                # over-subtracts around extended galaxies, and it can
-                                # be restored with apply_background('pretty').  These
-                                # are as delivered.
+                                # DP2 coadds get a final background subtraction
+                                # that over-subtracts around extended galaxies.
+                                # These are as delivered.
                                 "background_restored": 0,
                             },
                         )
 
-                    nb = [] if neighbours is None else neighbours.near(
+                    nb = neighbours.near(
                         float(tgt_ra[h]), float(tgt_dec[h]), neighbour_radius_arcsec,
                         band_name, host_id=int(host_id[h]),
                     )
@@ -1698,50 +1538,39 @@ def extract_patches(
                     star = [n["sep_arcsec"] for n in others if n["extendedness"] <= 0.5]
                     y0, x0 = _origin(stamp)
                     acf.add(image)
-                    writer.add(
-                        image, variance, packed, psf["psf"],
-                        meta={
-                            "band_idx": BANDS.index(band_name) if band_name in BANDS else 255,
-                            "x0": x0,
-                            "y0": y0,
-                            "center_x": x,
-                            "center_y": y,
-                            "ra": float(tgt_ra[h]),
-                            "dec": float(tgt_dec[h]),
-                            "psf_sigma": psf["psf_sigma"],
-                            "psf_fwhm": psf["psf_fwhm"],
-                            "psf_ixx": psf["psf_ixx"],
-                            "psf_iyy": psf["psf_iyy"],
-                            "psf_ixy": psf["psf_ixy"],
-                            "pixel_scale": _pixel_scale(wcs, x, y),
-                            "sky_noise": diag.get("sky_noise", np.nan),
-                            "host_id": int(host_id[h]),
-                            "host_offset_arcsec": float(r_jit[h]),
-                            "tract": base["tract"],
-                            "patch": base["patch"],
-                            "n_cells_spanned": len(cells) if cells else -1,
-                            "n_visits_min": n_lo,
-                            "n_visits_max": n_hi,
-                            "n_neighbours": len(others),
-                            "neighbour_flux_max": float(
-                                max([n["flux"] for n in others], default=np.nan)
-                            ),
-                            "nearest_galaxy_arcsec": float(min(gal, default=np.nan)),
-                            "nearest_star_arcsec": float(min(star, default=np.nan)),
-                            "frac_no_data": diag.get("frac_no_data", np.nan),
-                            "variance_step": diag.get("variance_step", np.nan),
-                            "cell_depth_ratio": diag.get("cell_depth_ratio", np.nan),
-                            "frac_inexact_psf": diag.get("frac_INEXACT_PSF", np.nan),
-                            "frac_rejected": diag.get("frac_REJECTED", np.nan),
-                        },
-                    )
+                    writer.add(image, meta={
+                        "band_idx": BANDS.index(band_name),
+                        "x0": x0,
+                        "y0": y0,
+                        "ra": float(tgt_ra[h]),
+                        "dec": float(tgt_dec[h]),
+                        "pixel_scale": _pixel_scale(wcs, x, y),
+                        "sky_noise": diag["sky_noise"],
+                        "host_id": int(host_id[h]),
+                        "host_offset_arcsec": float(r_jit[h]),
+                        "tract": base["tract"],
+                        "patch": base["patch"],
+                        "n_cells_spanned": len(cells),
+                        "n_visits_min": n_lo,
+                        "n_visits_max": n_hi,
+                        "cell_depth_ratio": diag.get("cell_depth_ratio", np.nan),
+                        "variance_step": diag["variance_step"],
+                        "frac_no_data": diag["frac_no_data"],
+                        "frac_inexact_psf": diag["frac_INEXACT_PSF"],
+                        "frac_rejected": diag["frac_REJECTED"],
+                        "n_neighbours": len(others),
+                        "neighbour_flux_max": float(
+                            max([n["flux"] for n in others], default=np.nan)
+                        ),
+                        "nearest_galaxy_arcsec": float(min(gal, default=np.nan)),
+                        "nearest_star_arcsec": float(min(star, default=np.nan)),
+                    })
                     for n in others:
                         neighbour_rows.append({"patch_index": n_accepted, **n})
                     rec.update(status="accepted", patch_index=n_accepted)
                     records.append(rec)
                     seen.add((int(host_id[h]), band_name))
                     n_accepted += 1
-                coadd = None
 
     host_tables = []
     batch = n_hosts
@@ -1851,19 +1680,12 @@ def _within_radius(table, ra: float, dec: float, radius_deg: float):
 
 
 def _stack_tables(tables):
-    """Concatenate the per-round host tables, or return the one there is."""
-    if not tables:
-        return None
+    """Concatenate the per-round host tables."""
     if len(tables) == 1:
         return tables[0]
-    try:
-        from astropy.table import vstack
+    from astropy.table import vstack
 
-        return vstack(tables, join_type="exact")
-    except Exception as exc:  # pragma: no cover - astropy is present in the stack
-        log.warning("could not stack %d host tables (%s); recording the first",
-                    len(tables), exc)
-        return tables[0]
+    return vstack(tables, join_type="exact")
 
 
 def _origin(stamp) -> tuple[int, int]:
@@ -1894,86 +1716,9 @@ def _pixel_scale(wcs, x: float, y: float) -> float:
         return float("nan")
 
 
-def psf_bundle(psf, x: float, y: float) -> dict | None:
-    """Coadd PSF kernel and its moments at tract pixel ``(x, y)``.
-
-    ``compute_kernel_image`` is the convolution kernel a forward model wants
-    (``compute_stellar_image`` is the one to compare against an observed star).
-
-    **The DP2 PSF object carries no shape or moment methods at all** -- unlike
-    DP1's ``afw`` PSF, ``CellPointSpreadFunction`` offers no ``computeShape``.
-    The moments are therefore measured from the kernel here.  The tutorial uses
-    GalSim HSM; this uses adaptive moments computed directly, to avoid a
-    dependency for one number and to give the same answer on any release.
-    """
-    try:
-        kernel = np.asarray(psf.compute_kernel_image(x=float(x), y=float(y)).array,
-                            dtype=np.float32)
-    except Exception as exc:
-        log.debug("PSF kernel unavailable at (%.1f, %.1f): %s", x, y, exc)
-        return None
-    if not np.all(np.isfinite(kernel)) or kernel.sum() <= 0:
-        return None
-    return {"psf": kernel, **_adaptive_moments(kernel)}
-
-
-#: FWHM / sigma for a Gaussian.
-SIGMA_TO_FWHM = 2.0 * np.sqrt(2.0 * np.log(2.0))
-
-
-def _adaptive_moments(image: np.ndarray, max_iter: int = 40,
-                      tol: float = 1e-8) -> dict:
-    """Gaussian-weighted second moments, iterated to self-consistency.
-
-    Unweighted moments of a PSF kernel are dominated by its wings and by
-    whatever noise is out there, and can diverge outright.  Weighting by a
-    Gaussian matched to the profile and iterating fixes that: for a Gaussian
-    image of covariance ``M`` weighted by ``W``, the weighted covariance is
-    ``(M^-1 + W^-1)^-1``, so at the fixed point ``W = M`` the measurement reads
-    ``M/2`` and the update is simply twice the weighted moments.
-    """
-    a = np.maximum(np.asarray(image, dtype=np.float64), 0.0)
-    total = a.sum()
-    if not np.isfinite(total) or total <= 0:
-        return {"psf_sigma": np.nan, "psf_fwhm": np.nan, "psf_ixx": np.nan,
-                "psf_iyy": np.nan, "psf_ixy": np.nan}
-    yy, xx = np.mgrid[0 : a.shape[0], 0 : a.shape[1]].astype(np.float64)
-    cy, cx = (a * yy).sum() / total, (a * xx).sum() / total
-    ixx = iyy = max(float(a.shape[0]) / 6.0, 1.0) ** 2
-    ixy = 0.0
-    for _ in range(max_iter):
-        det = ixx * iyy - ixy**2
-        if not np.isfinite(det) or det <= 0:
-            break
-        dx, dy = xx - cx, yy - cy
-        chi2 = (iyy * dx**2 - 2 * ixy * dx * dy + ixx * dy**2) / det
-        w = a * np.exp(-0.5 * np.clip(chi2, 0, 200))
-        wsum = w.sum()
-        if wsum <= 0:
-            break
-        cx_new = (w * xx).sum() / wsum
-        cy_new = (w * yy).sum() / wsum
-        dxn, dyn = xx - cx_new, yy - cy_new
-        nxx = 2.0 * (w * dxn**2).sum() / wsum
-        nyy = 2.0 * (w * dyn**2).sum() / wsum
-        nxy = 2.0 * (w * dxn * dyn).sum() / wsum
-        shift = max(abs(nxx - ixx), abs(nyy - iyy), abs(nxy - ixy))
-        cx, cy, ixx, iyy, ixy = cx_new, cy_new, nxx, nyy, nxy
-        if shift < tol:
-            break
-    det = max(ixx * iyy - ixy**2, 0.0)
-    sigma = float(det**0.25)
-    return {"psf_sigma": sigma, "psf_fwhm": sigma * SIGMA_TO_FWHM,
-            "psf_ixx": float(ixx), "psf_iyy": float(iyy), "psf_ixy": float(ixy)}
-
-
-class _Done(Exception):
-    """Internal: stop the nested extraction loops at max_patches."""
-
-
 def _neighbour_index(butler, tract: int, columns: Sequence[str],
                      bands: Sequence[str]):
-    """Neighbour index for one tract, or ``None`` if its table will not read.
+    """Neighbour index for one tract.
 
     Neighbours must come from the *whole* tract, not from the host pool: a host
     is interesting precisely because of what sits near it, and almost nothing
@@ -1982,16 +1727,13 @@ def _neighbour_index(butler, tract: int, columns: Sequence[str],
     """
     refs = object_refs_for_tract(butler, tract)
     if not refs:
-        log.warning("no object table for tract %d; neighbour covariates will be "
-                    "missing for its stamps", tract)
-        return None
-    try:
-        table = butler.get(refs[0], parameters={"columns": list(columns)})
-    except Exception as exc:
-        log.warning("object table for tract %d unreadable (%r); neighbour "
-                    "covariates will be missing", tract, exc)
-        return None
-    return _NeighbourIndex(table, bands)
+        raise RuntimeError(
+            f"no object table for tract {tract}, yet hosts were selected from "
+            f"it: the host catalogue and the repo disagree about what exists"
+        )
+    return _NeighbourIndex(
+        butler.get(refs[0], parameters={"columns": list(columns)}), bands
+    )
 
 
 class _NeighbourIndex:
@@ -2043,35 +1785,23 @@ class _NeighbourIndex:
         ]
 
 
-def _write_table(stem: Path, table) -> None:
-    """Persist the selected host catalogue next to the shards.
+def _write_table(stem, table) -> None:
+    """Persist a table as parquet.
 
-    Size, magnitude, ellipticity and blendedness are known only at selection
-    time and are not carried in the shard metadata, so without this the host
-    population cannot be inspected after the fact.
+    Size, magnitude and blendedness are known only at selection time and are not
+    carried in the shard metadata, so without this the host population cannot be
+    inspected after the fact.
     """
-    try:
-        df = table.to_pandas() if hasattr(table, "to_pandas") else table
-        df.to_parquet(stem.with_suffix(".parquet"), index=False)
-    except Exception as exc:  # pragma: no cover - depends on the environment
-        log.warning("could not write %s.parquet (%s); trying CSV", stem.name, exc)
-        try:
-            table.write(stem.with_suffix(".csv"), format="ascii.csv", overwrite=True)
-        except Exception as exc2:
-            log.warning("could not write host table at all: %s", exc2)
+    df = table.to_pandas() if hasattr(table, "to_pandas") else table
+    df.to_parquet(Path(stem).with_suffix(".parquet"), index=False)
 
 
-def _read_table(path: Path):
+def _read_table(path):
     """Read back a table written by ``_write_table``."""
     from astropy.table import Table
 
     path = Path(path)
-    for candidate in (path, path.with_suffix(".parquet"), path.with_suffix(".csv")):
-        if candidate.exists() and candidate.is_file():
-            if candidate.suffix == ".csv":
-                return Table.read(candidate, format="ascii.csv")
-            return Table.read(candidate)
-    raise FileNotFoundError(path)
+    return Table.read(path if path.suffix else path.with_suffix(".parquet"))
 
 
 def _write_manifest(

@@ -153,7 +153,6 @@ def write_synthetic_shards(
     out_dir: str | Path,
     n_patches: int = 256,
     native_size: int = 224,
-    psf_size: int = 25,
     patches_per_shard: int = 128,
     sky_noise_by_band: dict[str, float] | None = None,
     noise_correlation: float = 0.8,
@@ -170,8 +169,6 @@ def write_synthetic_shards(
     with ShardWriter(
         out_dir,
         native_size=native_size,
-        psf_size=psf_size,
-        mask_plane_dict=MASK_PLANES,
         prefix="synthetic",
         patches_per_shard=patches_per_shard,
         dataset_type="deep_coadd",
@@ -184,7 +181,7 @@ def write_synthetic_shards(
             band_idx = int(rng.integers(len(BANDS)))
             band = BANDS[band_idx]
             p = synthetic_patch(
-                rng, size=native_size, psf_size=psf_size, sky_noise=noise[band],
+                rng, size=native_size, sky_noise=noise[band],
                 noise_correlation=noise_correlation,
                 no_data_fraction=no_data_fraction,
             )
@@ -196,7 +193,9 @@ def write_synthetic_shards(
                     "r_ixx": float(10 ** rng.uniform(0.8, 2.2)),
                     "r_iyy": float(10 ** rng.uniform(0.8, 2.2)),
                     "r_ixy": float(rng.normal(0, 5)),
-                    "r_cModel_exp_reff_major": float(10 ** rng.uniform(-0.4, 0.5)),
+                    "sersic_reff_major": float(10 ** rng.uniform(0.3, 1.2)),
+                    "sersic_reff_minor": float(10 ** rng.uniform(0.1, 1.0)),
+                    "sersic_index": float(rng.uniform(0.5, 6.0)),
                     "refExtendedness": 1.0,
                     "refBand": "r",
                     "r_cModelFlux": float(10 ** rng.uniform(2.6, 4.6)),
@@ -205,19 +204,12 @@ def write_synthetic_shards(
             )
             w.add(
                 p["image"],
-                p["variance"],
-                p["mask"],
-                p["psf"],
                 meta={
                     "band_idx": band_idx,
                     "x0": 0,
                     "y0": 0,
-                    "center_x": p["center"][0],
-                    "center_y": p["center"][1],
                     "ra": 53.13 + float(rng.normal(0, 0.1)),
                     "dec": -28.10 + float(rng.normal(0, 0.1)),
-                    "psf_sigma": p["psf_sigma"],
-                    "psf_fwhm": p["psf_sigma"] * 2.3548200450309493,
                     "pixel_scale": 0.2003,
                     "sky_noise": noise[band],
                     "host_id": i,
@@ -230,6 +222,10 @@ def write_synthetic_shards(
                     "nearest_star_arcsec": float(rng.uniform(2, 30)),
                     # A 416 px stamp spans ~3x3 of the 150 px coadd cells.
                     "n_cells_spanned": int(max(1, round((native_size / 150) ** 2))),
+                    "n_visits_min": int(rng.integers(8, 32)),
+                    "n_visits_max": int(rng.integers(32, 40)),
+                    "cell_depth_ratio": float(rng.uniform(1.0, 1.4)),
+                    "variance_step": float(rng.uniform(1.0, 1.4)),
                     "frac_no_data": float(no_data_fraction),
                     "frac_inexact_psf": 0.3,
                     "frac_rejected": float(rng.uniform(0, 0.4)),
@@ -242,11 +238,6 @@ def write_synthetic_shards(
 def _write_synthetic_hosts(path: Path, rows: list[dict], rng) -> None:
     """Mirror the ``hosts.parquet`` that extraction writes, so the diagnostic
     plots can be exercised end to end without the cluster."""
-    if not rows:
-        return
-    try:
-        import pandas as pd
+    import pandas as pd
 
-        pd.DataFrame(rows).to_parquet(path, index=False)
-    except Exception:  # pragma: no cover - pandas/pyarrow optional
-        pass
+    pd.DataFrame(rows).to_parquet(path, index=False)

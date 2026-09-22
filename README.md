@@ -758,6 +758,28 @@ everything there. `n_visits_min` is recorded for every stamp and `--min-visits`
 gates on it, off by default: whether a shallow coadd belongs in this prior is a
 judgement about the prior, not about the pixels.
 
+### Only the image is stored
+
+The prior is a distribution over pixels. It never sees a variance plane, a mask
+or a PSF, so carrying them tripled the shards to no purpose. They are still
+*read* during extraction — they are what the quality gate is made of, and a bbox
+read returns them anyway — and then dropped. What survives is a handful of
+scalars per stamp (`sky_noise`, `variance_step`, `frac_no_data`, the visit
+counts), which is what a later cut from the manifest needs.
+
+This is also why the cutout service stays the wrong tool even though it returns
+images only: the pixels are already on local disk, and the planes the gate needs
+come free with the read that fetches them.
+
+### Nothing falls back
+
+A read either answers or ends the run. Every quiet degradation this code had
+turned out to be a bug wearing a disguise: `grid` and `bounds` were assumed to be
+butler components, were not, and silently forced a whole-patch read on every
+stamp at ~100× the I/O for several runs before a warning caught it. A component
+that does not answer, a mask schema that changes mid-run, an object table that is
+missing for a tract hosts were selected from — all now raise, naming what to fix.
+
 ### Storage
 
 Shards hold **native-resolution stamps in physical units** (nJy), plus variance,

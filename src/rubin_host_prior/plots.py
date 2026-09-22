@@ -264,12 +264,8 @@ def plot_hosts(shards, hosts=None, band: str = "r", out: Path | None = None):
             # Prefer the half-light radius, which DP2 gives directly in arcsec
             # and which the size cut is made on; fall back to the moments trace
             # converted with the pixel scale.
-            try:
-                size = host_half_light_arcsec(hosts)
-                label = "Sersic half-light major axis (arcsec)"
-            except KeyError:
-                size = np.sqrt(np.maximum(0.5 * (ixx + iyy), 0)) * scale
-                label = "trace radius (arcsec)"
+            size = host_half_light_arcsec(hosts)
+            label = "Sersic half-light major axis (arcsec)"
             panels.append(("host size", size, 40, label, False))
         fcol = f"{band}_cModelFlux"
         if fcol in cols:
@@ -295,8 +291,6 @@ def plot_hosts(shards, hosts=None, band: str = "r", out: Path | None = None):
         # coadd cell edge, which is what the gate is set against.
         panels.append(("variance step", np.asarray(meta["variance_step"], dtype=float),
                        40, "max/min block variance floor", False))
-    panels.append(("PSF size", np.asarray(meta["psf_sigma"], dtype=float), 40,
-                   "PSF sigma (pixels)", False))
     panels.append(("nearest galaxy", meta["nearest_galaxy_arcsec"], 40,
                    "arcsec", False))
     panels.append(("nearest star", meta["nearest_star_arcsec"], 40, "arcsec", False))
