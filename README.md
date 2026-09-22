@@ -568,8 +568,19 @@ orders of magnitude less I/O — and with a 3″ cut the hosts are thin enough t
 there is rarely a second stamp in a patch to amortise a whole read against.
 
 Everything else about a patch comes from **component reads**, which move no
-pixels either: `sky_projection`, `bbox`, `psf`, `grid` and `provenance`. So a
-patch that turns out to hold no usable host costs no pixel I/O at all.
+pixels either: `sky_projection`, `bbox`, `psf` and `provenance`.
+
+`grid` and `bounds` are *not* among them, which cost a run its whole optimisation
+once: `CellCoadd.grid` and `CellCoadd.bounds` are Python properties reading
+through to `self._psf.bounds`, not stored components, so asking the butler for
+them fails and forces a whole-patch read for something the `psf` component
+already carries. They are taken from the PSF object instead — `psf.bounds` is the
+`CellGridBounds`, and `psf.bounds.grid` the `CellGrid`.
+
+If `provenance` turns out not to be served either, per-cell visit counts go away
+and depth boundaries fall to the measured `variance_step`, with a warning —
+rather than silently paying ~100× the I/O for a covariate. `--min-visits` is the
+exception: it is asked for explicitly, so it loads whole patches to honour it.
 
 Both paths fall back. If components are refused the patch is read whole and its
 attributes used — and the run says **which** component forced that, once, because

@@ -1276,3 +1276,29 @@ def test_the_stamp_corners_are_what_is_tested():
     bounds = _Bounds(0, 3300, 0, 3300)
     assert _fits_in_patch(bounds, 1650.0, 1650.0, 416) is True
     assert _fits_in_patch(bounds, 100.0, 1650.0, 416) is False
+
+
+# -- what is actually a dataset component ----------------------------------
+
+
+def test_the_cell_grid_comes_from_the_psf_not_from_a_component():
+    """CellCoadd.grid and .bounds are properties reading through to the PSF's
+    own bounds, not stored components. Asking the butler for them forces a
+    whole-patch read for something the psf component already carries."""
+    grid = _Grid()
+    bounds = SimpleNamespace(grid=grid, missing=frozenset())
+    psf = SimpleNamespace(bounds=bounds)
+    # cells_in_stamp takes either, since CellGridBounds carries .grid.
+    assert cells_in_stamp(psf.bounds, 225, 225, 416) == cells_in_stamp(grid, 225, 225, 416)
+
+
+def test_bounds_from_the_psf_are_usable_as_the_containment_region():
+    psf = SimpleNamespace(bounds=_Bounds(0, 3300, 0, 3300))
+    assert _fits_in_patch(psf.bounds, 1650.0, 1650.0, 416) is True
+    assert _fits_in_patch(psf.bounds, 10.0, 1650.0, 416) is False
+
+
+def test_no_provenance_means_no_counts_rather_than_an_error():
+    """Without it the measured variance_step still catches depth boundaries."""
+    assert cell_visit_counts(None) == {}
+    assert stamp_depth({}, [(0, 0)]) == (-1, -1)

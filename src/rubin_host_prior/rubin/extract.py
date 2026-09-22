@@ -1370,6 +1370,33 @@ def extract_patches(
 
     n_refs = 0
     neighbour_columns = host_columns(bands)
+    # Whether per-cell depth is worth a whole-patch read if provenance is not
+    # served as a component.  ``min_visits`` is asked for explicitly, so it is;
+    # the ratio gate has a measured equivalent in ``variance_step``, so it is
+    # not, and the run says which it fell back to.
+    depth_required = gate_kwargs.get("min_visits") is not None
+    provenance_missing = False
+
+    def _provenance_for(ref, coadd, load_whole):
+        """``load_whole`` is passed in: the patch loader is per-ref, and closing
+        over a name defined inside the loop would only work by accident."""
+        nonlocal provenance_missing
+        if coadd is not None:
+            return coadd
+        prov = read_component(butler, ref, "provenance")
+        if prov is not None:
+            return prov
+        if depth_required:
+            return load_whole("provenance")
+        if not provenance_missing:
+            provenance_missing = True
+            log.warning(
+                "provenance is not served as a component, so per-cell visit "
+                "counts are unavailable; depth boundaries will be caught by the "
+                "measured variance_step instead. Pass --min-visits to load whole "
+                "patches and get the exact counts, at ~100x the pixel I/O."
+            )
+        return None
 
     def _sweep(hosts, host_id, tgt_ra, tgt_dec, r_jit):
         """One pass for one batch of hosts, tract by tract.
@@ -1381,7 +1408,7 @@ def extract_patches(
         """
         nonlocal writer, mask_mapping, n_accepted, component_reads_failed
         nonlocal bbox_reads_failed, n_empty_patches, n_matched_patches
-        nonlocal whole_patch_reason
+        nonlocal whole_patch_reason, provenance_missing
         nonlocal depth_logged, depth_checked, depth_usable, n_refs
 
         by_patch: dict[tuple[int, int], list[int]] = {}
@@ -1473,8 +1500,11 @@ def extract_patches(
                 # the right predicate.  Fall back to the image bbox if the
                 # component is not served -- but never load the whole patch just
                 # to ask, since that is the I/O this avoids.
-                bounds = (_attr(coadd, "bounds") if coadd is not None
-                          else read_component(butler, ref, "bounds"))
+                bounds = getattr(
+                    _attr(coadd, "psf") if coadd is not None
+                    else read_component(butler, ref, "psf"),
+                    "bounds", None,
+                )
                 region = bounds if bounds is not None else bbox
                 inside = [
                     (h, x, y) for h, x, y in zip(candidates, xs, ys)
@@ -1504,14 +1534,15 @@ def extract_patches(
                                  else read_component(butler, ref, "psf"))
                     if psf_model is None:
                         psf_model = _attr(_whole_patch("psf"), "psf")
-                    grid_src = (coadd if coadd is not None
-                                else read_component(butler, ref, "grid"))
+                    # The cell grid is not a dataset component -- CellCoadd.grid
+                    # and .bounds are properties reading through to the PSF's own
+                    # bounds -- so asking the butler for them forces a whole-patch
+                    # read for something the psf component already carries.
+                    # cells_in_stamp takes either, since CellGridBounds has .grid.
+                    grid_src = getattr(psf_model, "bounds", None)
                     if grid_src is None:
                         grid_src = _whole_patch("grid")
-                    prov = (coadd if coadd is not None
-                            else read_component(butler, ref, "provenance"))
-                    if prov is None:
-                        prov = _whole_patch("provenance")
+                    prov = _provenance_for(ref, coadd, _whole_patch)
                 except Exception as exc:
                     records.append({**base, "status": "rejected",
                                     "reasons": f"read_failed:{exc!r}"[:120]})
