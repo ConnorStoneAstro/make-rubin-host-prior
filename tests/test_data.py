@@ -1,5 +1,7 @@
 """The log transform, pooling, augmentation, shards and loader."""
 
+from pathlib import Path
+
 import numpy as np
 import pytest
 
@@ -27,8 +29,8 @@ from rubin_host_prior.data.synthetic import write_synthetic_shards
 
 # -- transform -------------------------------------------------------------
 #
-#   forward:  x = log(softplus(f / s)) / c
-#   model:    f = s * exp(c * x)                  strictly positive
+#   forward:  x = log(s * softplus(f / s))        -> log(f) for f >> s
+#   model:    f = exp(x)                          strictly positive, no band
 #
 # The two are deliberately not inverses. A source cannot emit negative flux, so
 # the prior's reachable domain in flux space must be positive; measured flux is
@@ -46,28 +48,42 @@ def _transform(softening=None, **kw):
 R = np.array([BANDS.index("r")])
 
 
-def test_the_model_map_is_exactly_the_softened_flux_and_strictly_positive():
-    """``s*exp(c*forward(f)) == softplus_s(f)``: the entire discrepancy between
-    data and model is the softening and nothing else.  And the property the
-    whole design exists for -- a scene drawn from the prior can never contain
-    negative flux, however far negative x wanders."""
-    t = _transform(log_scale=2.0)
+def test_every_map_is_built_from_the_one_softening_definition():
+    """``soften(f) = s*softplus(f/s)`` is the definition; ``forward`` is
+    ``log(soften(f)/s)/c`` and ``inverse`` is exactly ``soften``.
+
+    ``forward`` does not literally call ``soften`` -- it goes through
+    ``log_softplus``, because below ``f/s = -745`` the softened flux underflows
+    to zero in float64 and its log is ``-inf``.  That is a numerical detail, and
+    this is what pins the two forms together so it stays one.
+    """
+    from rubin_host_prior.data.transform import soften
+
+    t = _transform()
     s = t.softening[R[0]]
-    f = np.array([[-40.0, -4.0, 0.0, 4.0, 40.0, 4e5]])
-    u = f / s
-    softened = s * (np.maximum(u, 0.0) + np.log1p(np.exp(-np.abs(u))))
-    assert t.inverse(t.forward(f, R), R) == pytest.approx(softened, rel=1e-10)
+    f = np.array([[-400.0, -40.0, -4.0, 0.0, 4.0, 40.0, 4e5]])
+
+    assert t.forward(f, R) == pytest.approx(np.log(soften(f, s)))
+    assert t.soften(f, R) == pytest.approx(soften(f, s))
+    assert t.inverse(t.forward(f, R)) == pytest.approx(soften(f, s), rel=1e-10)
+
+    # And the reason forward is not written that way.  At f/s = -1000 the
+    # softened flux underflows to zero and the naive composition is -inf;
+    # forward returns the exact limit, f/s + log(s).
+    deep = np.array([[-1000.0 * s]])
+    assert soften(deep, s)[0, 0] == 0.0
+    assert t.forward(deep, R)[0, 0] == pytest.approx(-1000.0 + np.log(s))
 
     # Positive everywhere it can be represented.  exp underflows to exactly
-    # zero below x = -745/c in float64, which is flux 10^-320 nJy -- far outside
+    # zero below x = -745 in float64, which is 1e-324 nJy -- far outside
     # anything a sampler reaches, but it is a floor and it is worth knowing it
     # is there rather than believing the map is positive without qualification.
-    x = np.linspace(-370, 30, 2000)[None]
-    model = t.inverse(x, R)
+    x = np.linspace(-700, 30, 2000)[None]
+    model = t.inverse(x)
     assert np.all(model > 0) and np.all(np.isfinite(model))
     assert np.all(np.diff(model[0]) > 0)  # monotone, so invertible on its image
-    assert model == pytest.approx(s * np.exp(2.0 * x))
-    assert t.inverse(np.array([[-400.0]]), R)[0, 0] == 0.0
+    assert model == pytest.approx(np.exp(x))
+    assert t.inverse(np.array([[-800.0]]))[0, 0] == 0.0
 
 
 def test_large_fluxes_pass_through_and_negative_ones_vanish_smoothly():
@@ -76,10 +92,10 @@ def test_large_fluxes_pass_through_and_negative_ones_vanish_smoothly():
     to put a hard edge in."""
     t = _transform()
     bright = np.array([[1e3, 1e4, 1e5, 1e6]])
-    assert t.inverse(t.forward(bright, R), R) == pytest.approx(bright, rel=1e-3)
+    assert t.inverse(t.forward(bright, R)) == pytest.approx(bright, rel=1e-3)
 
     negative = np.array([[-2e3, -1e3, -50.0, -5.0]])
-    back = t.inverse(t.forward(negative, R), R)
+    back = t.inverse(t.forward(negative, R))
     assert np.all(back > 0) and np.all(back < t.softening[R[0]])
     assert np.all(np.diff(back[0]) > 0)
     # inverse_exact does recover them, which is what makes the loss checkable.
@@ -89,31 +105,61 @@ def test_large_fluxes_pass_through_and_negative_ones_vanish_smoothly():
     assert np.all(np.isfinite(t.forward(np.array([[-1e6, -2e6, 0.0, 1e12]]), R)))
 
 
-def test_the_softening_puts_every_band_on_a_common_footing():
-    """One band-agnostic prior over bands with very different depths: the offset
-    is what makes a u-band sky and a y-band sky land in the same place."""
+def test_the_softening_scale_has_one_source_of_truth():
+    """``softening_sigma`` decides how hard the sky is flattened, and it lived
+    in two places with different values: TransformConfig said 2.0 (suppress the
+    noise) while estimate_band_softening and prepare_config.py's flag both
+    defaulted to the 1.0 of the earlier preserve-the-noise design, which won
+    because the script assigned it unconditionally."""
+    import inspect
+
+    from rubin_host_prior.data.transform import estimate_band_softening
+
+    assert TransformConfig().softening_sigma == 2.0
+    assert (inspect.signature(estimate_band_softening)
+            .parameters["softening_sigma"].default is inspect.Parameter.empty)
+
+    script = (Path(__file__).resolve().parent.parent
+              / "scripts" / "prepare_config.py").read_text()
+    assert '"--softening-sigma", type=float, default=None' in script
+    assert "if args.softening_sigma is not None:" in script
+
+
+def test_x_is_absolute_log_flux_and_the_sky_is_what_moves():
+    """The trade the transform makes.  A given flux maps to the same x in every
+    band -- x is log(f), so the scene's absolute scale survives -- and the price
+    is that each band's sky sits at its own log(s*log2) instead of all of them
+    landing on one level.  Dividing by s inside the log would buy the common
+    sky level back by making x relative, which is the wrong way round for a
+    prior that has to compose with a likelihood in nJy."""
     noise = {"u": 28.0, "g": 11.0, "r": 12.0, "i": 16.0, "z": 24.0, "y": 40.0}
     t = _transform(noise)
+
+    bright = np.array([[4e5]])
+    everywhere = [t.forward(bright, np.array([i]))[0, 0] for i in range(len(BANDS))]
+    assert everywhere == pytest.approx([np.log(4e5)] * len(BANDS))
+
     zeros = np.zeros((1, 1))
-    pedestals = [t.forward(zeros, np.array([i]))[0, 0] for i in range(len(BANDS))]
-    assert pedestals == pytest.approx([pedestals[0]] * len(BANDS))
-    assert pedestals[0] == pytest.approx(np.log(np.log(2.0)))
+    skies = [t.forward(zeros, np.array([i]))[0, 0] for i in range(len(BANDS))]
+    assert skies == pytest.approx(
+        [np.log(noise[b] * np.log(2.0)) for b in BANDS])
+    assert max(skies) - min(skies) == pytest.approx(np.log(40.0 / 11.0))
+    # Same width about each of those levels, which is what keeps one prior over
+    # all six bands sane: one sky shape at several places, not six shapes.
+    for i in range(len(BANDS)):
+        assert t.sky_level(np.array([i]))[0] == pytest.approx(skies[i])
 
 
-def test_the_jacobian_is_c_times_flux():
-    t = _transform(log_scale=1.5)
+def test_the_model_map_needs_no_band_and_its_jacobian_is_the_flux():
+    """``inverse`` is exp(x) -- a forward model turning a scene back into nJy
+    has no per-band offset to undo, which is the point of the whole change."""
+    t = _transform()
     x = np.linspace(-5, 5, 50)[None]
-    assert t.jacobian(x, R) == pytest.approx(1.5 * t.inverse(x, R))
-    step = 1e-5
-    fd = (t.inverse(x + step, R) - t.inverse(x - step, R)) / (2 * step)
-    assert t.jacobian(x, R) == pytest.approx(fd, rel=1e-4)
-
-
-def test_log_scale_rescales_x_and_nothing_else():
-    f = np.array([[-30.0, 0.0, 30.0, 3000.0]])
-    a = _transform(log_scale=1.0).forward(f, R)
-    b = _transform(log_scale=3.0).forward(f, R)
-    assert b == pytest.approx(a / 3.0)
+    assert t.inverse(x) == pytest.approx(np.exp(x))
+    assert t.jacobian(x) == pytest.approx(t.inverse(x))
+    step = 1e-6
+    fd = (t.inverse(x + step) - t.inverse(x - step)) / (2 * step)
+    assert t.jacobian(x) == pytest.approx(fd, rel=1e-4)
 
 
 def test_the_softening_is_always_indexed_by_the_global_band_index():
@@ -678,7 +724,8 @@ def test_small_crops_do_not_wander_off_the_host(shard_dir):
 
 def test_sky_scatter_matches_the_prediction(shard_dir):
     """The check that the per-band softening scales are right: the log-space sky
-    scatter should match 0.721 / (softening_sigma * log_scale)."""
+    scatter should match 0.721 / softening_sigma, in every band.  It is a check
+    on the width; the per-band sky *level* differs by design."""
     from rubin_host_prior.data import expected_sky_scatter
 
     for ss_val in (1.0, 4.0):

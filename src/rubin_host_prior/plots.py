@@ -151,8 +151,10 @@ def plot_transform(dataset, n: int = 4, seed: int = 0, out: Path | None = None):
     """The chain from native flux to the training representation, plus the
     pixel-value histogram that says whether the transform is set up right.
 
-    Sky should pile up at ``x = log(log 2) ~ -0.37`` with a spread near
-    ``expected_sky_scatter``; sources should sit clearly above it.
+    ``x`` is absolute log flux, so the sky sits at ``log(s_band * log 2)`` --
+    one level per band, all with the same width.  Each band present gets a line;
+    the sky should pile up on it with a spread near ``expected_sky_scatter``,
+    and sources should sit clearly above.
     """
     plt = _plt()
     from .data.transform import expected_sky_scatter
@@ -178,7 +180,7 @@ def plot_transform(dataset, n: int = 4, seed: int = 0, out: Path | None = None):
                     True,
                 ),
                 (np.arcsinh(pooled[k] / sigma), "pooled flux (asinh)", "magma", True),
-                (logged[k], "x = log(softplus(f/s))", "viridis", False),
+                (logged[k], "x = log(s\u00b7softplus(f/s))", "viridis", False),
             )
         ):
             ax = fig.add_subplot(gs[k, col])
@@ -198,17 +200,24 @@ def plot_transform(dataset, n: int = 4, seed: int = 0, out: Path | None = None):
         augment=False,
     )[:, 0].ravel()
     ax.hist(allx, bins=200, color="0.3")
-    sky = dataset.transform.sky_level
     ss = dataset.config.transform.softening_sigma
-    ax.axvline(sky, color="crimson", lw=1.2, label=f"zero flux: x = log(log 2) = {sky:.2f}")
-    scatter = expected_sky_scatter(ss, dataset.config.transform.log_scale)
-    ax.axvspan(
-        sky - scatter,
-        sky + scatter,
-        color="crimson",
-        alpha=0.15,
-        label=f"predicted sky scatter $\\pm${scatter:.2f}",
-    )
+    scatter = expected_sky_scatter(ss)
+    # One sky level per band, at log(s_band * log 2).  They differ because x is
+    # absolute log flux and the bands have different depths; the widths do not.
+    present = sorted({int(b) for b in dataset.band_idx})
+    for n, i in enumerate(present):
+        sky = float(dataset.transform.sky_level(np.array([i]))[0])
+        if not np.isfinite(sky):
+            continue
+        ax.axvline(sky, color="crimson", lw=1.2)
+        ax.axvspan(
+            sky - scatter, sky + scatter, color="crimson", alpha=0.15,
+            label=(f"zero flux per band, $\\pm${scatter:.2f} predicted scatter"
+                   if n == 0 else None),
+        )
+        ax.annotate(dataset.transform.bands[i], (sky, 1.0),
+                    xycoords=("data", "axes fraction"), ha="center", va="bottom",
+                    fontsize=7, color="crimson", annotation_clip=False)
     ax.set_yscale("log")
     ax.set_xlabel("x (log space)")
     ax.set_ylabel("pixels")

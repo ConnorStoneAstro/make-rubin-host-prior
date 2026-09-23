@@ -43,7 +43,6 @@ def cache_key(config: Config, transform: LogFluxTransform, shards: ShardSet) -> 
         "patch": asdict(config.patch),
         "transform": {
             "softening": list(transform.softening),
-            "log_scale": transform.log_scale,
             "bands": list(transform.bands),
         },
         "shards": [p.name for p in shards.paths],
@@ -303,7 +302,19 @@ class PatchDataset:
         rng = np.random.default_rng(seed)
         idx = np.sort(rng.choice(len(self), size=min(n, len(self)), replace=False))
         x = self.make_batch(idx, rng=rng, augment=False)[:, 0]
-        p16, p84 = np.percentile(x, [16, 84])
+        # The sky width, measured **within each band** and then taken across
+        # them.  Most pixels in a patch are sky, so the 16-84 half-width is the
+        # sky scatter -- but x is absolute log flux, so each band's sky sits at
+        # its own log(s*log2), and pooling the bands before taking percentiles
+        # would measure the spread between those levels instead.  That is a
+        # different and much larger number, and it would drag sigma_min up with
+        # it.
+        bands_here = np.asarray(self.band_idx[idx], dtype=int)
+        widths = []
+        for i in sorted({int(b) for b in bands_here}):
+            lo, hi = np.percentile(x[bands_here == i], [16, 84])
+            widths.append(0.5 * (hi - lo))
+        sky_scatter = float(np.median(widths))
         deepest_sigma = np.nan
         if self._pooled is None:
             flux = self._pool(idx, rng=None, translate=False, scale_jitter=0.0)
@@ -322,11 +333,11 @@ class PatchDataset:
             },
             "min": float(x.min()),
             "max": float(x.max()),
-            # Most pixels in a patch are sky, so the 16-84 half-width measures
-            # the sky scatter in log space.  Compare against
-            # transform.expected_sky_scatter(softening_sigma); a large
-            # disagreement means the per-band softening scales are wrong.
-            "sky_scatter": float(0.5 * (p84 - p16)),
+            # Compare against transform.expected_sky_scatter(softening_sigma);
+            # a large disagreement means the per-band softening scales are
+            # wrong.  It is a check on the width -- the per-band sky *level*
+            # differs by design.
+            "sky_scatter": sky_scatter,
             # Per-patch spread is what sigma_max has to cover: the reverse
             # process starts from N(0, sigma_max^2) and must be able to reach
             # the brightest structure in a single patch.
@@ -341,7 +352,15 @@ class PatchDataset:
             # Informational only: softplus has no floor, so however deep this
             # goes the pixel is representable.
             "deepest_flux_sigma": deepest_sigma,
-            "sky_level": self.transform.sky_level,
+            # Per band, because x is absolute log flux: the sky sits at
+            # log(s_band * log 2) and the bands have different depths.  Only the
+            # bands actually present, so an unmeasured one shows as absent
+            # rather than as NaN.
+            "sky_level": {
+                self.transform.bands[i]:
+                    float(self.transform.sky_level(np.array([i]))[0])
+                for i in sorted({int(b) for b in self.band_idx[idx]})
+            },
         }
 
 

@@ -53,16 +53,17 @@ def main() -> None:
     np.save(f"{args.out}.npy", x)
 
     transform = LogFluxTransform.from_config(config.transform)
-    if args.band not in BANDS:
-        raise SystemExit(f"--band must be one of {' '.join(BANDS)}")
-    band_idx = np.full(len(x), BANDS.index(args.band))
-    # The model itself is band-agnostic; the band only enters when converting
-    # back to nJy, through that band's offset.
-    flux = transform.inverse(x, band_idx)
+    # x is absolute log flux, so the model map is exp(x) and no band enters it
+    # at all -- that is the whole point of the transform.  A band is still worth
+    # naming for the sky level it implies, which is what the sample should be
+    # read against.
+    flux = transform.inverse(x)
     print(f"log-space: mean {x.mean():+.3f} std {x.std():.3f} "
           f"range [{x.min():+.2f}, {x.max():+.2f}]")
-    print(f"{args.band}-band flux: median {np.median(flux):.2f} nJy, "
-          f"max {flux.max():.1f} nJy")
+    print(f"flux: median {np.median(flux):.2f} nJy, max {flux.max():.1f} nJy")
+    if args.band in BANDS:
+        sky = float(transform.sky_level(np.array([BANDS.index(args.band)]))[0])
+        print(f"  {args.band}-band sky sits at x = {sky:.2f}")
 
     try:
         import matplotlib

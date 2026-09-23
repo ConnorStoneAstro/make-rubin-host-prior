@@ -103,7 +103,7 @@ In rough order of how often they catch something:
 | figure | what to look for |
 |---|---|
 | `rejections.png` | **the important one.** Rejection reasons, and accepted vs rejected sky noise. If the rejected patches are systematically brighter or denser, the gate is discarding exactly the regime this project models, and the tolerances need loosening. |
-| `transform.png` | native flux → pooled → log space for a few patches, plus the pixel-value histogram. The sky peak must sit on `x = log(log 2) ≈ −0.37` inside the predicted scatter band, with sources clear of it. If it doesn't, the softening scales are wrong. |
+| `transform.png` | native flux → pooled → log space for a few patches, plus the pixel-value histogram. One red line per band, at that band's `x = log(s·log 2)`; the sky must pile up on each inside the predicted scatter band, with sources clear of it. If it doesn't, the softening scales are wrong. |
 | `training_batch.png` | exactly what the network receives: pooled, log-space, augmented, at the training size(s), on a shared colour scale so the spread between patches is visible. |
 | `cutouts.png` | raw stamps as `asinh(flux / sky noise)` — a stretch in σ units with a pinned low end, so bands of very different depth are directly comparable. |
 | `hosts.png` | the selected population: size, distortion, magnitude, surface brightness, Sérsic index, blendedness, band counts, sky noise and depth. |
@@ -132,9 +132,12 @@ prints two checks worth reading:
 - `sky_scatter` should match `expected_sky_scatter(softening_sigma)`
   (= `0.721 / softening_sigma`). If not, the per-band softening scales are wrong
   and the bands are not on a common footing.
-- the sky pedestal (`0.693 × softening_sigma`, in σ) should stay under 1, and the
-  flux above which the exponential model map is accurate should sit below
-  anything you care about photometrically.
+- the flux above which the exponential model map is accurate should sit below
+  anything you care about photometrically. The sky pedestal
+  (`0.693 × softening_sigma`, in σ) is *meant* to sit above 1σ — 1.39σ at the
+  default `softening_sigma = 2` — because suppressing the sky is the point of
+  the softening. An earlier version of this line said to keep it under one
+  sigma, from when the aim was to preserve the noise distribution.
 
 It also reports the **correlation length** of the pooled log-space patches and
 compares it to the model's `2R` crop — this is the authoritative measurement, and
@@ -366,8 +369,37 @@ decades of score magnitude. Set `sigma_scaling="none"` for the unmodified energy
 ### The log-space transform
 
     soften:   f_s = s_band * softplus(f / s_band)       softplus(u) = log(1+e^u)
-    forward:  x   = log(f_s / s_band) / c
-    model:    f   = s_band * exp(c * x)                 strictly positive
+    forward:  x   = log(f_s)                            → log(f) for f ≫ s
+    model:    f   = exp(x)                              strictly positive
+
+**`x` is log flux in nJy, absolutely.** `softplus(u) → u`, so `s·softplus(f/s) → f`
+and the forward map converges to plain `log(f)`: a 4×10⁵ nJy pixel lands at
+12.899 in *every* band, to machine precision. The model map is then `exp(x)` with
+no band in it at all — `LogFluxTransform.inverse` takes no `band_index` — so a
+forward model composing this prior with a likelihood in nJy has no per-band
+offset to undo.
+
+**The price is that each band's sky sits in a different place**, at
+`log(s_band·log 2)`: 2.38 in g and 3.28 in u at DP2-ish depths, a spread of 1.27.
+That is deliberate. An earlier version divided by `s_band` inside the logarithm,
+which put every band's sky at exactly `log(log 2) = −0.367` — it bought a common
+sky level by making `x` a *relative* quantity, so the same flux meant different
+`x` in different bands and the absolute scale of the signal was what got given
+away. Scene flux is what this prior exists to describe, so it is the sky that
+moves. The *width* is unchanged: all six bands scatter by `0.721/softening_sigma`
+about their own level, because the per-band term is an additive constant. What
+the model sees is one sky shape at several levels, not six shapes.
+
+Two things follow, and both are handled rather than assumed away:
+
+- **`sky_scatter` is measured per band and then across bands.** Pooling the bands
+  before taking percentiles would measure the spread between their sky *levels*,
+  which is 3–4× larger, and would drag `sigma_min` up with it.
+- **`SDEConfig.data_mean`.** VE only adds noise, so the `t = 1` marginal keeps the
+  data's mean, and `prior_sample` must start from `N(data_mean, σ_max²)`. This was
+  implicitly zero while the sky sat at −0.37; at +3.0 a prior sample centred on
+  zero starts half a `σ_max` away from the distribution the score was trained on.
+  `prepare_config.py` measures it.
 
 The softening is written as `s · softplus(f/s)` because that form has **one**
 parameter, it is a flux, and above it the map is the identity: `softplus(u) → u`
@@ -378,9 +410,18 @@ being hand-rolled. The one branch that remains belongs to the *logarithm*, not
 to softplus: below `u = -745` softplus underflows in float64 and its log is
 `-inf`, where `log(softplus(u)) → u` is exact to 1e-9.
 
-`s · exp(c · forward(f))` reproduces the softened flux exactly, so the entire
+`exp(forward(f))` reproduces the softened flux exactly, so the entire
 discrepancy between the data and what the model can express is the softening and
 nothing else.
+
+`soften(f, s)` is the definition, and `LogFluxTransform.soften` applies it with a
+band's own scale. `forward` does not call it — it goes through `log_softplus`,
+for the underflow reason above — so a test pins `forward == log(soften(f))` and
+`inverse == soften` to keep the implementation and the definition one thing.
+`softening_sigma` likewise has a single home in `TransformConfig`;
+`estimate_band_softening` takes it as a required argument rather than carrying a
+default of its own, and `prepare_config.py`'s `--softening-sigma` overrides the
+config only when it is actually passed.
 
 **The softening suppresses the sky, and that is the point.** With `s` at two
 sigma of the pooled per-band noise, pixels within the noise are compressed

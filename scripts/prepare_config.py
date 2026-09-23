@@ -8,11 +8,13 @@ the data's noise level and dynamic range.  This script measures both, writes a
 config, and prints the diagnostics you should look at before training:
 
 * ``sky_scatter`` should match ``expected_sky_scatter(softening_sigma)``.  If it
-  does not, the per-band softening scales are wrong and the bands will not be on
-  a common footing, which breaks the single band-agnostic prior.
-* the sky pedestal should stay below one sigma, and the flux above which the
-  exponential model map is accurate should sit below anything you care about
-  photometrically.
+  does not, the per-band softening scales are wrong.  Note this is a check on the
+  *width*: the sky *level* differs between bands by design, since x is absolute
+  log flux -- see ``data.transform``.
+* the flux above which the exponential model map is accurate should sit below
+  anything you care about photometrically.  The sky pedestal is *meant* to sit
+  above one sigma -- suppressing the sky is the point of the softening, and the
+  likelihood, not the prior, is what models the noise.
 """
 
 from __future__ import annotations
@@ -47,10 +49,11 @@ def main() -> None:
     p.add_argument("--shards", required=True, help="directory of *.h5 shards")
     p.add_argument("--out", required=True, help="config JSON to write")
     p.add_argument("--base-config", default=None, help="config to start from")
-    p.add_argument("--softening-sigma", type=float, default=1.0,
-                   help="softplus scale in units of pooled sky noise. Sets both "
-                        "the sky pedestal (0.693x this, in sigma) and the flux "
-                        "above which the exponential model map is accurate")
+    p.add_argument("--softening-sigma", type=float, default=None,
+                   help="softplus scale in units of pooled sky noise, s = this x "
+                        "noise. Sets the sky pedestal (0.693x this, in sigma) "
+                        "and the flux above which the exponential model map is "
+                        "accurate. Omit to use the config's own value")
     p.add_argument("--pool-factor", type=int, default=3)
     p.add_argument("--out-size", type=int, default=64)
     p.add_argument("--n-stats", type=int, default=512)
@@ -63,7 +66,12 @@ def main() -> None:
     config.patch.out_size = args.out_size
     config.patch.nominal_crop = args.out_size * args.pool_factor
     config.patch.native_size = max(shards.native_size, config.patch.nominal_crop)
-    config.transform.softening_sigma = args.softening_sigma
+    # Only when asked.  Assigning the flag's default unconditionally is how
+    # this script spent a while quietly resetting softening_sigma to the 1.0 of
+    # the old preserve-the-noise formulation, whatever the config said.
+    if args.softening_sigma is not None:
+        config.transform.softening_sigma = args.softening_sigma
+    softening_sigma = config.transform.softening_sigma
     # Measured from pooled patches, not derived from the variance plane:
     # coadd pixel noise is correlated, so pooling reduces it by less than
     # pool_factor and the derived value would be badly low.
@@ -71,7 +79,7 @@ def main() -> None:
     config.transform.band_softening = estimate_band_softening(
         pooled,
         pooled_bands,
-        softening_sigma=args.softening_sigma,
+        softening_sigma=softening_sigma,
         bands=shards.bands,
     )
 
@@ -102,6 +110,10 @@ def main() -> None:
     sigma_min, sigma_max = suggest_sigma_range(stats)
     config.sde.sigma_min = round(sigma_min, 5)
     config.sde.sigma_max = round(sigma_max, 3)
+    # x is absolute log flux, so the data is centred wherever the fluxes put it
+    # -- near +3 at DP2 depths, not near zero.  VE keeps the mean, so the t=1
+    # marginal is centred here and prior_sample has to start from the same place.
+    config.sde.data_mean = round(float(stats["mean"]), 4)
     config.save(args.out)
 
     print(json.dumps({"n_patches": len(shards),
@@ -115,16 +127,25 @@ def main() -> None:
     # extraction summary is native-resolution flux and is contaminated by the PSF.
     t = LogFluxTransform.from_config(config.transform, required_bands=present)
     ss = config.transform.softening_sigma
-    print(f"\nlog transform:  x = log(softplus(f/s))/c,  model map f = s*exp(c*x)")
+    print(f"\nlog transform:  x = log(s*softplus(f/s)),  model map f = exp(x)")
     print(f"  softening s = {ss:.2f} x pooled sky noise")
-    print(f"  model sky pedestal: {t.sky_pedestal * ss:.2f} sigma"
-          f"{'  (below the noise, good)' if t.sky_pedestal * ss < 1 else '  (ABOVE the noise)'}")
+    print(f"  bright flux passes through as log(f), the same x in every band")
+    import numpy as np
+
+    levels = ", ".join(
+        f"{b}={float(t.sky_level(np.array([i]))[0]):.2f}"
+        for i, b in enumerate(t.bands) if b in present)
+    print(f"  sky sits at log(s*log2), per band: {levels}")
+    print(f"  data mean x = {config.sde.data_mean:.3f}, which is where "
+          f"prior_sample starts from")
+    print(f"  sky pedestal: {t.sky_pedestal * ss:.2f} sigma -- pixels within "
+          f"the noise compress towards this, which is the point")
     print(f"  exponential map accurate within 1% above "
           f"{t.accurate_above(0.01) * ss:.1f} sigma, 0.1% above "
           f"{t.accurate_above(0.001) * ss:.1f} sigma")
     print(f"  deepest measured pixel: {stats['deepest_flux_sigma']:.1f} sigma "
           f"-> representable (softplus has no floor)")
-    predicted = expected_sky_scatter(ss, config.transform.log_scale)
+    predicted = expected_sky_scatter(ss)
     print(f"  sky scatter in x: {stats['sky_scatter']:.3f} measured vs "
           f"{predicted:.3f} predicted")
     if not 0.5 * predicted < stats["sky_scatter"] < 2.0 * predicted:

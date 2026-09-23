@@ -87,11 +87,16 @@ def main() -> None:
     dataset = PatchDataset.from_shards(shards, config, transform)
     stats = dataset.stats(128)
     config.sde.sigma_min, config.sde.sigma_max = suggest_sigma_range(stats)
+    # x is absolute log flux, so the data is not centred on zero and the t=1
+    # marginal is not either.
+    config.sde.data_mean = float(stats["mean"])
     print(f"[2] softening {({k: round(v, 1) for k, v in config.transform.band_softening.items()})}")
     print(f"    sky_scatter {stats['sky_scatter']:.3f} (expect ~"
           f"{expected_sky_scatter(config.transform.softening_sigma):.2f}), "
           f"deepest {stats['deepest_flux_sigma']:.1f} sigma")
-    print(f"    sigma range [{config.sde.sigma_min:.4f}, {config.sde.sigma_max:.2f}]")
+    print(f"    sky level per band {({k: round(v, 2) for k, v in stats['sky_level'].items()})}")
+    print(f"    sigma range [{config.sde.sigma_min:.4f}, {config.sde.sigma_max:.2f}]"
+          f" about data mean {config.sde.data_mean:.2f}")
     cl = dataset.correlation_length(128)
     print(f"    {context_advice(cl['xi'], 2 * args.n_layers)}"
           f"   ({cl['noise_fraction']:.0%} of variance is noise)")

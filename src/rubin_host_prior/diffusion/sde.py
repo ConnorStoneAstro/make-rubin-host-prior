@@ -25,10 +25,13 @@ from ..config import SDEConfig
 class VESDE:
     sigma_min: float = 0.01
     sigma_max: float = 10.0
+    #: Mean of the training data in x.  VE does not move the mean, so the
+    #: ``t = 1`` marginal is centred here and not on zero.
+    data_mean: float = 0.0
 
     @classmethod
     def from_config(cls, config: SDEConfig) -> "VESDE":
-        return cls(config.sigma_min, config.sigma_max)
+        return cls(config.sigma_min, config.sigma_max, config.data_mean)
 
     @property
     def log_ratio(self) -> float:
@@ -78,10 +81,18 @@ class VESDE:
     def prior_sample(
         self, key: PRNGKeyArray, shape: tuple[int, ...]
     ) -> Float[Array, "..."]:
-        """Draw from the ``t = 1`` marginal, which VE makes ``N(0, sigma_max^2)``.
+        """Draw from the ``t = 1`` marginal: ``N(data_mean, sigma_max^2)``.
 
-        Strictly this is only the true marginal if ``sigma_max`` dominates the
-        data's own scale.  Check it: ``sigma_max`` should be at least the largest
-        pixel-to-pixel spread in the training set.
+        VE only *adds* noise, so the marginal keeps the data's mean; the width is
+        ``sqrt(sigma_max^2 + var(data))``, which is ``sigma_max`` to the extent
+        that ``sigma_max`` dominates the data's own spread.  Check that:
+        ``sigma_max`` should be at least the largest pixel-to-pixel spread in
+        the training set.
+
+        ``data_mean`` is not cosmetic.  It was implicitly zero while the
+        transform put every band's sky at ``log(log 2) = -0.37``; under absolute
+        log flux the sky sits near +3, and starting the reverse process from
+        ``N(0, sigma_max^2)`` would be starting half a ``sigma_max`` away from
+        the distribution the score was trained on.
         """
-        return self.sigma_max * jax.random.normal(key, shape)
+        return self.data_mean + self.sigma_max * jax.random.normal(key, shape)

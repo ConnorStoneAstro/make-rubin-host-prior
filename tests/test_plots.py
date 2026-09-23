@@ -89,8 +89,13 @@ def test_transform_figure_marks_the_predicted_sky_position(dataset, tmp_path):
     assert path.exists()
     assert sum(1 for ax in fig.axes if ax.images) == 6  # 2 rows x 3 stages
     hist_ax = [ax for ax in fig.axes if ax.patches and not ax.images][0]
-    marked = [ln.get_xdata()[0] for ln in hist_ax.lines]
-    assert marked and marked[0] == pytest.approx(dataset.transform.sky_level)
+    # One line per band present, each at that band's log(s*log2).
+    marked = sorted(ln.get_xdata()[0] for ln in hist_ax.lines)
+    expected = sorted(
+        float(dataset.transform.sky_level(np.array([i]))[0])
+        for i in {int(b) for b in dataset.band_idx}
+    )
+    assert marked == pytest.approx(expected)
     assert expected_sky_scatter(dataset.config.transform.softening_sigma) > 0
     plt.close(fig)
 

@@ -44,13 +44,26 @@ class SDEConfig:
 
     sigma_min: float = 0.01
     sigma_max: float = 10.0
+    #: Mean of ``x`` over the training set.  The ``t = 1`` marginal is centred on
+    #: the data, not on zero, and sampling has to start from the same place.
+    #: This was implicitly zero while the transform put every band's sky at
+    #: ``log(log 2) = -0.37``; under absolute log flux the sky sits near +3 and
+    #: a prior sample centred on zero starts half a sigma_max away from the
+    #: distribution it is meant to be drawn from.  Measured, not chosen --
+    #: ``prepare_config.py`` sets it from ``stats["mean"]``.
+    data_mean: float = 0.0
 
 
 @dataclass
 class TransformConfig:
     """Flux -> log-space transform.
 
-        x = log(softplus(f / s_band)) / c        f = s_band * exp(c * x)
+        x = log(s_band * softplus(f / s_band))        f = exp(x)
+
+    ``x`` is log flux in nJy, absolutely: ``softplus(u) -> u``, so the forward
+    map converges to plain ``log(f)`` and the model map is ``exp(x)`` with no
+    band in it.  A forward model composing this prior with a likelihood in nJy
+    has no per-band offset to undo.
 
     The model map is a plain exponential, so the prior's reachable domain in
     flux space is strictly positive -- a source cannot emit negative flux.  The
@@ -67,10 +80,13 @@ class TransformConfig:
     2.0 the pedestal sits at 1.39 sigma and pixels within the noise are
     compressed towards it: the prior describes the galaxy rather than this
     realisation of the sky, which is what the likelihood is for.
+
+    The sky therefore lands at ``log(s_band * log 2)``, which differs between
+    bands.  That is the cost of an absolute flux scale and it is deliberate --
+    see ``data.transform``.
     """
 
     band_softening: dict[str, float] = field(default_factory=dict)  # nJy, per band
-    log_scale: float = 1.0  # "c" above
     softening_sigma: float = 2.0  # s_band = softening_sigma * pooled sky noise
 
 
