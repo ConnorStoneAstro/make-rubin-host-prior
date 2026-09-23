@@ -974,7 +974,21 @@ def extract_patches(
 
     # Shuffled, because the walk stops the moment the target is reached; in
     # catalogue order it would fill the set from one corner of the footprint.
+    #
+    # Then *ordered* -- not grouped -- so that hosts sharing a patch are walked
+    # consecutively.  Patches keep the shuffled order of the first host drawn
+    # into each, so where the set is drawn from is unchanged; all this does is
+    # put the repeats next to each other, which is what lets the component cache
+    # below be one entry deep.  The loop is still one host at a time.
     order = rng.permutation(len(catalogue))
+    seen_patches: dict[tuple[int, int], int] = {}
+    for k in order:
+        seen_patches.setdefault(
+            (int(catalogue["tract"][k]), int(catalogue["patch"][k])),
+            len(seen_patches))
+    order = sorted(order, key=lambda k: seen_patches[
+        (int(catalogue["tract"][k]), int(catalogue["patch"][k]))])
+    order = np.asarray(order)
     host_id = np.asarray(catalogue["objectId"], dtype=np.int64)[order]
     host_ra = np.asarray(catalogue["coord_ra"], dtype=float)[order]
     host_dec = np.asarray(catalogue["coord_dec"], dtype=float)[order]
@@ -996,6 +1010,27 @@ def extract_patches(
     n_off_the_grid = 0
     n_pixel_reads = 0
     depth_checked = False
+
+    # One patch deep, which the patch-ordered walk makes sufficient: every host
+    # in a patch is visited before the next patch is reached.  These reads are
+    # per (tract, patch, band) quantities that the old patch-major sweep
+    # amortised for free and this one would otherwise pay per host.
+    #
+    # Keyed on the *patch*, holding every band of it, because the inner loop
+    # runs over the bands of one host: a key that included the band would be
+    # cleared on every band change and would never hit at all.
+    cache_patch: tuple[int, int] | None = None
+    cache: dict[tuple[str, str], object] = {}
+
+    def component(ref, band, role, clock_name):
+        """A component of ``ref``, read once per patch rather than per host."""
+        nonlocal cache_patch, cache
+        if (tract, patch) != cache_patch:
+            cache_patch, cache = (tract, patch), {}
+        if (band, role) not in cache:
+            with clock(clock_name):
+                cache[(band, role)] = read_component(butler, ref, role)
+        return cache[(band, role)]
 
     for k in range(len(order)):
         if n_stamps is not None and n_accepted >= n_stamps:
@@ -1047,10 +1082,12 @@ def extract_patches(
 
             # Components only: no pixels move until the host is known to land
             # inside the built cells.  The cell grid comes off the PSF, which is
-            # where CellCoadd reads it from too.
-            with clock("component reads"):
-                wcs = read_component(butler, ref, "wcs")
-                bounds = read_component(butler, ref, "psf").bounds
+            # where CellCoadd reads it from too -- and which means reading every
+            # cell's PSF to get a bounding box, so the three are timed
+            # separately rather than as one "component reads" total.
+            wcs = component(ref, band_name, "wcs", "read: wcs")
+            bounds = component(ref, band_name, "psf",
+                               "read: cell grid (psf)").bounds
 
             x, y = _sky_to_pixel(wcs, target_ra, target_dec)
             if not _stamp_fits(bounds, x, y, native_size):
@@ -1077,9 +1114,8 @@ def extract_patches(
                 records.append(rec)
                 continue
 
-            with clock("component reads"):
-                visit_counts = cell_visit_counts(
-                    read_component(butler, ref, "provenance"))
+            visit_counts = cell_visit_counts(
+                component(ref, band_name, "provenance", "read: provenance"))
             if (tract, patch, band_name) not in depth_counted:
                 depth_counted.add((tract, patch, band_name))
                 all_visit_counts.extend(visit_counts.values())

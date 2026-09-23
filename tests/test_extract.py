@@ -136,22 +136,24 @@ def test_a_run_produces_the_stamps_asked_for_reading_only_their_pixels(
     assert (tmp_path / "manifest.parquet").exists()
 
 
-def test_the_walk_keeps_going_until_it_has_what_was_asked_for(monkeypatch,
-                                                              tmp_path):
-    """A host whose stamp does not fit costs nothing but a place in the queue;
-    the run draws deeper into the catalogue rather than returning short."""
+def test_a_host_that_fails_costs_only_its_place_in_the_queue(monkeypatch,
+                                                             tmp_path):
+    """The walk draws deeper into the catalogue rather than returning at the
+    first failures, and says so when the catalogue runs out before the target.
+    """
     gone = [fakes.CellIJ(i, j) for i in range(fakes.CELLS_PER_PATCH)
             for j in range(fakes.CELLS_PER_PATCH)]
     butler, tap = _make(monkeypatch, missing={(5063, 0): gone})
     butler.tap = tap
 
-    summary = _run(butler, tmp_path, n_stamps=20)
+    # More than the live tract can supply -- 40 hosts x 2 bands is 80 -- so the
+    # walk has to cover the 40 dead hosts too before it gives up.
+    summary = _run(butler, tmp_path, n_stamps=120)
     counts = summary["counts"]
-    assert counts["stamps_accepted"] == 20
-    # Half the catalogue is in the emptied tract, so more hosts were walked than
-    # the ten it would have taken had every one worked.
-    assert counts["hosts_tried"] > 10
-    assert counts["hosts_too_near_the_edge_of_coverage"] > 0
+    assert counts["stamps_accepted"] == 80
+    assert counts["hosts_tried"] == 80          # the whole catalogue
+    assert counts["hosts_too_near_the_edge_of_coverage"] == 40
+    assert counts["stamps_requested"] == 120    # and it is honest about it
 
     import pandas as pd
 
@@ -237,6 +239,36 @@ def test_a_catalogue_that_points_nowhere_says_so_early(butler, tmp_path):
 
 
 # -- talking to the butler --------------------------------------------------
+
+
+def test_components_are_read_once_per_patch_not_once_per_host(butler, tmp_path):
+    """303 of a real run's 398 seconds were these three reads, because the
+    host-major walk pays per host what the old patch-major sweep amortised.
+    The walk is ordered so that hosts sharing a patch are consecutive, which is
+    what lets a one-patch cache catch every repeat."""
+    from astropy.table import vstack
+
+    # Two hosts per patch, so the second must cost nothing.
+    objects = {t: _catalogue(t, *c, n=4, seed=t, patches=(0,))
+               for t, c in TRACTS.items()}
+    fakes.install(monkeypatch_noop(), ex)
+    b = fakes.FakeButler(TRACTS, objects)
+    extract_patches(b, tmp_path, tap_service=fakes.FakeTap(
+        vstack(list(objects.values()))), native_size=416, bands=("r", "i"),
+        n_stamps=None, seed=0)
+
+    # Two patches (one per tract) x two bands x three roles.  Per host it would
+    # be eight hosts x two bands x three, four times as many.
+    assert b.reads["component"] == 2 * 2 * 3
+    assert b.reads["bbox"] == 8 * 2      # one per host per band, as it must be
+    assert b.reads["whole"] == 0
+
+
+class monkeypatch_noop:
+    """fakes.install only needs something with setattr."""
+
+    def setattr(self, obj, name, value):
+        setattr(obj, name, value)
 
 
 def test_coadd_queries_are_constrained_by_data_id(butler):
@@ -517,7 +549,11 @@ def test_the_run_reports_where_its_time_went_and_how_deep_the_field_is(
         summary = _run(butler, tmp_path, n_stamps=40)
 
     seconds = summary["seconds"]
-    assert {"host catalogue", "component reads", "stamp pixels"} <= set(seconds)
+    # The component reads are timed one role at a time, not as a single total:
+    # they were 76% of a real run and "component reads: 303s" does not say which
+    # of the three to attack.
+    assert {"host catalogue", "stamp pixels", "read: wcs",
+            "read: cell grid (psf)", "read: provenance"} <= set(seconds)
     assert all(v >= 0 for v in seconds.values())
 
     dist = summary["visits_per_cell"]

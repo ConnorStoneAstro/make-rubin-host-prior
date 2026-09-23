@@ -666,6 +666,25 @@ orders of magnitude less I/O.
 Everything else about a patch comes from **component reads**, which move no
 pixels either: `sky_projection`, `psf` (for the cell grid) and `provenance`.
 
+Those three are **76% of the runtime** — 303 s of 398 s on a real run, against
+80 s for the pixels themselves. They are per-(tract, patch, band) quantities
+that the old patch-major sweep amortised for free and a host-major walk would
+otherwise pay per host, so two things claw it back:
+
+- the shuffled host list is **ordered** by patch — ordered, not grouped; the loop
+  is still one host at a time, and patches keep the shuffled order of the first
+  host drawn into each, so *where* the set is drawn from is unchanged;
+- a **one-patch component cache** then catches every repeat, because that
+  ordering guarantees the repeats are consecutive. It is keyed on the patch and
+  holds all of its bands: a key including the band would be cleared on every
+  band of a single host and never hit.
+
+The three are timed separately (`read: wcs`, `read: cell grid (psf)`,
+`read: provenance`) rather than as one total, because "component reads: 303 s"
+does not say which of them to attack. The prime suspect is the PSF: `bounds` is
+a bounding box and a set of missing cells, and getting it means deserialising a
+22×22 grid of per-cell PSFs.
+
 `grid` and `bounds` are *not* among them, which cost a run its whole optimisation
 once: `CellCoadd.grid` and `CellCoadd.bounds` are Python properties reading
 through to `self._psf.bounds`, not stored components, so asking the butler for
