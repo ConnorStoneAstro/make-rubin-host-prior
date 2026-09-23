@@ -664,12 +664,12 @@ returns a `CellCoadd` of just that region without loading the patch (DP2 tutoria
 orders of magnitude less I/O.
 
 Everything else about a patch comes from **component reads**, which move no
-pixels either: `sky_projection`, `psf` (for the cell grid) and `provenance`.
+pixels either: `sky_projection` and `provenance`.
 
-Those three are **76% of the runtime** — 303 s of 398 s on a real run, against
-80 s for the pixels themselves. They are per-(tract, patch, band) quantities
-that the old patch-major sweep amortised for free and a host-major walk would
-otherwise pay per host, so two things claw it back:
+Those three started as **76% of the runtime** — 303 s of 398 s on a real run,
+against 80 s for the pixels themselves. They are per-(tract, patch, band)
+quantities that the old patch-major sweep amortised for free and a host-major
+walk would otherwise pay per host, so two things claw it back:
 
 - the shuffled host list is **ordered** by patch — ordered, not grouped; the loop
   is still one host at a time, and patches keep the shuffled order of the first
@@ -679,18 +679,48 @@ otherwise pay per host, so two things claw it back:
   holds all of its bands: a key including the band would be cleared on every
   band of a single host and never hit.
 
-The three are timed separately (`read: wcs`, `read: cell grid (psf)`,
-`read: provenance`) rather than as one total, because "component reads: 303 s"
-does not say which of them to attack. The prime suspect is the PSF: `bounds` is
-a bounding box and a set of missing cells, and getting it means deserialising a
-22×22 grid of per-cell PSFs.
+The same cache holds the **ref query**, which is one `query_datasets` per host
+asking an identical question for every host in a patch. Leaving it out of the
+first version of the cache was worth 22% of a run on its own.
 
-`grid` and `bounds` are *not* among them, which cost a run its whole optimisation
-once: `CellCoadd.grid` and `CellCoadd.bounds` are Python properties reading
-through to `self._psf.bounds`, not stored components, so asking the butler for
-them fails and forces a whole-patch read for something the `psf` component
-already carries. They are taken from the PSF object instead — `psf.bounds` is the
-`CellGridBounds`, and `psf.bounds.grid` the `CellGrid`.
+The reads are timed separately (`read: wcs`, `read: provenance`) rather than as
+one total, because "component reads: 303 s" does not say which of them to
+attack. That measurement is what killed a confident guess: the PSF looked like
+the obvious culprit — `bounds` is a bounding box and a set of missing cells, and
+getting it meant deserialising a 22×22 grid of per-cell PSFs — but split out it
+was 51.7 s against 45.0 s for the WCS and 25.3 s for provenance. No single read
+dominated. After the cache the profile was flat: pixels 108 s, ref queries 68 s,
+psf 52 s, wcs 45 s, provenance 25 s.
+
+### The read is the fit test
+
+There was a pre-check before the pixel read: take the coadd's cell grid, and ask
+whether both stamp corners lay inside the cells that were actually built and
+whether any cell in the *middle* of the stamp was missing. Both conditions make
+the bbox read raise anyway — so the pre-check bought nothing but an earlier
+answer, at the cost of the PSF read that produced the grid.
+
+It is gone. `butler.get(ref, parameters={'bbox': box})` is wrapped in a `try`,
+and a failure is a rejection with reason `off_the_grid`. The cell indices the
+depth check needs then come off the **stamp**, which is a `CellCoadd` of just
+that region and already in hand — they must be the patch's own `(i, j)` and not
+indices relative to the sub-region, which is exactly what the existing
+provenance cross-check asserts on the first stamp of a run.
+
+**What that cost.** The pre-check could tell "this stamp is off the grid" from
+"this read failed"; a `try` cannot. A burst of `OSError` would otherwise be
+counted as a selection effect and quietly bias the training set. So every
+distinct exception type is logged once at WARNING with its message, and
+`stamp_read_failures` in the summary maps each type to the first message seen —
+empty on a healthy run, and a type other than the geometry error there means the
+repo is broken rather than the sky being ragged.
+
+Worth recording for anyone who reaches for the cell grid again: `CellCoadd.grid`
+and `CellCoadd.bounds` are **not** butler components. They are Python properties
+reading through to `self._psf.bounds`, so asking the butler for them fails and
+falls back to a whole-patch read — which is how this code spent several runs at
+~100× the pixel I/O without anyone noticing. The grid now comes off the stamp,
+which is a `CellCoadd` and carries it directly.
 
 Nothing falls back. A component the repo will not serve ends the run, naming the
 role and the component it was asked for. The alternative — read the whole patch
@@ -714,15 +744,13 @@ and cell grid included. The rule that settles it is not "remote or local" but
 rows and hands back 10⁴, so it belongs where the catalogue is; the cutout service
 would be asked to ship bytes that are already here.
 
-**A stamp is tested against the cell grid, not the image.** A patch at the edge
-of coverage has cells that were never built: its image `bbox` is the full patch
-while `bounds.bbox` covers only the populated part, and slicing outside that
-raises rather than returning empty pixels. `bounds` is the right predicate and
-excludes individually missing cells too. Because the corner test cannot see a
-hole in the *middle* of a stamp, the cells the stamp covers are checked against
-`bounds.missing` separately. A host that fails either test is rejected as
-`off_the_grid`, and the rejection is counted: being too near the edge of coverage
-is a real property of early DP2 and part of the selection function.
+**A stamp is tested against the cell grid, not the image** — by the read itself.
+A patch at the edge of coverage has cells that were never built: its image `bbox`
+is the full patch while the cell grid covers only the populated part, and slicing
+outside that raises rather than returning empty pixels. So does a hole in the
+middle. A host that hits either is rejected as `off_the_grid` and counted: being
+too near the edge of coverage is a real property of early DP2 and part of the
+selection function.
 
 The host list is **shuffled** before the walk, because the walk stops the moment
 `n_stamps` is reached — in catalogue order a run that stopped early would be

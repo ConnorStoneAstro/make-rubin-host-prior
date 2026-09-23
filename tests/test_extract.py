@@ -36,7 +36,6 @@ from rubin_host_prior.rubin.extract import (
     extract_patches,
     find_token,
     host_adql,
-    missing_cells,
     run_adql,
     select_hosts,
     stamp_depth,
@@ -153,6 +152,7 @@ def test_a_host_that_fails_costs_only_its_place_in_the_queue(monkeypatch,
     assert counts["stamps_accepted"] == 80
     assert counts["hosts_tried"] == 80          # the whole catalogue
     assert counts["hosts_too_near_the_edge_of_coverage"] == 40
+    assert counts["stamps_off_the_grid"] == 80  # 40 dead hosts x two bands
     assert counts["stamps_requested"] == 120    # and it is honest about it
 
     import pandas as pd
@@ -257,9 +257,13 @@ def test_components_are_read_once_per_patch_not_once_per_host(butler, tmp_path):
         vstack(list(objects.values()))), native_size=416, bands=("r", "i"),
         n_stamps=None, seed=0)
 
-    # Two patches (one per tract) x two bands x three roles.  Per host it would
-    # be eight hosts x two bands x three, four times as many.
-    assert b.reads["component"] == 2 * 2 * 3
+    # Two patches (one per tract) x two bands x two roles -- wcs and provenance;
+    # the psf is not read at all any more.  Per host it would be four times as
+    # many.
+    assert b.reads["component"] == 2 * 2 * 2
+    # And the ref query is in the same cache.  Leaving it out was 22% of a real
+    # run: it is one call per host asking an identical question.
+    assert b.reads["query"] == 2
     assert b.reads["bbox"] == 8 * 2      # one per host per band, as it must be
     assert b.reads["whole"] == 0
 
@@ -338,8 +342,29 @@ def test_the_cells_a_stamp_covers_include_the_middle_ones():
                                             fakes.Interval(0, 3300)))
     cells = cells_in_stamp(bounds, 225, 225, 416)
     assert len(cells) == 9 and (1, 1) in cells
-    assert missing_cells(fakes.CellGridBounds(bounds.bbox,
-                                              [fakes.CellIJ(1, 1)]), cells) == [(1, 1)]
+
+
+def test_a_stamp_over_a_hole_is_a_read_failure_not_a_pre_check(monkeypatch,
+                                                               tmp_path):
+    """The pre-check is gone: reading the pixels is what says whether a stamp
+    fits.  A cell missing in the *middle* of a stamp is the case it existed for,
+    and the read has to catch that too, not just an edge.  The failure is
+    counted and its type reported, because a try cannot tell "off the grid" from
+    "this repo is broken" and that distinction is what was given up."""
+    # One interior cell of every patch 0, so stamps straddling it must fail.
+    butler, tap = _make(monkeypatch, missing={(5063, 0): [fakes.CellIJ(11, 11)],
+                                              (5064, 0): [fakes.CellIJ(11, 11)]})
+    butler.tap = tap
+    summary = _run(butler, tmp_path, n_stamps=None)
+
+    assert "off_the_grid" in summary["rejection_counts"]
+    assert summary["counts"]["stamps_off_the_grid"] > 0
+    # The type is surfaced rather than silently folded into the count.
+    assert set(summary["stamp_read_failures"]) == {"ValueError"}
+    # And a clean run reports none at all.
+    clean, ctap = _make(monkeypatch)
+    clean.tap = ctap
+    assert _run(clean, tmp_path / "clean")["stamp_read_failures"] == {}
 
 
 # -- the host list ----------------------------------------------------------
@@ -553,7 +578,8 @@ def test_the_run_reports_where_its_time_went_and_how_deep_the_field_is(
     # they were 76% of a real run and "component reads: 303s" does not say which
     # of the three to attack.
     assert {"host catalogue", "stamp pixels", "read: wcs",
-            "read: cell grid (psf)", "read: provenance"} <= set(seconds)
+            "read: provenance"} <= set(seconds)
+    assert "read: cell grid (psf)" not in seconds
     assert all(v >= 0 for v in seconds.values())
 
     dist = summary["visits_per_cell"]

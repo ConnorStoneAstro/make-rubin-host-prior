@@ -99,12 +99,14 @@ DATASET_TYPE = "deep_coadd"
 
 #: Attribute names on a ``CellCoadd``, and the names of the butler components
 #: that serve them.  Note what is *absent*: ``grid`` and ``bounds`` are Python
-#: properties reading through to ``psf.bounds``, not components.
+#: properties reading through to ``psf.bounds``, not components -- and ``psf``
+#: itself is no longer read, because deserialising a 22x22 block of per-cell
+#: PSFs to find a bounding box cost 52 s of a 400 s run and the bbox read
+#: answers the same question by succeeding or failing.
 DP2_ATTRS = {
     "image": "image",
     "variance": "variance",
     "mask": "mask",
-    "psf": "psf",
     "wcs": "sky_projection",
     "schema": "schema",
     "origin": "yx0",
@@ -772,29 +774,14 @@ def _stamp_box(x: float, y: float, size: int):
     return Box.factory[iy - half : iy - half + size, ix - half : ix - half + size]
 
 
-def _stamp_fits(bounds, x: float, y: float, size: int) -> bool:
-    """Both stamp corners inside the built cells, in tract coordinates.
-
-    Against the cell grid rather than the image bbox: a patch at the edge of
-    coverage has cells that were never built, and slicing outside them raises
-    rather than returning empty pixels.  A host too near that edge is a genuine
-    data condition, not a bug -- it is rejected, and the rejection is counted so
-    the selection function stays measurable.
-    """
-    ix, iy = int(round(x)), int(round(y))
-    half = size // 2
-    return bool(
-        bounds.contains(x=ix - half, y=iy - half)
-        and bounds.contains(x=ix - half + size - 1, y=iy - half + size - 1)
-    )
-
-
 def cells_in_stamp(source, x: float, y: float, size: int) -> list[tuple[int, int]]:
-    """Every ``(i, j)`` cell index the stamp covers.
+    """Every ``(i, j)`` cell index the stamp covers, in the patch's numbering.
 
-    Takes a ``CellCoadd`` or the cell grid on its own, so a component read
-    serves.  Raises if neither answers: an empty list here would silently
-    disable both depth checks and the missing-cell check at once.
+    Takes a ``CellCoadd`` or a cell grid on its own.  In the walk it is handed
+    the *stamp* -- a CellCoadd of just this region, already read -- rather than
+    the patch's PSF, which cost 52 s of a 400 s run to deserialise for its
+    bounding box.  Raises if neither answers: an empty list here would silently
+    disable the depth check.
     """
     grid = getattr(source, "grid", source)
     half = size // 2
@@ -871,21 +858,6 @@ def cell_visit_counts(provenance) -> dict[tuple[int, int], int]:
     )
     cells, counts = np.unique(np.unique(keys, axis=0)[:, :2], axis=0, return_counts=True)
     return {(int(i), int(j)): int(n) for (i, j), n in zip(cells, counts)}
-
-
-def missing_cells(bounds, cells: list[tuple[int, int]]) -> list[tuple[int, int]]:
-    """Which of ``cells`` were never built.
-
-    ``CellGridBounds.bbox`` is the populated *rectangle*; ``missing`` is the
-    handful of cells inside it that are absent anyway.  A corner test catches a
-    stamp hanging off the edge of coverage but not a hole in the middle of one,
-    and slicing across either raises rather than returning empty pixels.
-    """
-    absent = getattr(bounds, "missing", None)
-    if not absent:
-        return []
-    keys = {(int(c.i), int(c.j)) for c in absent}
-    return [c for c in cells if c in keys]
 
 
 def stamp_depth(
@@ -1009,28 +981,38 @@ def extract_patches(
     n_no_coadd = 0
     n_off_the_grid = 0
     n_pixel_reads = 0
+    n_off_the_grid_stamps = 0
+    #: Exception type -> the first message seen with it.  Every distinct kind of
+    #: stamp-read failure is reported once; see the read below for why.
+    read_failures: dict[str, str] = {}
     depth_checked = False
 
     # One patch deep, which the patch-ordered walk makes sufficient: every host
-    # in a patch is visited before the next patch is reached.  These reads are
-    # per (tract, patch, band) quantities that the old patch-major sweep
-    # amortised for free and this one would otherwise pay per host.
+    # in a patch is visited before the next patch is reached.  Everything in
+    # here is a per-(tract, patch) or per-(tract, patch, band) quantity that the
+    # old patch-major sweep amortised for free and this one would otherwise pay
+    # per host: the ref query, and the three component reads.
     #
     # Keyed on the *patch*, holding every band of it, because the inner loop
     # runs over the bands of one host: a key that included the band would be
     # cleared on every band change and would never hit at all.
     cache_patch: tuple[int, int] | None = None
-    cache: dict[tuple[str, str], object] = {}
+    cache: dict = {}
 
-    def component(ref, band, role, clock_name):
-        """A component of ``ref``, read once per patch rather than per host."""
+    def patch_cache() -> dict:
+        """The cache for the patch being walked, emptied when it changes."""
         nonlocal cache_patch, cache
         if (tract, patch) != cache_patch:
             cache_patch, cache = (tract, patch), {}
-        if (band, role) not in cache:
+        return cache
+
+    def component(ref, band, role, clock_name):
+        """A component of ``ref``, read once per patch rather than per host."""
+        entry = patch_cache()
+        if (band, role) not in entry:
             with clock(clock_name):
-                cache[(band, role)] = read_component(butler, ref, role)
-        return cache[(band, role)]
+                entry[(band, role)] = read_component(butler, ref, role)
+        return entry[(band, role)]
 
     for k in range(len(order)):
         if n_stamps is not None and n_accepted >= n_stamps:
@@ -1059,8 +1041,14 @@ def extract_patches(
                      n_tried, len(order), hid, n_accepted,
                      f" of {n_stamps}" if n_stamps else "")
 
-        with clock("coadd ref queries"):
-            refs = coadd_refs(butler, tract, patch, bands)
+        # Cached like the components, and for the same reason: consecutive
+        # hosts in one patch ask the butler an identical question.  Leaving this
+        # out of the cache was worth 22% of a real run's wall time.
+        entry = patch_cache()
+        if "refs" not in entry:
+            with clock("coadd ref queries"):
+                entry["refs"] = coadd_refs(butler, tract, patch, bands)
+        refs = entry["refs"]
         if not refs:
             n_no_coadd += 1
             records.append({"host_id": hid, "tract": tract, "patch": patch,
@@ -1080,22 +1068,8 @@ def extract_patches(
                 "patch": patch,
             }
 
-            # Components only: no pixels move until the host is known to land
-            # inside the built cells.  The cell grid comes off the PSF, which is
-            # where CellCoadd reads it from too -- and which means reading every
-            # cell's PSF to get a bounding box, so the three are timed
-            # separately rather than as one "component reads" total.
             wcs = component(ref, band_name, "wcs", "read: wcs")
-            bounds = component(ref, band_name, "psf",
-                               "read: cell grid (psf)").bounds
-
             x, y = _sky_to_pixel(wcs, target_ra, target_dec)
-            if not _stamp_fits(bounds, x, y, native_size):
-                rec.update(status="rejected", reasons="off_the_grid")
-                records.append(rec)
-                continue
-            fitted = True
-
             sep = _verify_centre(wcs, x, y, target_ra, target_dec)
             rec["centre_sep_arcsec"] = sep
             if not np.isfinite(sep) or sep > CENTRE_TOLERANCE_ARCSEC:
@@ -1107,12 +1081,46 @@ def extract_patches(
                     f"mixing them displaces a position by up to a whole patch."
                 )
 
-            cells = cells_in_stamp(bounds, x, y, native_size)
-            absent = missing_cells(bounds, cells)
-            if absent:
-                rec.update(status="rejected", reasons=f"missing_cells:{len(absent)}")
+            # One read, of just these pixels -- and the read is also the test of
+            # whether the stamp fits.  There used to be a pre-check here, from
+            # the coadd's cell grid: whether both corners lay inside the cells
+            # that were actually built, and whether any cell in the middle was
+            # missing.  Both conditions make this read raise anyway, and getting
+            # the grid meant deserialising a 22x22 block of per-cell PSFs for
+            # every host, which measured 52 s of a 400 s run.
+            #
+            # What it cost to drop: the pre-check could distinguish "this stamp
+            # is off the grid" from "this read failed", and the try cannot.  So
+            # every distinct failure is reported once, loudly, with its type and
+            # message -- a burst of OSError here is a broken repo being counted
+            # as a selection effect, and that has to be visible.
+            try:
+                with clock("stamp pixels"):
+                    stamp = butler.get(
+                        ref, parameters={"bbox": _stamp_box(x, y, native_size)})
+            except Exception as exc:
+                kind = type(exc).__name__
+                if kind not in read_failures:
+                    read_failures[kind] = str(exc)
+                    log.warning(
+                        "stamp read failed with %s, counted as off_the_grid: %s. "
+                        "Expected for a host near the edge of coverage or over a "
+                        "cell that was never built; anything else means the read "
+                        "is failing for a reason this is silently absorbing.",
+                        kind, exc)
+                n_off_the_grid_stamps += 1
+                rec.update(status="rejected", reasons=f"off_the_grid:{kind}")
                 records.append(rec)
                 continue
+            fitted = True
+            n_pixel_reads += 1
+
+            # The cell indices come off the stamp, which is a CellCoadd of just
+            # this region and already in hand.  They must be the patch's own
+            # (i, j) and not indices relative to the sub-region -- the depth
+            # cross-check below is what says so, since provenance is keyed by
+            # the patch's numbering.
+            cells = cells_in_stamp(stamp, x, y, native_size)
 
             visit_counts = cell_visit_counts(
                 component(ref, band_name, "provenance", "read: provenance"))
@@ -1138,11 +1146,6 @@ def extract_patches(
                          len(visit_counts), min(visit_counts.values()),
                          max(visit_counts.values()))
 
-            # One read, of just these pixels.
-            with clock("stamp pixels"):
-                stamp = butler.get(
-                    ref, parameters={"bbox": _stamp_box(x, y, native_size)})
-            n_pixel_reads += 1
             image = np.asarray(_attr(stamp, "image").array, dtype=np.float32)
             if image.shape != (native_size, native_size):
                 rec.update(status="rejected", reasons=f"clipped:{image.shape}")
@@ -1249,6 +1252,7 @@ def extract_patches(
             "hosts_tried": n_tried,
             "hosts_with_no_coadd_for_their_patch": n_no_coadd,
             "hosts_too_near_the_edge_of_coverage": n_off_the_grid,
+            "stamps_off_the_grid": n_off_the_grid_stamps,
             "stamps_attempted": summary.pop("n_attempts"),
             "stamps_accepted": n_accepted,
             "stamps_rejected": summary.pop("n_rejected"),
@@ -1256,6 +1260,10 @@ def extract_patches(
             "shards_written": len(paths),
         },
         seconds=clock.summary(),
+        # Empty unless a stamp read failed.  A type other than the geometry
+        # error means reads are failing for a reason the walk is counting as a
+        # selection effect.
+        stamp_read_failures=read_failures,
         shards=[str(p) for p in paths],
         visits_per_cell=_distribution(all_visit_counts),
         field_radius_deg=radius_deg,

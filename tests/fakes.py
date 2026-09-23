@@ -141,11 +141,17 @@ class Mask:
 
 
 class Stamp:
-    def __init__(self, image, variance, mask, y0, x0):
+    """A CellCoadd of one region.  Carries the patch's cell grid, because that
+    is where the walk now gets its cell indices from -- and they have to be the
+    patch's own (i, j), not indices relative to the sub-region, or they will not
+    match the provenance table."""
+
+    def __init__(self, image, variance, mask, y0, x0, grid=None):
         self.image = Plane(image)
         self.variance = Plane(variance)
         self.mask = mask
         self.yx0 = XY(x=x0, y=y0)
+        self.grid = grid
 
 
 class Psf:
@@ -187,7 +193,7 @@ class FakeButler:
         self.missing = dict(missing)  # (tract, patch) -> [CellIJ, ...]
         self.skymap = skymap
         self.rng = np.random.default_rng(seed)
-        self.reads = {"component": 0, "bbox": 0, "whole": 0}
+        self.reads = {"component": 0, "bbox": 0, "whole": 0, "query": 0}
         # Built once per patch and handed out again: the read is still counted,
         # so a test can see how many there were, but 484 cells x n_visits rows
         # do not get rebuilt for every stamp.
@@ -210,6 +216,7 @@ class FakeButler:
     def query_datasets(self, kind, data_id=None, limit=None, explain=True, **kw):
         """Constrained by data id.  A real repo answers a tract+patch query with
         one ref per band; anything wider would let a wrong-patch ref through."""
+        self.reads["query"] += 1
         data_id = dict(data_id or {})
         tract, patch = data_id.get("tract"), data_id.get("patch")
         tracts = [tract] if tract is not None else sorted(self.tracts)
@@ -267,9 +274,20 @@ class FakeButler:
         return table
 
     def _stamp(self, tract, patch, box):
+        """Raises if the box leaves the built cells -- at its edges *or* through
+        a hole in the middle.  That is what lets the walk drop its pre-check:
+        the read is the test.  A corner-only check would let a stamp straddling
+        a missing interior cell through, which is the case the pre-check's
+        ``missing_cells`` existed for."""
         bounds = self._bounds(tract, patch)
-        if not (bounds.contains(x=box.x.start, y=box.y.start)
-                and bounds.contains(x=box.x.max, y=box.y.max)):
+        for x in range(box.x.start, box.x.stop, CELL):
+            for y in range(box.y.start, box.y.stop, CELL):
+                if not bounds.contains(x=x, y=y):
+                    raise ValueError(
+                        f"grid bounding box {bounds.bbox} does not contain {box}"
+                    )
+        if not (bounds.contains(x=box.x.max, y=box.y.max)
+                and bounds.contains(x=box.x.start, y=box.y.start)):
             raise ValueError(
                 f"grid bounding box {bounds.bbox} does not contain {box}"
             )
@@ -281,7 +299,8 @@ class FakeButler:
         r2 = (xx - nx / 2) ** 2 + (yy - ny / 2) ** 2
         image += (400.0 * np.exp(-r2 / (2 * 9.0**2))).astype(np.float32)
         variance = np.full((ny, nx), sky**2, dtype=np.float32)
-        return Stamp(image, variance, Mask((ny, nx)), box.y.start, box.x.start)
+        return Stamp(image, variance, Mask((ny, nx)), box.y.start, box.x.start,
+                     grid=bounds.grid)
 
 
 class FakeTap:
