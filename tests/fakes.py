@@ -187,7 +187,11 @@ class FakeButler:
         self.missing = dict(missing)  # (tract, patch) -> [CellIJ, ...]
         self.skymap = skymap
         self.rng = np.random.default_rng(seed)
-        self.reads = {"component": 0, "bbox": 0, "whole": 0, "object": 0}
+        self.reads = {"component": 0, "bbox": 0, "whole": 0}
+        # Built once per patch and handed out again: the read is still counted,
+        # so a test can see how many there were, but 484 cells x n_visits rows
+        # do not get rebuilt for every stamp.
+        self._contrib_cache: dict = {}
 
     # geometry of a patch inside its tract
     def _patch_box(self, patch):
@@ -204,20 +208,20 @@ class FakeButler:
         return Wcs(ra0, dec0, x0=0.0, y0=0.0)
 
     def query_datasets(self, kind, data_id=None, limit=None, explain=True, **kw):
+        """Constrained by data id.  A real repo answers a tract+patch query with
+        one ref per band; anything wider would let a wrong-patch ref through."""
         data_id = dict(data_id or {})
-        tract = data_id.get("tract")
+        tract, patch = data_id.get("tract"), data_id.get("patch")
         tracts = [tract] if tract is not None else sorted(self.tracts)
-        if kind == "object":
-            return [Ref(skymap=self.skymap, tract=t) for t in tracts
-                    if t in self.objects]
         refs = []
         for t in tracts:
             table = self.objects.get(t)
             if table is None:
                 continue
-            for patch in sorted({int(p) for p in table["patch"]}):
+            present = {int(p) for p in table["patch"]}
+            for pa in sorted(present if patch is None else present & {int(patch)}):
                 for band in ("u", "g", "r", "i", "z", "y"):
-                    refs.append(Ref(skymap=self.skymap, tract=t, patch=patch,
+                    refs.append(Ref(skymap=self.skymap, tract=t, patch=pa,
                                     band=band))
         return refs
 
@@ -236,12 +240,6 @@ class FakeButler:
             raise RuntimeError(f"no component {component!r}")
 
         fields = what.dataId.mapping
-        if "patch" not in fields:          # an object table
-            self.reads["object"] += 1
-            table = self.objects[int(fields["tract"])]
-            columns = (parameters or {}).get("columns")
-            return table[[c for c in columns if c in table.colnames]] if columns \
-                else table
         if not parameters or "bbox" not in parameters:
             self.reads["whole"] += 1
             raise AssertionError(
@@ -254,15 +252,19 @@ class FakeButler:
     def _contributions(self, tract, patch):
         from astropy.table import Table
 
-        box = self._patch_box(patch)
+        key = (int(tract), int(patch))
+        if key in self._contrib_cache:
+            return self._contrib_cache[key]
         rows = []
         for i in range(CELLS_PER_PATCH):
             for j in range(CELLS_PER_PATCH):
                 for v in range(self.n_visits):
                     rows.append((i, j, 1000 + v, 1))
         a = np.asarray(rows, dtype=np.int64)
-        return Table({"cell_i": a[:, 0], "cell_j": a[:, 1],
-                      "visit": a[:, 2], "detector": a[:, 3]})
+        table = Table({"cell_i": a[:, 0], "cell_j": a[:, 1],
+                       "visit": a[:, 2], "detector": a[:, 3]})
+        self._contrib_cache[key] = table
+        return table
 
     def _stamp(self, tract, patch, box):
         bounds = self._bounds(tract, patch)
@@ -282,9 +284,48 @@ class FakeButler:
         return Stamp(image, variance, Mask((ny, nx)), box.y.start, box.x.start)
 
 
+class FakeTap:
+    """A TAP service that answers every query with one table.
+
+    The host cuts run *on the service*, so a fake that applied them would be
+    testing itself.  What the extraction code does with the rows it gets back is
+    what the sweep tests are about.
+    """
+
+    def __init__(self, table):
+        self.table = table
+        self.queries: list[str] = []
+
+    def submit_job(self, query):
+        self.queries.append(query)
+        return _FakeJob(self.table)
+
+
+class _FakeJob:
+    def __init__(self, table):
+        self.table = table
+        self.phase = "COMPLETED"
+        self.deleted = False
+
+    def run(self):
+        pass
+
+    def wait(self, phases=None, timeout=None):
+        pass
+
+    def raise_if_error(self):
+        pass
+
+    def fetch_result(self):
+        return type("Result", (), {"to_table": lambda _self: self.table})()
+
+    def delete(self):
+        self.deleted = True
+
+
 def install(monkeypatch, module):
     """Point the extraction module's lazy stack import at these fakes."""
     from types import SimpleNamespace
 
     monkeypatch.setattr(module, "_lsst",
-                        lambda: SimpleNamespace(Box=Box, Butler=None, sphgeom=None))
+                        lambda: SimpleNamespace(Box=Box, Butler=None))

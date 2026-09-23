@@ -8,11 +8,6 @@ the run is reproducible from a thing you can read and diff.
     $EDITOR extraction.yaml
     python scripts/extract_dp2_patches.py --config extraction.yaml
 
-The cuts used to be scattered across four files: defaults on ``select_hosts``,
-defaults on ``host_adql``, module constants in ``rubin.quality``, and command
-line flags that sometimes overrode one and not the other.  Changing what counted
-as a host meant editing code in several places and hoping they agreed.
-
 **The cuts, and why they are these.**
 
 *Visibility is total magnitude, not surface brightness.*  Mean surface
@@ -23,10 +18,11 @@ galaxy is visible when it has enough total flux, so ``max_mag`` is the primary
 cut and ``max_mu_e`` is left loose, as a bound on runaway fits rather than a
 selector.
 
-*Extent is angular size referenced to the PSF.*  ``min_reff_arcsec`` is the
-intrinsic half-light radius from the multiband Sersic fit; ``min_deconvolved_px``
-is the same claim made against the image, ``T^2 = ((ixx+iyy)-(ixxPSF+iyyPSF))/2``,
-which a point source makes exactly zero regardless of the seeing.
+*Extent is one measurement.*  ``min_reff_arcsec`` is the half-light major axis
+of the multiband Sersic fit -- one morphology fit to all six bands at once, in
+arcsec, before PSF convolution.  There is no second size estimator and no
+non-parametric cross-check: carrying several measurements of the same quantity
+means carrying the question of which one to believe.
 
 *The pixel cuts are tuned for shallow, ragged coverage.*  Early DP2 outside the
 deep fields runs one visit per cell, and the surveyed region has edges
@@ -34,6 +30,11 @@ everywhere, so a stamp is far more likely to clip a coverage boundary than to
 contain an artefact.  Gating a plane at zero tolerance when the same quantity is
 also measured as a fraction just means the stricter of the two always wins and
 the tolerance is decorative.
+
+Each cut is defined once.  The host cuts are compiled into the ADQL and applied
+by the TAP service; the patch cuts are handed to ``rubin.quality.gate``, whose
+tolerance arguments have no defaults of their own so that this file is the only
+place that says what a cut is.
 """
 
 from __future__ import annotations
@@ -53,7 +54,9 @@ def mag_to_flux(mag: float) -> float:
 
 def flux_to_mag(flux: float) -> float:
     """nJy to AB magnitude."""
-    return float(AB_ZEROPOINT - 2.5 * __import__("math").log10(flux))
+    import math
+
+    return float(AB_ZEROPOINT - 2.5 * math.log10(flux))
 
 
 @dataclass
@@ -77,7 +80,7 @@ class HostCuts:
     min_mag: float = 11.5
 
     #: Half-light major axis of the multiband Sersic fit, arcsec.  Intrinsic,
-    #: i.e. before PSF convolution.
+    #: i.e. before PSF convolution.  The only size measurement there is.
     min_reff_arcsec: float = 1.5
     max_reff_arcsec: float = 30.0
 
@@ -86,10 +89,6 @@ class HostCuts:
     #: around an invisible envelope, not a way of choosing galaxies.  One sigma
     #: of r-band sky per square arcsecond is about 27.
     max_mu_e: float | None = 25.5
-
-    #: PSF-deconvolved moment radius, native pixels.  A point source is exactly
-    #: zero; 2.5 px is 0.5 arcsec of genuine extent.
-    min_deconvolved_px: float | None = 2.5
 
     #: Sersic index ceiling.  Above about 6 the profile has no measurable size.
     max_sersic_index: float | None = 6.0
@@ -107,10 +106,6 @@ class HostCuts:
     #: Collapse catalogue rows closer than this, in arcsec.  DP2 has no
     #: detect_isPrimary and overlapping tracts give one source two objectIds.
     dedupe_radius_arcsec: float = 0.5
-    #: Draw equally from bins of equal width in log size, over the fixed range
-    #: above rather than over the sample's own tail.
-    size_stratified: bool = True
-    n_size_bins: int = 5
 
     @property
     def flux_range(self) -> tuple[float, float]:
@@ -141,7 +136,9 @@ class HostCuts:
         import math
 
         lines = [f"  faint limit {self.max_mag:.1f} mag"
-                 f"   ({self.flux_range[0]:.0f} nJy)"]
+                 f"   ({self.flux_range[0]:.0f} nJy)",
+                 f"  size {self.min_reff_arcsec:.1f}-{self.max_reff_arcsec:.1f}\""
+                 f" (Sersic half-light major axis)"]
         if self.max_mu_e is not None:
             lines.append(f"  surface brightness <= {self.max_mu_e:.1f} mag/arcsec^2")
             lines.append("  reff    mag from SB   binding cut")
@@ -209,12 +206,13 @@ class PatchCuts:
     min_visits: int | None = None
 
     def __post_init__(self) -> None:
-        # JSON has no tuples, so a loaded file would otherwise compare unequal
+        # YAML has no tuples, so a loaded file would otherwise compare unequal
         # to the object it was written from.
         self.zero_tolerance_planes = tuple(self.zero_tolerance_planes)
 
     def gate_kwargs(self) -> dict:
-        """As ``rubin.quality.gate`` takes them."""
+        """As ``rubin.quality.gate`` takes them.  ``gate`` has no defaults for
+        any of these, so this is the only statement of what they are."""
         return {
             "zero_tol": tuple(self.zero_tolerance_planes),
             "frac_tol": dict(self.max_plane_fraction),
@@ -241,17 +239,12 @@ class SkyRegion:
 
 @dataclass
 class Catalogue:
-    """Where the host list comes from."""
+    """Where the host list comes from: one ADQL query against ``dp2.Object``."""
 
-    #: "tap" sends the cuts to the RSP as one ADQL query; "butler" scans the
-    #: repo's object tables instead and needs no network.
-    source: str = "tap"
     #: Written once and reused; delete the file if the host cuts change.
     cache: str | None = None
     #: TOP N on the TAP query.  null for no limit.
     limit_hosts: int | None = None
-    #: Scan only this many object tables (butler source only).
-    limit_tracts: int | None = None
     #: Found from the RSP discovery document when null.
     tap_url: str | None = None
 
@@ -261,36 +254,27 @@ class Stamps:
     """What each cutout is."""
 
     bands: tuple[str, ...] = ("u", "g", "r", "i", "z", "y")
+    #: Native pixels cut from the coadd.  Deliberately larger than the training
+    #: crop: the slack is what the loader translates within, which is where
+    #: decentring comes from now that extraction centres on the host.
+    native_size: int = 512
+    patches_per_shard: int = 1024
 
     def __post_init__(self) -> None:
         # YAML has no tuples, so a loaded file would compare unequal to the
         # object it was written from.
         self.bands = tuple(self.bands)
-    #: Native pixels cut from the coadd.  Deliberately larger than the training
-    #: crop: the slack is what the loader translates within, which is where
-    #: decentring comes from now that extraction centres on the host.
-    native_size: int = 416
-    patches_per_shard: int = 1024
-    #: Record what sits near each host: how many objects, the brightest, the
-    #: nearest galaxy and star.  Covariates only -- nothing trains on them --
-    #: and they cost one ~700k-row object-table read per tract that yields a
-    #: stamp.  With hosts drawn thinly across the footprint that is most of the
-    #: runtime, so it is off unless asked for.
-    neighbours: bool = False
-    neighbour_radius_arcsec: float = 30.0
 
 
 @dataclass
 class Run:
     """How much to do."""
 
-    #: Hosts drawn per round.  Each yields at most one cutout per band.
-    n_hosts: int = 8000
-    #: Target number of accepted cutouts; null to take what the hosts give.
-    n_patches: int | None = None
-    #: Hard stop, no topping up.
-    max_patches: int | None = None
-    max_rounds: int = 8
+    #: Accepted cutouts to collect.  The walk continues until it has them or the
+    #: catalogue runs out; null takes whatever the whole catalogue gives.  The
+    #: check happens between hosts, so a run can overshoot by up to one host's
+    #: worth of bands.
+    n_stamps: int | None = None
     seed: int = 0
     prefix: str = "patches"
 
@@ -337,8 +321,7 @@ class ExtractionConfig:
         where = ("the whole DP2 footprint" if self.sky.radius_deg is None
                  else f"{self.sky.radius_deg} deg of "
                       f"({self.sky.ra}, {self.sky.dec})")
-        return (f"extracting from {where} via {self.catalogue.source}\n"
-                f"host cuts:\n" + self.hosts.describe())
+        return (f"extracting from {where}\nhost cuts:\n" + self.hosts.describe())
 
 
 #: Kept as an alias: the cuts alone are still a useful thing to pass around.
@@ -351,8 +334,8 @@ class Selection:
 def _build(cls, raw: dict):
     """Construct a cuts dataclass, refusing a key it does not have.
 
-    A typo in a hand-edited selection file must not silently leave the default
-    in place -- that is a cut that looks applied and is not.
+    A typo in a hand-edited config must not silently leave the default in
+    place -- that is a cut that looks applied and is not.
     """
     known = {f.name for f in dataclasses.fields(cls)}
     unknown = set(raw) - known

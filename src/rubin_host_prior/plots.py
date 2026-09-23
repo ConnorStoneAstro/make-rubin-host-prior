@@ -13,7 +13,7 @@ spent on it.  In rough order of how often they catch something:
 ``cutouts``        raw stamps, in units of their own sky noise, to see the range
                    of scenes that were selected.
 ``hosts``          the selected population: size, magnitude, ellipticity, band,
-                   sky noise, neighbour distances.
+                   sky noise, depth.
 
 matplotlib is imported lazily so the package stays importable without it.
 """
@@ -222,20 +222,6 @@ def plot_transform(dataset, n: int = 4, seed: int = 0, out: Path | None = None):
 # -- the selected host population ------------------------------------------
 
 
-def _distortion(ixx, iyy, ixy):
-    """``|e|`` from second moments, the distortion convention.
-
-    ``e1 = (Ixx - Iyy)/(Ixx + Iyy)``, ``e2 = 2 Ixy/(Ixx + Iyy)``, so for an
-    ellipse of axis ratio ``q`` this is ``(1 - q^2)/(1 + q^2)`` -- *not* the
-    ``(1 - q)/(1 + q)`` shear convention.  They differ by roughly a factor of two
-    at small ellipticity, which is enough to mislead if the axis is mislabelled.
-    """
-    t = ixx + iyy
-    with np.errstate(invalid="ignore", divide="ignore"):
-        e1, e2 = (ixx - iyy) / t, 2.0 * ixy / t
-    return np.hypot(e1, e2)
-
-
 def _hist(ax, values, bins, title, xlabel, log=False):
     v = np.asarray(values, dtype=float)
     v = v[np.isfinite(v)]
@@ -262,34 +248,26 @@ def plot_hosts(shards, hosts=None, band: str = "r", out: Path | None = None):
     plt = _plt()
     from .config import BANDS
 
-    from rubin_host_prior.rubin.extract import host_half_light_arcsec
-
     meta = shards.meta
     panels = []
 
     if hosts is not None and len(hosts):
         cols = set(getattr(hosts, "columns", getattr(hosts, "colnames", [])))
-        # DP2 second moments are per band -- there is no band-independent
-        # shape_xx -- and only ugri carry them.
-        mom = [f"{band}_ixx", f"{band}_iyy", f"{band}_ixy"]
-        scale = float(np.nanmedian(meta["pixel_scale"])) if len(meta["pixel_scale"]) else 0.2
-        if set(mom) <= cols:
-            ixx, iyy, ixy = (np.asarray(hosts[c], dtype=float) for c in mom)
-            panels.append(
-                (
-                    "host distortion",
-                    _distortion(ixx, iyy, ixy),
-                    40,
-                    "$|e| = (1-q^2)/(1+q^2)$",
-                    False,
-                )
-            )
-            # Prefer the half-light radius, which DP2 gives directly in arcsec
-            # and which the size cut is made on; fall back to the moments trace
-            # converted with the pixel scale.
-            size = host_half_light_arcsec(hosts)
-            label = "Sersic half-light major axis (arcsec)"
-            panels.append(("host size", size, 40, label, False))
+        # Size and shape both come from the multiband Sersic fit -- the same fit
+        # the size cut is made on -- rather than from per-band adaptive moments,
+        # which would be a second, PSF-convolved answer to the same question.
+        if {"sersic_reff_major", "sersic_reff_minor"} <= cols:
+            a = np.asarray(hosts["sersic_reff_major"], dtype=float)
+            b = np.asarray(hosts["sersic_reff_minor"], dtype=float)
+            panels.append(("host size", a, 40,
+                           "Sersic half-light major axis (arcsec)", False))
+            with np.errstate(invalid="ignore", divide="ignore"):
+                q = np.where(a > 0, b / a, np.nan)
+            # The distortion convention, e = (1-q^2)/(1+q^2), not the shear
+            # convention (1-q)/(1+q); they differ by about a factor of two at
+            # small ellipticity, enough to mislead if the axis is mislabelled.
+            panels.append(("host distortion", (1 - q**2) / (1 + q**2), 40,
+                           "$|e| = (1-q^2)/(1+q^2)$", False))
         fcol = f"{band}_cModelFlux"
         if fcol in cols:
             flux = np.asarray(hosts[fcol], dtype=float)
@@ -349,17 +327,6 @@ def plot_hosts(shards, hosts=None, band: str = "r", out: Path | None = None):
                 False,
             )
         )
-    panels.append(("nearest galaxy", meta["nearest_galaxy_arcsec"], 40, "arcsec", False))
-    panels.append(("nearest star", meta["nearest_star_arcsec"], 40, "arcsec", False))
-    panels.append(
-        (
-            "neighbours in frame",
-            np.asarray(meta["n_neighbours"], dtype=float),
-            30,
-            "count within search radius",
-            False,
-        )
-    )
     if "n_visits_min" in meta:
         # Exposure times are equal, so this is the depth of the shallowest cell
         # the stamp covers, straight from the coadd provenance.

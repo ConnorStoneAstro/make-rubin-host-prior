@@ -18,7 +18,7 @@ Figures, in rough order of how often they catch something:
   training_batch.png what the network actually receives, augmentation and all
   cutouts.png        raw stamps in units of their own sky noise
   hosts.png          the selected population: size, magnitude, ellipticity,
-                     band, sky noise, neighbour distances
+                     band, sky noise, depth
 """
 
 from __future__ import annotations

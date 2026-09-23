@@ -41,11 +41,14 @@ def main() -> None:
     p.add_argument("--collection", default="dp2")
     p.add_argument("--no-plots", action="store_true",
                    help="skip the diagnostic figures written to <out>/diagnostics")
-    p.add_argument("--verbose", "-v", action="count", default=0)
+    p.add_argument("--verbose", "-v", action="count", default=0,
+                   help="DEBUG instead of the default INFO")
     args = p.parse_args()
 
+    # INFO by default: an extraction runs for tens of minutes and a run that
+    # says nothing is a run you cannot tell from a hung one.
     logging.basicConfig(
-        level=[logging.WARNING, logging.INFO, logging.DEBUG][min(args.verbose, 2)],
+        level=logging.DEBUG if args.verbose else logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
 
@@ -63,17 +66,10 @@ def main() -> None:
         bands=config.stamps.bands,
         native_size=config.stamps.native_size,
         patches_per_shard=config.stamps.patches_per_shard,
-        neighbour_radius_arcsec=config.stamps.neighbour_radius_arcsec,
-        neighbours_wanted=config.stamps.neighbours,
-        host_source=config.catalogue.source,
         host_cache=config.catalogue.cache,
         limit_hosts=config.catalogue.limit_hosts,
-        limit_tracts=config.catalogue.limit_tracts,
         tap_url=config.catalogue.tap_url,
-        n_hosts=config.run.n_hosts,
-        n_patches=config.run.n_patches,
-        max_patches=config.run.max_patches,
-        max_rounds=config.run.max_rounds,
+        n_stamps=config.run.n_stamps,
         seed=config.run.seed,
         prefix=config.run.prefix,
         selection=config,

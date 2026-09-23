@@ -62,28 +62,6 @@ from __future__ import annotations
 
 import numpy as np
 
-#: Any pixel set in these planes disqualifies the patch.  ``NO_DATA`` is one of
-#: the two Rubin says to exclude outright (tutorial 202.5): no input covered the
-#: pixel, so it is not sky, it is nothing.  ``DETECTION_EDGE`` means too near the
-#: patch edge for the detection kernel.
-ZERO_TOL: tuple[str, ...] = ("NO_DATA", "DETECTION_EDGE")
-
-#: Maximum allowed fraction of the patch, per plane.  Stricter than the DP1
-#: measurement recommendations for CR/INTRP -- see the module docstring.
-FRAC_TOL: dict[str, float] = {
-    # Rubin's guidance is to exclude SATURATED outright, which for *pixels* in a
-    # measurement is right.  For whole training stamps it is not: on a coadd the
-    # saturated core of a bright neighbour lands in a great many stamps, and a
-    # scene with a bright neighbour is precisely the regime this project models,
-    # so a blanket cut would reproduce the selection bias the rejection
-    # statistics exist to expose.  A small fraction is kept away from the centre,
-    # zero is kept at the centre where the transient goes, and the fraction is
-    # recorded either way.  Tighten to 0.0 to follow the guidance literally.
-    "SATURATED": 0.005,
-    "COSMIC_RAY": 0.005,  # mostly rejected during coaddition; a safety net
-    "INTERPOLATED": 0.02,  # smooth synthetic fill; bad for a generative model
-}
-
 #: Measured and recorded for every stamp, never gated on.  ``INEXACT_PSF`` and
 #: ``REJECTED`` cover a large fraction of the DP2 coadd, so a cut on them keeps
 #: almost nothing; ``DETECTED`` marks the targets.  Having the fractions in the
@@ -97,28 +75,6 @@ COVARIATE_PLANES: tuple[str, ...] = (
     "SUSPECT",
 )
 
-#: Same planes, applied to the central region, where structure matters most.
-#:
-#: Not all zero, which is what these were and what made ``inner_COSMIC_RAY``
-#: reject a quarter of a real run on its own.  The inner region of a 416 px stamp
-#: is about 20 000 pixels, so zero tolerance means one flagged pixel anywhere
-#: near the middle disqualifies the stamp -- far stricter than intended, and
-#: strictest against the crowded fields where flags are densest.
-#:
-#: The three planes are also not equally harmful, which the old uniform zero
-#: ignored.  A ``COSMIC_RAY`` pixel on a *coadd* is real data: the affected
-#: inputs were rejected during coaddition and the pixel was built from the rest,
-#: so it is shallower, not invented.  An ``INTERPOLATED`` pixel is invented --
-#: smooth synthetic fill, exactly the kind of false structure a generative model
-#: will learn -- so it stays tight.  ``SATURATED`` stays at zero: the centre is
-#: where the transient goes, and a saturated core there makes the stamp useless
-#: for the thing it is being collected for.
-INNER_FRAC_TOL: dict[str, float] = {
-    "SATURATED": 0.0,
-    "COSMIC_RAY": 0.005,
-    "INTERPOLATED": 0.001,
-}
-
 #: Never gate on these: they mark real sources, or cover so much of the coadd
 #: that a cut keeps nothing.
 NEVER_REJECT: tuple[str, ...] = COVARIATE_PLANES
@@ -131,14 +87,6 @@ NEVER_REJECT: tuple[str, ...] = COVARIATE_PLANES
 #: half-light radius is 5 native px -- so no source can fill a block and lift its
 #: floor.
 VARIANCE_BLOCK_FRACTION: float = 1 / 8
-
-#: Largest accepted ratio between the highest and lowest block variance floor.
-#: This is a ratio in *variance*, so 1.5 is a factor 1.22 in noise sigma, about
-#: where a cell boundary stops being subtle and starts being the first thing you
-#: see in the stamp.  Recorded for every stamp either way, so this can be
-#: retuned from the manifest without re-reading pixels.
-MAX_VARIANCE_STEP: float = 1.5
-
 
 #: Percentile taken within each block.  Low, because source Poisson variance is
 #: one-sided: at the 25th percentile a bright 3 arcsec galaxy reads as a step of
@@ -156,60 +104,47 @@ VARIANCE_FLOOR_PERCENTILE: float = 10.0
 SOURCE_NSIGMA: float = 3.0
 
 
-def variance_floors(
-    variance: np.ndarray,
-    image: np.ndarray | None = None,
-    block: int | None = None,
-    floor_percentile: float = VARIANCE_FLOOR_PERCENTILE,
-    min_usable: float = 0.5,
-    source_nsigma: float = SOURCE_NSIGMA,
-) -> np.ndarray:
+#: A block must keep this fraction of its pixels to report a floor at all; a
+#: block covered by a galaxy has no sky in it to report.
+MIN_USABLE_FRACTION: float = 0.5
+
+
+def variance_floors(variance: np.ndarray, image: np.ndarray) -> np.ndarray:
     """Low envelope of the sky variance on a block grid, in reading order.
 
     Two defences against a source being read as depth, because it adds its own
-    Poisson variance and that contamination is one-sided.  First, given the
-    ``image``, pixels detected above the sky are dropped outright -- a galaxy big
+    Poisson variance and that contamination is one-sided.  First, pixels the
+    ``image`` shows to be above the sky are dropped outright -- a galaxy big
     enough to fill a block would otherwise defeat any percentile.  Second, what
     is taken within a block is a low percentile rather than a mean or median.
-
-    Blocks left with less than ``min_usable`` of their pixels are dropped rather
-    than given a floor from whatever survived; a block covered by a galaxy has no
-    sky in it to report.
     """
     v = np.asarray(variance, dtype=float)
     h, w = v.shape
-    if block is None:
-        block = max(int(round(min(h, w) * VARIANCE_BLOCK_FRACTION)), 8)
+    block = max(int(round(min(h, w) * VARIANCE_BLOCK_FRACTION)), 8)
     usable = np.isfinite(v) & (v > 0)
-    if image is not None:
-        im = np.asarray(image, dtype=float)
-        sky = float(np.median(im[usable])) if usable.any() else 0.0
-        with np.errstate(invalid="ignore"):
-            usable &= np.isfinite(im) & (im < sky + source_nsigma * np.sqrt(v))
+    im = np.asarray(image, dtype=float)
+    sky = float(np.median(im[usable])) if usable.any() else 0.0
+    with np.errstate(invalid="ignore"):
+        usable &= np.isfinite(im) & (im < sky + SOURCE_NSIGMA * np.sqrt(v))
     floors: list[float] = []
     for y0 in range(0, h - block + 1, block):
         for x0 in range(0, w - block + 1, block):
             sl = (slice(y0, y0 + block), slice(x0, x0 + block))
             good = v[sl][usable[sl]]
-            if good.size < min_usable * block * block:
+            if good.size < MIN_USABLE_FRACTION * block * block:
                 continue
-            floors.append(float(np.percentile(good, floor_percentile)))
+            floors.append(float(np.percentile(good, VARIANCE_FLOOR_PERCENTILE)))
     return np.asarray(floors, dtype=float)
 
 
-def variance_step(
-    variance: np.ndarray,
-    image: np.ndarray | None = None,
-    block: int | None = None,
-    floor_percentile: float = VARIANCE_FLOOR_PERCENTILE,
-) -> float:
+def variance_step(variance: np.ndarray, image: np.ndarray) -> float:
     """Ratio of the highest to the lowest block variance floor.
 
     1.0 is a uniform stamp; a coadd cell boundary shows as the ratio of the two
     cells' depths.  NaN when fewer than two blocks are usable, which is a lack of
     information and not a defect -- the gate treats it as a pass.
     """
-    floors = variance_floors(variance, image, block, floor_percentile)
+    floors = variance_floors(variance, image)
     if floors.size < 2 or floors.min() <= 0:
         return float("nan")
     return float(floors.max() / floors.min())
@@ -244,31 +179,31 @@ def gate(
     variance: np.ndarray,
     mask: np.ndarray,
     plane_dict: dict[str, int],
-    sky_noise: float | None = None,
-    inner_fraction: float = 0.34,
-    zero_tol: tuple[str, ...] = ZERO_TOL,
-    frac_tol: dict[str, float] | None = None,
-    inner_frac_tol: dict[str, float] | None = None,
-    max_no_data: float = 0.02,
-    max_inner_no_data: float = 0.0,
-    max_variance_step: float = MAX_VARIANCE_STEP,
-    variance_block: int | None = None,
-    variance_floor_percentile: float = VARIANCE_FLOOR_PERCENTILE,
-    cell_depth_ratio: float | None = None,
-    max_cell_depth_ratio: float = MAX_VARIANCE_STEP,
-    n_visits: int | None = None,
-    min_visits: int | None = None,
-    require_known_planes: bool = True,
+    *,
+    zero_tol: tuple[str, ...],
+    frac_tol: dict[str, float],
+    inner_frac_tol: dict[str, float],
+    inner_fraction: float,
+    max_no_data: float,
+    max_inner_no_data: float,
+    max_variance_step: float,
+    max_cell_depth_ratio: float,
+    min_visits: int | None,
+    cell_depth_ratio: float,
+    n_visits: int,
 ) -> tuple[list[str], dict[str, float]]:
     """Return ``(rejection_reasons, diagnostics)``.  Empty reasons means accept.
+
+    None of the tolerances have defaults.  They come from ``extraction.yaml``
+    via ``PatchCuts.gate_kwargs``, which is then the only place in the codebase
+    that says what a cut is; a default here would be a second answer to that
+    question, and the two would drift.
 
     Diagnostics are returned whether or not the patch passes, so the manifest
     records them for rejected patches too -- the rejection statistics are how you
     find out whether the selection function is biased against bright, dense
     galaxy centres, which is exactly the regime this project cares about.
     """
-    frac_tol = FRAC_TOL if frac_tol is None else frac_tol
-    inner_frac_tol = INNER_FRAC_TOL if inner_frac_tol is None else inner_frac_tol
     bad = set(frac_tol) & set(NEVER_REJECT)
     if bad:
         raise ValueError(f"refusing to gate on {sorted(bad)}: these mark real sources")
@@ -277,15 +212,14 @@ def gate(
     # gate matches nothing and silently passes every stamp.  Absent names are
     # meant to contribute nothing, but *all* of them being absent means the
     # mapping is wrong, not that the data is clean.
-    if require_known_planes:
-        wanted = set(zero_tol) | set(frac_tol) | set(inner_frac_tol)
-        if wanted and not (wanted & set(plane_dict)):
-            raise ValueError(
-                f"none of the gated planes {sorted(wanted)} appear in the mask "
-                f"mapping {sorted(plane_dict)}. DP2 renamed SAT->SATURATED, "
-                f"CR->COSMIC_RAY, INTRP->INTERPOLATED, EDGE->DETECTION_EDGE; a "
-                f"stale gate matches nothing and passes everything."
-            )
+    wanted = set(zero_tol) | set(frac_tol) | set(inner_frac_tol)
+    if wanted and not (wanted & set(plane_dict)):
+        raise ValueError(
+            f"none of the gated planes {sorted(wanted)} appear in the mask "
+            f"mapping {sorted(plane_dict)}. DP2 renamed SAT->SATURATED, "
+            f"CR->COSMIC_RAY, INTRP->INTERPOLATED, EDGE->DETECTION_EDGE; a "
+            f"stale gate matches nothing and passes everything."
+        )
 
     reasons: list[str] = []
     diag: dict[str, float] = {}
@@ -318,36 +252,29 @@ def gate(
     # without looking at a pixel.  It is not a replacement for the measured
     # version -- coadds are inverse-variance weighted, so cells with equal counts
     # still differ by whatever the seeing and sky did -- so both run.
-    # NaN is "not measured"; inf is a cell with no visits at all, which is the
-    # worst case and must not be excused by a finiteness check.
     # Absolute depth, as opposed to how much it varies across the stamp.  Early
     # DP2 outside the deep fields is 1-3 visits per cell, which is a different
     # sky from a deep coadd; off by default, because whether that is too shallow
     # is a judgement about the prior and not about the pixels.
-    if n_visits is not None and n_visits >= 0:
-        diag["n_visits_min"] = float(n_visits)
-        if min_visits is not None and n_visits < min_visits:
-            reasons.append(f"too_shallow:{n_visits}<{min_visits}")
+    diag["n_visits_min"] = float(n_visits)
+    if min_visits is not None and n_visits < min_visits:
+        reasons.append(f"too_shallow:{n_visits}<{min_visits}")
 
-    if cell_depth_ratio is not None and not np.isnan(cell_depth_ratio):
-        diag["cell_depth_ratio"] = float(cell_depth_ratio)
-        if cell_depth_ratio > max_cell_depth_ratio:
-            reasons.append(
-                f"cell_depth:{cell_depth_ratio:.2f}>{max_cell_depth_ratio}"
-            )
+    diag["cell_depth_ratio"] = float(cell_depth_ratio)
+    if cell_depth_ratio > max_cell_depth_ratio:
+        reasons.append(f"cell_depth:{cell_depth_ratio:.2f}>{max_cell_depth_ratio}")
 
     # Cell-based coadds step in depth at cell edges and nothing flags it; see the
     # module docstring.  Gate on it, because a stamp with a straight noise
     # boundary through it teaches the model that the sky does that.
-    step = variance_step(variance, image, variance_block, variance_floor_percentile)
+    step = variance_step(variance, image)
     diag["variance_step"] = step
     if np.isfinite(step) and step > max_variance_step:
         reasons.append(f"variance_step:{step:.2f}>{max_variance_step}")
 
-    if sky_noise is None:
-        finite = variance[~no_data]
-        sky_noise = float(np.sqrt(np.median(finite))) if finite.size else np.nan
-    diag["sky_noise"] = float(sky_noise)
+    finite = variance[~no_data]
+    diag["sky_noise"] = (float(np.sqrt(np.median(finite))) if finite.size
+                         else float("nan"))
 
     zero_bit = plane_bitmask(plane_dict, zero_tol)
     if zero_bit and np.any(mask & zero_bit):

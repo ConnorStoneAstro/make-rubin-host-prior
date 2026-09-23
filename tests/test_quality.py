@@ -9,6 +9,7 @@ is checked here is what must *not* be thrown away.
 import numpy as np
 import pytest
 
+from rubin_host_prior.selection import PatchCuts
 from rubin_host_prior.rubin.quality import (
     gate,
     plane_bitmask,
@@ -34,10 +35,19 @@ def _scene(extra=0.0, seed=0):
     return np.random.default_rng(seed).normal(0.0, SKY, (SIZE, SIZE)) + extra
 
 
+#: ``gate`` has no tolerances of its own -- extraction.yaml, via PatchCuts, is
+#: the only place that says what a cut is -- so a caller must supply all of
+#: them.  These are the shipped values; each test overrides the one it is about.
+#: ``max_variance_step`` is tightened to the old module default, which is what
+#: these tests were written against.
+BASELINE = {**PatchCuts().gate_kwargs(), "max_variance_step": 1.5,
+            "max_cell_depth_ratio": 1.5, "cell_depth_ratio": 1.0, "n_visits": 1}
+
+
 def _gate(image, mask=None, variance=None, **kw):
     mask = np.zeros((SIZE, SIZE), np.uint32) if mask is None else mask
     variance = np.full((SIZE, SIZE), SKY**2) if variance is None else variance
-    return gate(image, variance, mask, PLANES, **kw)
+    return gate(image, variance, mask, PLANES, **{**BASELINE, **kw})
 
 
 def _flagged(plane, n_px, centred=True):
@@ -67,7 +77,7 @@ def test_stale_dp1_plane_names_fail_loudly():
     nothing and passes every stamp, which is the worst possible outcome."""
     with pytest.raises(ValueError, match="renamed"):
         gate(_scene(), np.full((SIZE, SIZE), SKY**2),
-             np.zeros((SIZE, SIZE), np.uint32), {"SAT": 0, "CR": 1})
+             np.zeros((SIZE, SIZE), np.uint32), {"SAT": 0, "CR": 1}, **BASELINE)
 
 
 def test_gating_on_a_plane_that_marks_real_sources_is_refused():
@@ -169,6 +179,14 @@ def _var(step=1.0, frac=0.5, seed=0):
     return v * np.random.default_rng(seed).lognormal(0.0, 0.05, v.shape)
 
 
+def _step(variance, image=None):
+    """``variance_step`` needs the image: the source masking is not optional,
+    because a galaxy wider than a block defeats any percentile.  Flat zeros
+    stand in where the test is about the variance plane alone."""
+    return variance_step(variance,
+                         np.zeros_like(variance) if image is None else image)
+
+
 def _galaxy(sigma_px, peak_over_sky=200, gain=0.1, seed=0):
     """An image and the variance plane that goes with it, source Poisson too."""
     rng = np.random.default_rng(seed)
@@ -180,18 +198,18 @@ def _galaxy(sigma_px, peak_over_sky=200, gain=0.1, seed=0):
 
 @pytest.mark.parametrize("step", [1.0, 1.3, 2.0, 4.0])
 def test_a_depth_step_is_measured_at_its_true_ratio(step):
-    assert variance_step(_var(step)) == pytest.approx(step, rel=0.15, abs=0.1)
+    assert _step(_var(step)) == pytest.approx(step, rel=0.15, abs=0.1)
 
 
 def test_a_step_is_found_wherever_it_falls_and_survives_a_galaxy():
     """The blocks are not aligned to cells, so a boundary anywhere must show --
     and masking the source must not mask the evidence."""
     for frac in (0.2, 0.35, 0.5, 0.75):
-        assert variance_step(_var(2.0, frac=frac)) > 1.7
+        assert _step(_var(2.0, frac=frac)) > 1.7
     image, variance = _galaxy(10.0)
     variance[:, SIZE // 2:] *= 2.0
     image[:, SIZE // 2:] *= np.sqrt(2.0)
-    assert variance_step(variance, image) == pytest.approx(2.0, rel=0.2)
+    assert _step(variance, image) == pytest.approx(2.0, rel=0.2)
 
 
 @pytest.mark.parametrize("sigma_px", [4.2, 10.0, 20.0])
@@ -201,7 +219,7 @@ def test_a_bright_galaxy_does_not_fake_a_step(sigma_px):
     ones most wanted, would be rejected first.  sigma = 20 px is wider than a
     whole block, which no percentile survives; it takes the image."""
     image, variance = _galaxy(sigma_px)
-    assert variance_step(variance, image) < 1.15
+    assert _step(variance, image) < 1.15
     assert not any(r.startswith("variance_step")
                    for r in _gate(image, variance=variance)[0])
 
@@ -209,15 +227,15 @@ def test_a_bright_galaxy_does_not_fake_a_step(sigma_px):
 def test_no_data_regions_do_not_read_as_depth():
     v = _var(1.0)
     v[:40, :40] = np.inf
-    assert variance_step(v) == pytest.approx(1.0, abs=0.1)
+    assert _step(v) == pytest.approx(1.0, abs=0.1)
 
 
 def test_absence_of_information_is_a_pass_not_a_rejection():
     small = np.full((10, 10), SKY**2)
-    assert np.isnan(variance_step(small))
+    assert np.isnan(_step(small))
     assert not any(r.startswith("variance_step") for r in
                    gate(np.zeros((10, 10)), small,
-                        np.zeros((10, 10), np.uint32), PLANES)[0])
+                        np.zeros((10, 10), np.uint32), PLANES, **BASELINE)[0])
 
 
 def test_the_measured_step_gates_and_is_always_recorded():
@@ -241,9 +259,8 @@ def test_the_exact_depth_ratio_gates_without_looking_at_pixels():
     # inf is a cell with no visits at all: the worst case, not an excuse.
     assert any(r.startswith("cell_depth")
                for r in _gate(_scene(), cell_depth_ratio=np.inf)[0])
-    # NaN and None are "not measured".
-    _, diag = _gate(_scene(), cell_depth_ratio=None)
-    assert "cell_depth_ratio" not in diag
+    # Recorded either way, so the threshold can be retuned from the manifest.
+    assert _gate(_scene(), cell_depth_ratio=1.4)[1]["cell_depth_ratio"] == 1.4
 
 
 def test_the_two_depth_measures_are_independent():
@@ -264,6 +281,3 @@ def test_absolute_depth_is_recorded_and_gated_only_on_request():
     assert any(r.startswith("too_shallow")
                for r in _gate(_scene(), n_visits=2, min_visits=10)[0])
     assert not _gate(_scene(), n_visits=30, min_visits=10)[0]
-    # -1 is "provenance unavailable"; it must not read as a shallow stamp.
-    _, diag = _gate(_scene(), n_visits=-1, min_visits=10)
-    assert "n_visits_min" not in diag

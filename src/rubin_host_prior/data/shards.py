@@ -42,12 +42,6 @@ META_DTYPES: dict[str, str] = {
     "host_id": "i8",
     "tract": "i4",
     "patch": "i4",
-    "n_neighbours": "i2",
-    "neighbour_flux_max": "f4",
-    # Separation to the nearest catalogue object other than the host itself,
-    # split by extendedness.  NaN where there is none inside the search radius.
-    "nearest_galaxy_arcsec": "f4",
-    "nearest_star_arcsec": "f4",
     # Depth.  Cells are coadded from different input visits, so a stamp over
     # 150 native px straddles a boundary between two of them; exposure times are
     # equal, so the ratio of visit counts is the depth step exactly, and
@@ -68,11 +62,12 @@ IMAGE_KEYS = ("image",)
 IMAGE_DTYPES = {"image": "f4"}
 
 #: Bumped whenever the shard layout or the meaning of its metadata changes.
-#: Shards written before this existed carried variance, mask and PSF arrays and
-#: a different metadata set; they still *open* -- missing metadata columns fill
-#: with -1 -- which is precisely the problem, because a stale set then trains or
-#: plots without complaint.  ``ShardSet.open`` refuses them instead.
-SHARD_SCHEMA = 2
+#: Older shards still *open* -- a missing metadata column fills with -1 -- which
+#: is precisely the problem, because a stale set then trains or plots without
+#: complaint.  ``ShardSet.open`` refuses them instead.  Schema 1 carried
+#: variance, mask and PSF arrays; schema 2 added four neighbour columns that
+#: nothing trained on and that cost an object-table read per tract.
+SHARD_SCHEMA = 3
 
 
 class ShardWriter:
@@ -191,11 +186,9 @@ class ShardSet:
                 if found != SHARD_SCHEMA:
                     raise ValueError(
                         f"{p} is shard schema {found}, this code writes and "
-                        f"reads {SHARD_SCHEMA}. Schema 1 stored variance, mask "
-                        f"and PSF arrays alongside a different metadata set; it "
-                        f"would open here with the new columns silently filled "
-                        f"with -1. Re-extract, or point at the newer output "
-                        f"directory."
+                        f"reads {SHARD_SCHEMA}. An older shard opens here with "
+                        f"the metadata it lacks silently filled with -1. "
+                        f"Re-extract, or point at the newer output directory."
                     )
                 if attrs is None:
                     attrs = a

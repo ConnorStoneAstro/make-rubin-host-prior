@@ -108,7 +108,7 @@ def test_hosts_figure_uses_the_catalogue_when_present(shards, extracted, tmp_pat
     # and the shard-only panels are there either way
     for fig in (with_cat, without):
         t = {ax.get_title() for ax in fig.axes}
-        assert {"patches per band", "local sky noise", "nearest galaxy"} <= t
+        assert {"patches per band", "local sky noise", "variance step"} <= t
     assert len(with_cat.axes) > len(without.axes)
     plt.close(with_cat)
     plt.close(without)
@@ -121,7 +121,7 @@ def test_hosts_figure_survives_an_all_nan_column(shards, tmp_path):
 
     faked = copy.copy(shards)
     faked.meta = dict(shards.meta)
-    faked.meta["nearest_star_arcsec"] = np.full(len(shards), np.nan)
+    faked.meta["variance_step"] = np.full(len(shards), np.nan)
     fig, _ = plots.plot_hosts(faked, None, out=tmp_path)
     titles = [ax.get_title() for ax in fig.axes]
     assert any("no data" in t for t in titles)
@@ -167,18 +167,6 @@ def test_make_all_writes_the_full_set(shards, dataset, extracted, tmp_path):
 def test_make_all_without_a_dataset_skips_the_loader_figures(shards, tmp_path):
     written = plots.make_all(shards, out_dir=tmp_path, n_cutouts=4)
     assert {p.name for p in written} == {"cutouts.png", "hosts.png"}
-
-
-def test_distortion_uses_the_moment_convention():
-    """e = (Ixx-Iyy)/(Ixx+Iyy) is the distortion, (1-q^2)/(1+q^2), which differs
-    from the (1-q)/(1+q) shear convention by about 2x at modest ellipticity.
-    Mislabelling the axis would quietly misinform."""
-    for q in (1.0, 0.8, 0.5, 0.2):
-        got = float(plots._distortion(np.array(1.0), np.array(q**2), np.array(0.0)))
-        assert got == pytest.approx((1 - q**2) / (1 + q**2))
-    assert plots._distortion(np.array(1.0), np.array(0.64), np.array(0.0)) == (
-        pytest.approx(0.2195, abs=1e-3)
-    )
 
 
 def test_package_imports_without_matplotlib(monkeypatch):

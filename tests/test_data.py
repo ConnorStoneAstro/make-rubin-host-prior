@@ -697,9 +697,10 @@ def test_sky_scatter_matches_the_prediction(shard_dir):
 
 
 def test_shards_from_an_older_schema_are_refused(shard_dir, tmp_path):
-    """Schema 1 stored variance, mask and PSF arrays and a different metadata
-    set.  It still *opens* -- missing columns fill with -1 -- which is exactly
-    the problem, because a stale set then trains or plots without complaint."""
+    """An older shard still *opens* -- the metadata it lacks fills with -1 --
+    which is exactly the problem, because a stale set then trains or plots
+    without complaint.  Schema 1 stored variance, mask and PSF arrays; schema 2
+    added four neighbour columns nothing trained on."""
     import shutil
 
     import h5py
@@ -713,7 +714,7 @@ def test_shards_from_an_older_schema_are_refused(shard_dir, tmp_path):
             del f.attrs["schema"]
     with pytest.raises(ValueError, match="shard schema 1"):
         ShardSet.from_dir(copy)
-    assert SHARD_SCHEMA == 2
+    assert SHARD_SCHEMA > 1
 
 
 def test_a_shard_missing_a_metadata_column_is_refused(shard_dir, tmp_path):

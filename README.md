@@ -40,15 +40,20 @@ python -m pytest            # ~2 min, no cluster, no LSST stack
 ### 1. Extract patches (on NERSC, inside the stack)
 
 ```bash
-python scripts/extract_dp2_patches.py --out data/ecdfs --bands r i --n-hosts 2000 -v
+python scripts/extract_dp2_patches.py --config extraction.yaml
 ```
 
-Selects extended objects from the per-tract `object` table, finds covering
-`deep_coadd` patches, cuts a **jittered** stamp near each host, runs the artefact
-gate, and writes sharded HDF5 plus a manifest. A host yields at most one patch
-per band, so `--n-hosts` sets the training-set size fairly directly.
+One ADQL query against `dp2.Object` returns the host list; the list is shuffled
+and **walked host by host**, and each host is turned into up to one stamp per
+band, centred on it, read as a bbox out of its own patch. The artefact gate runs
+on each, and what survives is written as sharded HDF5 plus a manifest.
 
-Read `data/ecdfs/summary.json` before trusting the output. It carries
+Everything the run does comes from `extraction.yaml`, which is checked in. The
+script has no defaults of its own, so there is no way for a command-line flag and
+a config key to disagree; `--repo` and `--collection` name the butler, and that
+is all.
+
+Read `<out>/summary.json` before trusting the output. It carries
 `rejection_counts`, and those statistics are the only way to see whether the
 selection function is biased — if bright, dense galaxy centres are being
 rejected, the training set is skewed against exactly the regime this project
@@ -70,19 +75,19 @@ block keeps the two words apart:
 
 | key | means |
 |---|---|
-| `host_candidates_in_catalogue` | rows that passed the host cuts |
-| `hosts_selected` | drawn from those, across all rounds |
-| `hosts_that_reached_a_patch` | had a stamp attempted somewhere |
-| `hosts_whose_stamp_fitted_nowhere` | the rest: too near a coverage edge |
+| `host_candidates_in_catalogue` | rows the ADQL returned, after the flags and the dedupe |
+| `hosts_tried` | how far down the shuffled list the walk got |
+| `hosts_with_no_coadd_for_their_patch` | of those, ones the repo has no `deep_coadd` for |
+| `hosts_too_near_the_edge_of_coverage` | of those, ones whose stamp fitted inside no built cell grid |
 | `stamps_attempted` | rows in the manifest |
 | `stamps_accepted` / `stamps_rejected` | written / gated away |
-| `coadd_patches_read` | refs swept |
-| `patches_holding_a_host` | of those, the ones a host landed in |
+| `stamps_requested` | `run.n_stamps` from the config |
+| `shards_written` | HDF5 files under `<out>/shards` |
 
 `rejection_counts` counts **every** reason a stamp failed, so it sums to more
-than `stamps_rejected`; `first_rejection_counts` is one reason each. `seconds`
-says where the wall time went. The same thing is printed in prose at the end of
-a run.
+than `stamps_rejected`. `seconds` says where the wall time went, and
+`visits_per_cell` how deep the field was. The same thing is printed in prose at
+the end of a run.
 
 ### 2. Look at the diagnostic figures
 
@@ -101,15 +106,17 @@ In rough order of how often they catch something:
 | `transform.png` | native flux → pooled → log space for a few patches, plus the pixel-value histogram. The sky peak must sit on `x = log(log 2) ≈ −0.37` inside the predicted scatter band, with sources clear of it. If it doesn't, the softening scales are wrong. |
 | `training_batch.png` | exactly what the network receives: pooled, log-space, augmented, at the training size(s), on a shared colour scale so the spread between patches is visible. |
 | `cutouts.png` | raw stamps as `asinh(flux / sky noise)` — a stretch in σ units with a pinned low end, so bands of very different depth are directly comparable. |
-| `hosts.png` | the selected population: size, distortion, magnitude, blendedness, band counts, sky noise, PSF size, nearest galaxy/star, neighbour counts, and the extraction jitter. |
+| `hosts.png` | the selected population: size, distortion, magnitude, surface brightness, Sérsic index, blendedness, band counts, sky noise and depth. |
 
-The host size/magnitude/distortion panels come from `hosts.parquet`, which
-extraction writes alongside the shards — those quantities are known only at
-selection time and are not carried in the shard metadata.
+The host panels come from `hosts.parquet`, which extraction writes alongside the
+shards — those quantities are known only at selection time and are not carried in
+the shard metadata.
 
-Note the distortion convention: `|e| = (Ixx−Iyy, 2Ixy)/(Ixx+Iyy)`, which is
-`(1−q²)/(1+q²)`, roughly twice the `(1−q)/(1+q)` shear convention at modest
-ellipticity.
+Size and shape both come from the multiband Sérsic fit, the same fit the size cut
+is made on, rather than from per-band adaptive moments: a second, PSF-convolved
+answer to the same question is a thing to have to reconcile. Note the distortion
+convention: `|e| = (1−q²)/(1+q²)` with `q = b/a`, roughly twice the `(1−q)/(1+q)`
+shear convention at modest ellipticity.
 
 ### 3. Derive the config from the data
 
@@ -139,7 +146,7 @@ lag 1 to exclude it, because a naive 1/e crossing on the raw profile returns
 The softening scale is **measured per band**, so a band the shards contain no
 patches in gets no scale — inventing one would put its turnover wherever the
 guess landed. The script prints the patch count per band and says so when one is
-empty; a band missing entirely usually means the run hit its `--n-patches` target
+empty; a band missing entirely usually means the run hit its `n_stamps` target
 before reaching it, or that no coadds exist for those tracts.
 
 The transform is nonetheless **always indexed over the whole of `BANDS`**, with
@@ -454,8 +461,9 @@ a scene with a bright neighbour is exactly the regime this project models, so a
 blanket cut would reproduce the selection bias the rejection statistics exist to
 expose. A small fraction is kept away from the centre, zero at the centre where
 the transient goes, and the fraction is recorded either way. Set
-`FRAC_TOL["SATURATED"] = 0.0` to follow the guidance literally. `NO_DATA` *is*
-excluded outright, as are `DETECTION_EDGE` pixels.
+`patches.max_plane_fraction.SATURATED: 0.0` in `extraction.yaml` to follow the
+guidance literally. `DETECTION_EDGE` pixels *are* excluded outright; `NO_DATA` is
+measured as an inf-variance fraction instead — see below.
 
 **`INEXACT_PSF` and `REJECTED` are not quality cuts.** They cover a large
 fraction of the DP2 coadd, so gating on them keeps almost nothing. They are
@@ -480,24 +488,31 @@ galaxies and the background is recoverable via `apply_background`. The images ar
 taken **as delivered**, without restoration, and every shard records
 `background_restored=0` so a set made the other way is distinguishable.
 
-### `n_hosts` is not the size of the training set
+### `run.n_stamps` counts cutouts, not hosts
 
 A host yields at most one cutout per band, and the gate rejects a share of those,
-so `--n-hosts 128` produces nowhere near 128 cutouts — `n_accepted` in the
-summary is the number that actually got written, and the first thing to read
-beside it is `rejection_counts`, which says where the rest went. A stamp can fail several
-gates at once, so those counts sum to more than `n_rejected`; `first_rejection_counts`
-gives the first reason only, which is what the figure and the summary used to
-disagree about. `diagnostic_percentiles` gives the distribution of every gated
-quantity over every attempt, which is what a threshold should be chosen from.
+so the two units differ by nearly a factor of six. `n_stamps` is the one that
+sizes the training set: the walk continues down the shuffled catalogue until it
+has that many accepted cutouts, or until the catalogue runs out. The check
+happens between hosts, so a run can overshoot by up to one host's worth of bands
+rather than leaving its last host with an arbitrary subset of them.
+
+Topping up is not free of consequences. Whatever the gate rejects, it rejects
+preferentially, so a target that takes most of the catalogue to fill is drawn
+from a different population than one filled in the first hundred hosts.
+`rejection_counts` says where the rest went; a stamp can fail several gates at
+once, so those counts sum to more than `stamps_rejected`.
+`diagnostic_percentiles` gives the distribution of every gated quantity over
+every attempt, which is what a threshold should be chosen from.
 
 Hosts are drawn from **the whole DP2 footprint** by default, not from a disc
-around a field centre. With a 3″ size cut that is the difference between a
+around a field centre. With a selective size cut that is the difference between a
 workable sample and almost nothing: big galaxies are rare per square degree, so
 the way to get more of them is more sky, not more draws from the same 0.3°.
-`--radius-deg` still restricts to a field if you want one.
+`sky.radius_deg` still restricts to a field if you want one.
 
-**The host cuts are sent to TAP** (`--host-source tap`, the default). They are a
+**The host cuts are sent to TAP**, and that is the only way the host list is
+built. They are a
 selection, and a selection is what a query service is for: the footprint is ~10⁹
 rows and the survivors ~10⁴, so filtering where the catalogue already lives is
 the difference between moving the survivors and moving the catalogue. One ADQL
@@ -508,13 +523,16 @@ symmetric reason. TAP is asked for a selection whose result is tiny; the cutout
 service would be asked to ship pixels that are already on local disk. The right
 question is never "remote or local" but "is the answer smaller than the input".
 
-Only the numeric cuts go into the WHERE clause. The boolean Sersic failure flags
-are fetched and applied locally, because how a boolean compares in ADQL is
-backend-specific and a wrong guess silently returns nothing; the point-source
-cross-check and the cross-tract dedupe are not expressible there either. There is
-no `ORDER BY` — the tutorial is explicit that sorting burdens a shared service,
-and the stratified draw happens locally regardless. The job is submitted async
-and deleted afterwards, including on failure.
+The WHERE clause is where the host cuts **are** applied. They are not applied
+again after the rows arrive: re-running a cut the service already made is a
+second answer to the same question, and two answers drift. Three things are left
+for the client, because a query cannot do them — the boolean Sérsic failure flags
+and the saturated/interpolated core flags, since how a boolean compares in ADQL
+is backend-specific and a wrong guess silently returns nothing; and the
+cross-tract dedupe, which needs the whole pool at once. There is no `ORDER BY` —
+the tutorial is explicit that sorting burdens a shared service, and the draw
+happens locally regardless. The job is submitted async and deleted afterwards,
+including on failure.
 
 **You do not need to be on the RSP.** TAP is an IVOA standard and the Rubin
 endpoint is an ordinary TAP service behind a bearer token, so `pyvo` talks to it
@@ -541,18 +559,22 @@ refuses. The token value is never printed, only its type prefix. `tap_client`
 runs the scope check itself before submitting anything, so the failure arrives
 with a reason attached rather than as a 401 from inside a job.
 
-TAP needs network, which a batch node may not have. That is what `--host-cache`
-is for: query once where there is a network, cache, and extraction then runs with
-no service at all. `--limit-hosts` puts a `TOP N` on the query.
+TAP needs network, which a batch node may not have. That is what
+`catalogue.cache` is for: query once where there is a network, and extraction
+then runs from the parquet with no service at all. `catalogue.limit_hosts` puts a
+`TOP N` on the query.
 
-**`--host-source butler`** is the offline route: scan the object tables through
-the repo instead, one tract at a time, applying the cuts before anything is
-concatenated so what is held is the host list and not the footprint. It reads far
-more but needs nothing beyond the repo. It is not a silent fallback — ask for it.
-`--limit-tracts` bounds a test run.
+A cache has the cuts **baked into it**, so the ADQL that produced one is written
+beside it as `<cache>.sql` and compared against what the current config asks for.
+Reusing a cache after editing `extraction.yaml` is a cut that looks applied and
+is not — the same failure the config file exists to prevent — so a mismatch stops
+the run and prints both queries. Delete the two files to re-query.
 
-Sampling deliberately does *not* happen during either scan: a stratified draw has
-to see the whole pool or it stratifies within tracts instead of across them.
+There used to be a second route, scanning the per-tract `object` tables through
+the butler, for a node with no network at all. It is gone. Two ways to build the
+same list meant two column lists, two places the cuts were applied, and a
+question about which one a given `hosts.parquet` came from; the cache covers the
+offline case at a fraction of the reading.
 
 TAP results are unmasked before use. A VOTable NULL comes back masked, and
 `np.asarray` on a masked column hands back the raw buffer with no hint that part
@@ -561,43 +583,47 @@ integer like `patch` it is whatever was in memory, which would file a host under
 a patch it is nowhere near. Nulls in `patch`/`tract` are logged and set to -1 so
 they match nothing; rows with no sky position are dropped with a count.
 
-A position that will not project is not fatal either. It means "not in this
-patch" — either the row had no coordinates or the patch does not cover that piece
-of sky — so it is a rejection, not a crash. If **`PATCH_CHECK_AFTER` patches in a
-row hold none** of the hosts the catalogue assigned to them, the run says so and
-prints where the hosts actually projected against the patch's pixel span, because
-that pattern means the `Object.patch` column and the `deep_coadd` dataId `patch`
-are not the same numbering rather than a run of unlucky edges.
-`n_patches_with_hosts` / `n_patches_without_hosts` in the summary is the same
-thing after the fact.
+A host whose stamp does not fit inside the built cells of its patch is a
+rejection, not a crash: it is too near the edge of coverage, which is a genuine
+data condition on early DP2 and part of the selection function. But if **none of
+the first `PATCH_CHECK_AFTER` hosts** produces a stamp at all, the run stops and
+says so, because that pattern means the `Object.patch` column and the
+`deep_coadd` dataId `patch` are not the same numbering — or `native_size` is too
+large to fit inside a patch anywhere — rather than a run of unlucky edges.
+Walking the whole catalogue to discover that and then writing an empty set is the
+outcome worth avoiding.
 
-Per-tract queries are constrained with `data_id=`, not with a `where` string.
-The expression language bit once and silently: in `where="tract = :tract"` the
-bind key **shadows the dimension of the same name**, so it resolved as
+Coadd queries are constrained with `data_id=`, not with a `where` string. The
+expression language bit once and silently: in `where="tract = :tract"` the bind
+key **shadows the dimension of the same name**, so it resolved as
 `tract = tract` — true for every row. The query returned the whole repo,
 truncated at the default 20000, and since patch indices repeat across tracts the
 client-side patch filter let refs from anywhere through. Hosts were matched
 against same-numbered patches in other tracts and projected ~200 000 pixels away.
-Refs are now filtered on tract client-side as well, and a ref from the wrong
-tract is reported rather than dropped quietly.
+A ref whose data id is not the one asked for now ends the run.
 
-The sweep is then **tract-major**, which is what makes the footprint affordable.
-The object table is per tract, so the neighbour index is built once per tract and
-thrown away; and within a tract only the patches that actually hold a host are
-asked for, since under a cut this selective a patch holds one or two hosts and
-sweeping every patch that overlaps a field loads a great many that hold none.
-Candidates for a patch are the hosts the catalogue assigned to it — testing every
-host against every patch is quadratic and unaffordable once the list spans the
-sky.
+### The walk is host-major
+
+One host, one position, one cutout per band. The loop used to be organised by
+patch — group the hosts by the patch the catalogue assigned them, sweep tract by
+tract, slice every host that fell inside each patch from one read — because that
+amortises a whole-patch read across the hosts in it. Once the pixels come from a
+bbox read there is nothing to amortise, and with a selective size cut a patch
+holds one or two hosts anyway.
+
+What that structure cost was everything built to support it: the tract sweep, the
+`by_patch` grouping, the accepted-`(host, band)` set guarding against tract
+overlap, the round-and-top-up machinery, and the patch-yield diagnostics. A host
+is now visited once, by position, so it **cannot** be extracted twice and none of
+that bookkeeping has anything to guard.
 
 **Only the stamp's pixels are read.** `butler.get(ref, parameters={'bbox': box})`
 returns a `CellCoadd` of just that region without loading the patch (DP2 tutorial
-104.5). A patch is ~4100 px square and a stamp is 416, so that is about two
-orders of magnitude less I/O — and with a 3″ cut the hosts are thin enough that
-there is rarely a second stamp in a patch to amortise a whole read against.
+104.5). A patch is ~4100 px square and a stamp is 512, so that is about two
+orders of magnitude less I/O.
 
 Everything else about a patch comes from **component reads**, which move no
-pixels either: `sky_projection`, `bbox`, `psf` and `provenance`.
+pixels either: `sky_projection`, `psf` (for the cell grid) and `provenance`.
 
 `grid` and `bounds` are *not* among them, which cost a run its whole optimisation
 once: `CellCoadd.grid` and `CellCoadd.bounds` are Python properties reading
@@ -606,17 +632,27 @@ them fails and forces a whole-patch read for something the `psf` component
 already carries. They are taken from the PSF object instead — `psf.bounds` is the
 `CellGridBounds`, and `psf.bounds.grid` the `CellGrid`.
 
-If `provenance` turns out not to be served either, per-cell visit counts go away
-and depth boundaries fall to the measured `variance_step`, with a warning —
-rather than silently paying ~100× the I/O for a covariate. `--min-visits` is the
-exception: it is asked for explicitly, so it loads whole patches to honour it.
+Nothing falls back. A component the repo will not serve ends the run, naming the
+role and the component it was asked for. The alternative — read the whole patch
+and carry on — is ~100× the pixel I/O for an identical result, and it ran that
+way undetected for several runs before a warning caught it.
 
-Both paths fall back. If components are refused the patch is read whole and its
-attributes used — and the run says **which** component forced that, once, because
-silently taking ~100× the pixel I/O is exactly the kind of thing that should be
-visible. If a bbox read is refused, or comes back missing a plane — checked on
-the spot, since an absent `variance` would otherwise surface as an
-`AttributeError` hours in — the run switches to whole patches and says so.
+### Why not the cutout service
+
+DP2 tutorial 103.6 describes exactly the shape this walk has: name a position,
+get back a cutout with the metadata a `deep_coadd` carries. It is the *SODA*
+service, though — a remote HTTP endpoint at `data.lsst.cloud`, reached through
+`lsst.rsp.RSPDiscovery` and `get_pyvo_auth`, neither of which exists off the
+platform. Using it from a batch node would mean reimplementing both, then paying
+an ObsCore lookup, a datalink resolution (15-minute expiry) and a SODA request
+for every host in every band, with every pixel crossing the WAN.
+
+`butler.get(ref, parameters={'bbox': box})` is the same request against pixels
+that are already on local disk, and it returns the same `CellCoadd`, provenance
+and cell grid included. The rule that settles it is not "remote or local" but
+*is the answer smaller than the input*: TAP is asked for a selection out of 10⁹
+rows and hands back 10⁴, so it belongs where the catalogue is; the cutout service
+would be asked to ship bytes that are already here.
 
 **A stamp is tested against the cell grid, not the image.** A patch at the edge
 of coverage has cells that were never built: its image `bbox` is the full patch
@@ -624,25 +660,13 @@ while `bounds.bbox` covers only the populated part, and slicing outside that
 raises rather than returning empty pixels. `bounds` is the right predicate and
 excludes individually missing cells too. Because the corner test cannot see a
 hole in the *middle* of a stamp, the cells the stamp covers are checked against
-`bounds.missing` separately. And whatever else goes wrong cutting one stamp is
-recorded as `cut_failed` and the run continues — one stamp is one stamp.
+`bounds.missing` separately. A host that fails either test is rejected as
+`off_the_grid`, and the rejection is counted: being too near the edge of coverage
+is a real property of early DP2 and part of the selection function.
 
-`--n-patches` is the number to ask for when you want a training set of a given
-size. Extraction then works towards it: draw a batch of hosts, sweep every coadd
-patch, and if it is still short draw another batch — sized from the yield it has
-actually observed, since that depends on the field, the band set and how tight
-the gate is, none of which are known in advance — excluding hosts already tried.
-It stops when the target is met, the catalogue runs out, or `--max-rounds` is
-reached, and says which. `--max-patches` is the older hard stop and never tops
-up.
-
-Two consequences worth knowing. The patch list is **shuffled**, because the sweep
-stops the moment the target is reached and the butler returns patches ordered by
-band: left in order, a run that stopped early would be entirely g-band and
-entirely one corner of the field. And topping up is not free — whatever the gate
-rejects, it rejects preferentially, so a set filled over several rounds is drawn
-deeper into the catalogue than one filled by the first round. Read
-`rejection_counts` before deciding that is acceptable.
+The host list is **shuffled** before the walk, because the walk stops the moment
+`n_stamps` is reached — in catalogue order a run that stopped early would be
+drawn entirely from one corner of the footprint.
 
 ### One file describes the whole run
 
@@ -659,10 +683,13 @@ flag and a config key cannot disagree.
 
 The cuts used to be spread across defaults on `select_hosts`, defaults on
 `host_adql`, module constants in `rubin.quality` and command-line flags that
-sometimes overrode one and not the other. A key the file does not recognise — or
-a whole mistyped section — is an error rather than a silently ignored line, since
-a cut that looks applied and is not is the worst of the three outcomes. YAML
-rather than JSON so the reasoning can sit next to the numbers.
+sometimes overrode one and not the other. They are now stated once. `gate` has no
+defaults for any of its tolerances — every one is a required argument, filled by
+`PatchCuts.gate_kwargs()` — so there is no second answer for the config to drift
+away from, and a test asserts that the two signatures match. A key the file does
+not recognise, or a whole mistyped section, is an error rather than a silently
+ignored line, since a cut that looks applied and is not is the worst of the three
+outcomes. YAML rather than JSON so the reasoning can sit next to the numbers.
 
 Extraction prints `describe()` before it runs: the faint limit, the surface
 brightness limit, and **which of the two binds at each size**. Size and
@@ -671,7 +698,7 @@ limit and a surface-brightness limit can quietly exclude each other over exactly
 the range you care about, and the answer to "why did this find nothing" is
 usually in those four lines.
 
-### Visibility is magnitude; extent is size
+### Visibility is magnitude; extent is one size measurement
 
 `max_mag` is the primary host cut. Surface brightness decides whether a *fit* is
 real, but it is a poor proxy for "I can see it": a tight `max_mu_e` selects
@@ -680,29 +707,53 @@ structure wants — it favours exactly the compact objects that look like point
 sources. So `max_mu_e` is left loose, as a bound on runaway fits rather than a
 selector, and total flux does the work.
 
-Extent is `min_reff_arcsec` (intrinsic, from the multiband Sersic fit) together
-with `min_deconvolved_px`, which is the same claim made against the image:
-`T² = ((ixx+iyy) − (ixxPSF+iyyPSF))/2`, exactly zero for a point source at any
-seeing.
+That distinction was learned the hard way. Nothing else in the selection requires
+the object to be *visible*: with a 3″ half-light radius the old 360 nJy floor
+admitted objects at μ_e = 29.4 mag/arcsec², some 2.4 mag/arcsec² fainter than one
+sigma of sky per square arcsecond in r. At that signal-to-noise the multiband
+Sérsic fit is degenerate along (n, R_e, flux) and walks off to a large radius
+around an invisible envelope while the real light stays in a few pixels. Those
+rows pass every size cut and arrive as point-like blobs — which is exactly what
+the cutouts figure was showing. The surface-brightness bound is written
+server-side as `flux >= K · reff_major · reff_minor`, multiplication only, since
+`LOG10` and `POWER` are not guaranteed across ADQL dialects and a clause the
+service silently declines to apply is worse than one it refuses.
+
+**Extent is `min_reff_arcsec` and nothing else** — the half-light major axis of
+the multiband Sérsic fit, in arcsec, measured before PSF convolution. There used
+to be a second, non-parametric size cut alongside it, built from the per-band HSM
+adaptive moments with the PSF removed in quadrature,
+`T² = ((ixx+iyy) − (ixxPSF+iyyPSF))/2`. It was correct, and it is gone: two
+measurements of the same quantity means carrying the question of which one to
+believe, and five extra columns per band to answer it with. The Sérsic fit is one
+morphology fit to all six bands at once and is the better of the two.
+
+That cut is also the reason to say what a *wrong* size cut looks like. Adaptive
+moments are flux-weighted toward the core and run 1.4× smaller than R_e for an
+exponential and 4–9× smaller for a de Vaucouleurs, so a sample correctly cut at
+R_e ≥ 3″ plotted at 0.7–2.2″ in the old trace-radius panel. Seeing sizes below
+the cut is what a *working* cut looks like in the wrong units. And an absolute
+threshold on the raw moments meant nothing at all: a star's trace radius is
+whatever the seeing was — 2.0 px at median DP2 seeing, against a `min_trace_px`
+of 1.75, which therefore rejected nothing.
+
+**The bright end is a saturation flag, not a flux ceiling.** An early 3e6 nJy
+ceiling (r = 15.2) sat 1.5–3 mag *below* where cores actually saturate, so it was
+blocking precisely the nearly-saturating galaxies wanted. `min_mag` is now
+nominal and `{band}_pixelFlags_saturatedCenter` does the work, which is literally
+"this core is not saturated". `interpolatedCenter` goes with it: an interpolated
+core is synthetic structure exactly where the transient goes.
 
 ### Host selection on DP2
 
 The DP2 Object table differs from DP1 in ways that break code silently rather
-than loudly, so `select_hosts` is built to fail loudly instead:
+than loudly:
 
 - **There is no band-independent `shape_xx`.** Second moments are per band
-  (`{band}_ixx`, `{band}_iyy`, `{band}_ixy`, in pixel²). `host_trace_radius_px`
-  raises if they are absent rather than returning NaN, because every caller uses
-  it to avoid a sample dominated by the smallest, faintest galaxies.
-- **TAP's `dp2.Object` and the butler's `object` parquet are not the same table.**
-TAP serves derived columns the pipeline never wrote — `{band}_cModelMag` among
-them — and asking the butler for one fails the whole read with a formatter
-error. The SDM schema describes the TAP view. So the host selection (TAP) and
-the neighbour index (butler) get different column lists, each chosen for what
-its source has and its caller needs, and a butler read that fails on a column
-says which of the two tables it is talking to.
-
-**All six bands carry photometry and shapes.** `u` through `y` all have
+  (`{band}_ixx`, `{band}_iyy`, `{band}_ixy`, in pixel²), and they are measured on
+  the PSF-convolved coadd. None of them are read any more — see above — but a
+  DP1-era column name would fail the whole query rather than one column.
+- **All six bands carry photometry and shapes.** `u` through `y` all have
   `_cModelFlux`, `_ixx` and `_sersicFlux`. An earlier version of this file said
   only `ugri` did; that came from reading the *rendered* schema page in excerpts,
   which is long enough to truncate mid-table and give a confidently wrong answer.
@@ -710,82 +761,22 @@ says which of the two tables it is talking to.
   (`python/lsst/sdm/schemas/drp_base.yaml`), which is small enough to grep and
   carries the units as `ivoa:unit`.
 - **There are no `detect_*` columns at all**, so `detect_isPrimary` is not
-  available for dropping duplicates — and tracts and patches overlap, so a
-  source in an overlap region appears twice, across two tracts under two
-  *different* `objectId`s. `dedupe_hosts` therefore collapses near coincidences
-  on the sky (0.5″) as well as repeated ids.
+  available for dropping duplicates — and tracts overlap, so a source in an
+  overlap region appears twice, under two *different* `objectId`s. `dedupe_hosts`
+  therefore collapses near coincidences on the sky (0.5″) as well as repeated
+  ids. This is no longer about patches: a host is visited once, by position, so
+  it cannot be extracted twice by the walk. It is about the catalogue listing one
+  galaxy under two rows, which the walk would take at face value.
+- **TAP's `dp2.Object` view and the butler's `object` parquet are not the same
+  table.** TAP serves derived columns the pipeline never wrote —
+  `{band}_cModelMag` among them — and asking the butler for one fails the whole
+  read with a formatter error. Only the TAP view is read now, so there is one
+  column list rather than two that had to be kept from drifting.
 - DP2 also offers continuous `{band}_sizeExtendedness` and
   `{band}_model_extendedness`, either a better primary cut than the hard 0/1
   `refExtendedness` if the sample turns out to need one, and
   the band-independent `sersic_*` block — `reff_major`/`reff_minor` in arcsec,
-  `index`, `theta`, `rho`, and per-band `{band}_sersicFlux` for all six bands —
-  which is what the size cut and the diagnostic plots use.
-
-**Surface brightness is the cut that decides whether a host is a galaxy.** Not
-size. Nothing else in the selection requires the object to be *visible*: with a
-3″ half-light radius the old 360 nJy floor admitted objects at
-μ_e = 29.4 mag/arcsec², some 2.4 mag/arcsec² fainter than one sigma of sky per
-square arcsecond in r. At that signal-to-noise the multiband Sersic fit is
-degenerate along (n, R_e, flux) and walks off to a large radius around an
-invisible envelope while the real light stays in a few pixels. Those rows pass
-every size cut and arrive as point-like blobs — which is exactly what the
-cutouts figure was showing.
-
-So `--max-mu-e` (default **24.5**) is the primary cut, written server-side as
-`flux >= K · reff_major · reff_minor` — multiplication only, since `LOG10` and
-`POWER` are not guaranteed across ADQL dialects and a clause the service
-silently declines to apply is worse than one it refuses.
-
-The sample is therefore **surface-brightness limited, not size limited**. The
-size bounds are wide — 0.7″ to 12″, a factor of 17 — because that is the range
-asked for, "a couple of arcsec across up to very large". A galaxy of ordinary
-brightness at R_e = 3″ covers about 30 pooled pixels of visible isophote, so 3″
-was never too small; it was the wrong knob.
-
-**The point-source cut is referenced to the PSF.** `{band}_ixx` and friends are
-HSM adaptive moments on the *PSF-convolved* coadd, so a star's trace radius is
-whatever the seeing was — 2.0 px at median DP2 seeing, against a `min_trace_px`
-of 1.75, which therefore rejected nothing. The cut is now on
-`T² = ((ixx+iyy) − (ixxPSF+iyyPSF))/2`, which a point source makes exactly zero.
-
-**Two things worth knowing about the trace radius**, since it is what the old
-hosts figure plotted: adaptive moments are flux-weighted toward the core and
-run 1.4× smaller than R_e for an exponential and 4–9× smaller for a de
-Vaucouleurs. A sample correctly cut at R_e ≥ 3″ plots at 0.7–2.2″ in trace
-radius. Seeing sizes below the cut in that panel is what a *working* cut looks
-like in the wrong units.
-
-**The bright end is a saturation flag, not a flux ceiling.** The old 3e6 nJy
-ceiling (r = 15.2) sits 1.5–3 mag *below* where cores actually saturate, so it
-was blocking precisely the nearly-saturating galaxies wanted. The ceiling is now
-nominal and `{band}_pixelFlags_saturatedCenter` does the work, which is literally
-"this core is not saturated". `interpolatedCenter` goes with it: an interpolated
-core is synthetic structure exactly where the transient goes.
-
-**Stratification bins are fixed, not data-driven.** Edges taken from the
-sample's own min and max hand whole bins to whatever tail exists — so with
-runaway fits in the pool, the stratification written to rescue rare large
-galaxies was preferentially rescuing rare bad fits instead.
-
-`min_trace_px` stays as a second, non-parametric floor from the adaptive moments,
-a cross-check against a runaway fit.
-
-**The flux ceiling had to move with it.** Size and flux are not independent: a
-galaxy with a 3″ half-light radius and an ordinary effective surface brightness
-of 22 mag/arcsec² has r ≈ 17.6, nine times brighter than the 36000 nJy ceiling
-this used to carry. That ceiling was set for a 1″ population and would have
-annihilated the size cut. It is now 3e6 nJy (r ≈ 15.2); saturated cores are the
-gate's job rather than this one's. `select_hosts` also notices when a size cut
-and a flux range are nearly disjoint and says so, rather than silently returning
-nothing.
-
-**Size stratification draws from equal-width bins in log half-light radius, not
-quantiles.**
-This matters and was wrong until recently: quantile bins hold equal numbers by
-construction, so drawing equally from each is *exactly* a uniform sample and
-stratifies nothing. With equal-width bins the sample carries ~9× more
-well-resolved hosts than a uniform draw, falling to 1× as the request approaches
-the whole population — you cannot over-sample galaxies that are not there.
+  `index`, `theta`, `rho`, and per-band `{band}_sersicFlux` for all six bands.
 
 ### Cell structure, and the depth step it causes
 
@@ -822,8 +813,8 @@ one-sided and the biggest, best hosts would be rejected first:
 With both, a σ = 30 px galaxy at 200× the sky reads 1.01 while a true 1.3 step
 still reads 1.31. The default threshold is **1.5 in variance**, which is 1.22 in
 noise σ; the ratio goes into the manifest whether the stamp passes or not, so it
-can be retuned from `variance_step` without re-reading pixels. `--max-variance-step
-inf` keeps everything.
+can be retuned from `variance_step` without re-reading pixels.
+`max_variance_step: null` keeps everything.
 
 **And the coadd states the step exactly, before any pixel is read.**
 `CellCoadd.provenance.contributions` is a table of `{visit, detector, cell}` —
@@ -840,26 +831,26 @@ images contributed to each cell.
 The two measures are kept because neither subsumes the other. Coaddition is
 inverse-variance weighted, so cells with equal visit counts still differ by
 whatever the seeing and the sky did — the counts cannot see that and the variance
-can; and provenance can be absent or spelled differently, in which case the
-variance is all there is. Two independent conventions meet here — the grid's
-`(i, j)` and the provenance table's cell columns — and nothing guarantees they
-agree on which one is x, so the first stamp checks that its cells appear in the
-table at all and, if they do not, says so and falls back rather than rejecting
-every stamp for the most confusing possible reason.
+can. Two independent conventions meet here — the grid's `(i, j)` and the
+provenance table's cell columns — and nothing guarantees they agree on which one
+is x, so the first stamp checks that its cells appear in the table at all and, if
+they do not, ends the run naming both spellings. Transposed, every lookup misses
+and every stamp reads as zero-visit, which is the most confusing possible reason
+to reject a whole field.
 
-`n_cells_spanned` is still recorded as the footprint, and `visits_per_cell` in
-the summary gives the depth of the **whole run** — every cell of every patch
-swept. That replaces a log line that reported the first patch only: it read like
-a property of the run, so it moved whenever anything perturbed the RNG stream
-that decides which tract is visited first. Removing the per-host jitter did
-exactly that, and the reported depth went from 1–9 visits to 1–1 with no change
-to the data at all. The per-patch line is still printed, but it names its patch.
+`n_cells_spanned` is recorded as the footprint, and `visits_per_cell` in the
+summary gives the depth of the **whole run** — every cell of every patch read.
+That replaces a log line that reported the first patch only: it read like a
+property of the run, so it moved whenever anything perturbed the RNG stream that
+decides which host is visited first. Removing the per-host jitter did exactly
+that, and the reported depth went from 1–9 visits to 1–1 with no change to the
+data at all.
 
 **Absolute depth is a separate question from depth *variation*.** Early DP2
 outside the deep fields runs 1–3 visits per cell, which is a different sky from a
 deep coadd — and at 1–3 visits a single-visit difference between neighbouring
 cells is a `cell_depth_ratio` of 2 or 3, so the 1.5 default rejects nearly
-everything there. `n_visits_min` is recorded for every stamp and `--min-visits`
+everything there. `n_visits_min` is recorded for every stamp and `min_visits`
 gates on it, off by default: whether a shallow coadd belongs in this prior is a
 judgement about the prior, not about the pixels.
 
@@ -891,19 +882,36 @@ A read either answers or ends the run. Every quiet degradation this code had
 turned out to be a bug wearing a disguise: `grid` and `bounds` were assumed to be
 butler components, were not, and silently forced a whole-patch read on every
 stamp at ~100× the I/O for several runs before a warning caught it. A component
-that does not answer, a mask schema that changes mid-run, an object table that is
-missing for a tract hosts were selected from — all now raise, naming what to fix.
+that does not answer, a mask schema that changes mid-run, a WCS that does not
+round-trip, an empty or unreadable `provenance.contributions`, a cell grid that
+will not answer `index_of`, a ref whose data id is not the one asked for — all
+raise, naming what to fix.
+
+The same rule applies to having two ways of doing one thing, which is the same
+disguise in a different coat. There is one route to the host list (TAP), one size
+measurement (`sersic_reff_major`), one place each cut is stated
+(`extraction.yaml` — `gate` has no tolerance defaults of its own, so it cannot
+disagree), and one way pixels are read (a bbox around the host). What used to be
+"the other option" was in every case the one nobody ran, which is to say the one
+nobody would notice had broken.
 
 ### Storage
 
-Shards hold **native-resolution stamps in physical units** (nJy), plus variance,
-mask, the mask plane dictionary, PSF stamp and moments, `x0y0`, WCS-derived
-position, MJD and neighbour summary. Pooling, the log transform and the offsets
+Shards hold **native-resolution stamps in physical units** (nJy) and nothing
+else in the way of arrays, plus a row of scalars per stamp: `x0`/`y0`, the host
+position and id, the pixel scale, the sky noise, the depth the stamp was cut at
+and the fractions the gate measured. Pooling, the log transform and the offsets
 all happen in the loader, so any of them can change without re-extracting.
 
-`x0y0` and the mask plane dictionary are mandatory, not optional: LSST boxes have
-non-zero origins, bit assignments are not guaranteed stable across releases, and
-without both a saved stamp cannot be mapped back to the sky or interpreted.
+The prior is a distribution over pixels and never sees a variance plane, a mask
+or a PSF, so carrying them tripled the storage to no purpose. They are still
+*read* during extraction — they are what the gate is made of — and then dropped;
+what survives of them is that row of scalars, which is what a later cut from the
+manifest needs.
+
+`x0`/`y0` and the mask plane dictionary are mandatory, not optional: LSST boxes
+have non-zero origins, bit assignments are not guaranteed stable across releases,
+and without both a saved stamp cannot be mapped back to the sky or interpreted.
 
 `PatchDataset.build_pooled_cache()` writes a derived pooled-and-transformed array
 keyed by a hash of the transform config, for fast iteration. It only supports
@@ -923,25 +931,24 @@ than guessed, so the list is short:
       daf_butler v27, so `dict(data_id)` now falls through to sequence iteration
       and raises `KeyError: 0`. `_data_id_dict` goes through `.mapping` /
       `.required` instead, and still handles the old form.
-- [ ] **`deep_coadd.bbox` and `.sky_projection` as component reads.** Both are
-      documented, but if either is refused the loop falls back to loading the
-      whole patch (slower, identical result) and warns once, rather than
-      rejecting every ref in the field.
-- [ ] **`grid.index_of(x=, y=)` returning `.i`/`.j`.** Used only for the
-      `n_cells_spanned` covariate, and degrades to `-1` if the attribute names
-      differ.
+- [x] **`deep_coadd.sky_projection`, `.psf` and `.provenance` as component
+      reads.** A component the repo will not serve ends the run. It used to fall
+      back to loading the whole patch, which is ~100× the I/O for an identical
+      result, and did so silently for several runs — note that `grid` and
+      `bounds` are *not* components at all but properties reading through to
+      `psf.bounds`, which is how that fallback got triggered on every stamp.
+- [ ] **`grid.index_of(x=, y=)` returning `.i`/`.j`.** The cell grid is what the
+      depth and missing-cell checks are made of, so it raises rather than
+      degrading if the attribute names differ.
 - [ ] **Field choice.** ECDFS (tract 5063) is the best-characterised DP2 field
       and the one the tutorials use; check dp2.lsst.io before choosing on cadence
       grounds.
-- [ ] **`min_trace_px = 1.75`** in `select_hosts` is a DP1-era ComCam PSF size.
-      It is now only a cross-check behind the 1″ half-light cut, so it matters
-      less, but check it against the DP2 PSF before leaning on it.
 - [ ] **`provenance.contributions` column names.** The API documents the table
       as `{visit, detector, cell}` without pinning the spellings, and `CellIJ`
       cannot survive into an astropy column as one object, so
       `CONTRIB_CELL_COLUMNS` tries `cell_i/cell_j`, `cell_x/cell_y`, `i/j`,
       `x/y` and logs the real names if none match. One run says which it is.
-- [ ] **`--max-variance-step 1.5`** was chosen from what a depth step looks like,
+- [ ] **`max_variance_step`** was chosen from what a depth step looks like,
       not from DP2 statistics. Look at the `variance step` panel in `hosts.png`
       and the rejection counts after a real run: if it is rejecting a large
       fraction, the cells in this field differ more than assumed and the
@@ -984,9 +991,11 @@ than guessed, so the list is short:
 ## Layout
 
 ```
+extraction.yaml      the whole description of an extraction run, checked in
 src/rubin_host_prior/
   geometry.py        valid-conv shape arithmetic; read before choosing a patch size
   config.py          every dataclass that must travel with a checkpoint
+  selection.py       extraction.yaml's dataclasses: the host and patch cuts
   nn/                layers.py (FiLM, Fourier, ConvBlock), energy.py (net + score)
   diffusion/         sde.py (VE), loss.py (DSM + interior crop), sampler.py
   training/          trainer.py, ema.py, checkpoint.py
@@ -996,6 +1005,7 @@ src/rubin_host_prior/
                      fake data for offline testing)
   rubin/             quality.py (stack-free gate), extract.py (lazy LSST imports)
 scripts/             extract_dp2_patches.py, diagnose.py, prepare_config.py,
-                     train.py, sample.py, smoke_test.py
-tests/               ~100 tests, no cluster and no LSST stack required
+                     check_tap.py, train.py, sample.py, smoke_test.py
+tests/               no cluster and no LSST stack required; fakes.py is a butler
+                     small enough to read, which is where the walk is tested
 ```

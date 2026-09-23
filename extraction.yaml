@@ -17,15 +17,12 @@ sky:
   dec: -28.10
   radius_deg: null
 
-# Where the host list comes from.  "tap" sends the cuts to the RSP as one ADQL
-# query, which is far less work than reading every row of ~1000 object tables,
-# but needs network and a token with read:tap.  "butler" scans the repo instead
-# and needs nothing else.  Either way the cache means it happens once.
+# Where the host list comes from: one ADQL query against dp2.Object, which is
+# what a query service is for -- the footprint is ~10^9 rows and the survivors
+# ~10^4.  Needs network and a token with read:tap; the cache means once.
 catalogue:
-  source: tap
   cache: data/host_catalogue.parquet
   limit_hosts: null      # TOP N on the query; null for no limit
-  limit_tracts: null     # butler source only
   tap_url: null          # found from the RSP discovery document
 
 # What each cutout is.  native_size is deliberately larger than the training
@@ -37,25 +34,19 @@ stamps:
   bands: [u, g, r, i, z, y]
   native_size: 512
   patches_per_shard: 1024
-  # Record what sits near each host.  Covariates only -- nothing trains on
-  # them -- and they cost one ~700k-row object-table read per tract that yields
-  # a stamp, which with hosts drawn thinly across the footprint is most of the
-  # runtime.  Off unless you want them.
-  neighbours: false
-  neighbour_radius_arcsec: 30.0
 
-# How much to do.  n_hosts counts hosts, not cutouts: each yields at most one
-# per band and the gate rejects a share of those.  n_patches is a target the run
-# works towards, drawing fresh hosts until it has them.
+# How much to do.  n_stamps counts accepted cutouts, not hosts: a host yields at
+# most one per band and the gate rejects a share of those, so 200 hosts is of
+# order 1000 stamps.  The walk continues until it has them or the catalogue runs
+# out, and the check happens between hosts, so it can overshoot by up to one
+# host's worth of bands.
 run:
-  n_hosts: 1000
-  n_patches: null
-  max_patches: null
-  max_rounds: 8
+  n_stamps: 1000
   seed: 0
   prefix: patches
 
-# Which catalogue rows may become hosts.
+# Which catalogue rows may become hosts.  These are compiled into the ADQL and
+# applied by the service; only the boolean flags and the dedupe run locally.
 #
 # max_mag is the cut that decides visibility.  Surface brightness decides
 # whether a *fit* is real, but it is a poor proxy for "I can see it": a tight
@@ -63,10 +54,9 @@ run:
 # over galaxy structure wants.  So max_mu_e stays loose, as a bound on fits that
 # ran away around an invisible envelope.
 #
-# Extent is min_reff_arcsec, the intrinsic half-light radius from the multiband
-# Sersic fit, together with min_deconvolved_px, which is the same claim made
-# against the image: T^2 = ((ixx+iyy)-(ixxPSF+iyyPSF))/2, exactly zero for a
-# point source at any seeing.
+# Extent is min_reff_arcsec and nothing else: the half-light major axis of the
+# multiband Sersic fit, in arcsec, before PSF convolution.  One measurement of
+# size, one cut on it.
 hosts:
   band: r
   max_mag: 19.0          # faint limit
@@ -74,15 +64,12 @@ hosts:
   min_reff_arcsec: 1.5
   max_reff_arcsec: 30.0
   max_mu_e: 25.5         # mag/arcsec^2; sky is about 27
-  min_deconvolved_px: 2.5
   max_sersic_index: 6.0
   min_extendedness: 0.5
   max_blendedness: null
   reject_saturated_centre: true
   reject_interpolated_centre: false
   dedupe_radius_arcsec: 0.5
-  size_stratified: false
-  n_size_bins: 5
 
 # Which stamps survive, given the pixels.  Tolerances are fractions of the
 # stamp, and of its central region where the transient goes.
