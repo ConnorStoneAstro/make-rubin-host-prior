@@ -64,6 +64,50 @@ def _save(fig, out: Path | None, name: str) -> Path | None:
     return path
 
 
+# -- what the model has learned to draw -------------------------------------
+
+
+def plot_samples(samples, step: int | None = None, out: Path | None = None,
+                 name: str = "samples"):
+    """A square grid of samples, in the log space the model works in.
+
+    Deliberately the same representation and the same kind of figure as
+    ``training_batch.png``, so the two can be put side by side: that comparison
+    is the whole point of drawing samples during training, and it only works if
+    nothing is stretched differently between them.
+
+    One colour scale across the whole grid, from the 0.5/99.5 percentiles of all
+    the samples together.  Per-panel scaling would make every sample look
+    equally structured, including the ones that are noise.
+    """
+    plt = _plt()
+
+    x = np.asarray(samples)
+    if x.ndim == 4:                 # (B, C, H, W) -> first channel
+        x = x[:, 0]
+    rows, cols = _grid(len(x))
+    finite = x[np.isfinite(x)]
+    lo, hi = (np.percentile(finite, (0.5, 99.5)) if finite.size
+              else (0.0, 1.0))
+
+    fig, axes = plt.subplots(rows, cols, figsize=(1.35 * cols, 1.35 * rows))
+    for ax, img in zip(np.ravel(np.atleast_1d(axes)), x):
+        _show(ax, img, lo, hi, cmap="viridis")
+    for ax in np.ravel(np.atleast_1d(axes))[len(x):]:
+        ax.set_axis_off()
+    title = f"{len(x)} samples, log space"
+    if step is not None:
+        title += f", step {step:,}"
+    # Non-finite values mean the sampler diverged, which a colour scale taken
+    # from the finite ones would hide completely.
+    n_bad = int(np.sum(~np.isfinite(x)))
+    if n_bad:
+        title += f"  --  {n_bad:,} non-finite pixels"
+    fig.suptitle(title, fontsize=9)
+    fig.tight_layout()
+    return fig, _save(fig, out, name)
+
+
 # -- raw cutouts -----------------------------------------------------------
 
 

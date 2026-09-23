@@ -168,6 +168,47 @@ NaN in training.
 python scripts/train.py --shards data/ecdfs/shards --config config.json --out runs/ecdfs
 ```
 
+Writes into `--out`:
+
+| path | what |
+|---|---|
+| `log.jsonl` | one line per log step, eval and checkpoint |
+| `checkpoints/step-XXXXXXXX/` | the weights at each of `n_checkpoints` points |
+| `samples/step-XXXXXXXX.png` | a square grid drawn from the EMA model there |
+| `latest/` | the newest checkpoint, **with** the optimiser state |
+| `final/` | the end of the run |
+
+**Checkpoints are a count, not an interval.** `train.n_checkpoints` (default 10)
+spreads them evenly over `steps`, with the last landing exactly on the final
+step; an interval has to be recomputed by hand every time `steps` changes, and
+getting it wrong means either one checkpoint or thousands. Asking for more
+checkpoints than there are steps gives one per step rather than duplicates.
+
+Each one keeps the weights and the EMA but **not** the optimiser state, which is
+two more copies of the parameters and is only ever wanted for the most recent
+checkpoint — that lives in `latest/`, overwritten each time. Ten checkpoints
+therefore cost the weights ten times and the optimiser once.
+
+**Each checkpoint draws `n_samples` (default 64) from the EMA model** and writes
+them as an 8×8 grid. The EMA rather than the live weights, because that is what
+inference uses. They are in the same log space and the same style as
+`training_batch.png`, so put the two side by side — that comparison is the point,
+and it only works because nothing is stretched differently between them. The
+colour scale is shared across the whole grid: per-panel scaling would make every
+sample look equally structured, including the ones that are noise.
+
+Sampling is the one step in training that can exhaust device memory on its own —
+the canvas is `4R` larger than the sample and every score evaluation sees all of
+it — so a failure is logged with its reason and training continues. Hours of
+training must not be lost to a diagnostic. The log line for each checkpoint
+carries `sample_mean`, `sample_std` and `sample_nonfinite`; a diverged sampler
+produces `inf` rather than an error, and a grid of those looks like a blank
+figure, so the count is what tells you.
+
+`--n-samples 0` skips sampling; `--n-checkpoints 0` skips checkpoints entirely.
+`sample_steps` (default 256) is the probability-flow ODE step count and is what
+decides what a checkpoint costs — Heun is two score evaluations per step.
+
 ### 5. Sample
 
 ```bash

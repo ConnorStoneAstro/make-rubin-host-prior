@@ -33,7 +33,7 @@ def _config(**train_kw):
     c.train.steps = 12
     c.train.batch_size = 4
     c.train.log_every = 4
-    c.train.ckpt_every = 0
+    c.train.n_checkpoints = 0
     for k, v in train_kw.items():
         setattr(c.train, k, v)
     return c
@@ -421,3 +421,79 @@ def test_no_warning_when_translation_is_switched_off():
                                  pool_factor=3),
                augment=AugmentConfig(translate=False))
     assert c.check_sizes() == []
+
+
+# -- checkpoints and the samples that go with them --------------------------
+
+
+def test_checkpoints_are_spread_over_the_run_not_set_by_an_interval():
+    """``ckpt_every`` had to be recomputed by hand every time ``steps`` changed,
+    and getting it wrong meant either one checkpoint or thousands."""
+    from rubin_host_prior.config import TrainConfig
+
+    assert TrainConfig(steps=1000).checkpoint_steps() == [
+        100, 200, 300, 400, 500, 600, 700, 800, 900, 1000]
+    # The last one always lands exactly on the final step.
+    for steps, n in ((1000, 3), (99, 7), (200_000, 10)):
+        got = TrainConfig(steps=steps, n_checkpoints=n).checkpoint_steps()
+        assert len(got) == n and got[-1] == steps and got == sorted(set(got))
+    # Fewer steps than checkpoints asked for gives one per step, not duplicates.
+    assert TrainConfig(steps=3, n_checkpoints=10).checkpoint_steps() == [1, 2, 3]
+    assert TrainConfig(steps=1000, n_checkpoints=0).checkpoint_steps() == []
+
+
+def test_a_run_leaves_a_history_of_checkpoints_and_sample_grids(tmp_path):
+    """Ten checkpoints over a run, each with a picture of what the model draws
+    at that point -- the thing a loss curve cannot show you."""
+    config = _config(steps=6, n_checkpoints=3, n_samples=4, sample_steps=2)
+    model = ConvEnergyNet(config.energy, key=jax.random.key(0))
+    rng = np.random.default_rng(0)
+    train(model, _batches(rng), config, out_dir=tmp_path, verbose=False)
+
+    steps = [2, 4, 6]
+    kept = sorted(p.name for p in (tmp_path / "checkpoints").iterdir())
+    assert kept == [f"step-{s:08d}" for s in steps]
+    assert sorted(p.name for p in (tmp_path / "samples").iterdir()) == [
+        f"step-{s:08d}.png" for s in steps]
+
+    # The weights are kept every time; the optimiser state, which is two more
+    # copies of them, only in `latest`.
+    for s in steps:
+        d = tmp_path / "checkpoints" / f"step-{s:08d}"
+        assert (d / "model.eqx").exists() and (d / "ema.eqx").exists()
+        assert not (d / "opt_state.eqx").exists()
+    assert (tmp_path / "latest" / "opt_state.eqx").exists()
+
+    # Every checkpoint is loadable on its own, and says which step it is.
+    reloaded, _, step = load_checkpoint(tmp_path / "checkpoints" / "step-00000004")
+    assert step == 4 and n_parameters(reloaded) == n_parameters(model)
+
+    # And the log records what was drawn, so a diverged sampler is visible in
+    # the log rather than only as a blank figure.
+    events = [json.loads(line) for line in
+              (tmp_path / "log.jsonl").read_text().splitlines()]
+    ckpts = [e for e in events if e.get("event") == "checkpoint"]
+    assert [e["step"] for e in ckpts] == steps
+    assert all(e["sample_nonfinite"] == 0 for e in ckpts)
+    assert all("sample_mean" in e and "sample_seconds" in e for e in ckpts)
+
+
+def test_sampling_never_costs_a_run(tmp_path, monkeypatch):
+    """Hours of training must not be lost to a diagnostic.  Sampling is the one
+    step here that can exhaust device memory on its own."""
+    import rubin_host_prior.diffusion.sampler as sampler
+
+    def boom(*a, **kw):
+        raise RuntimeError("RESOURCE_EXHAUSTED: out of memory")
+
+    monkeypatch.setattr(sampler, "sample_interior", boom)
+    config = _config(steps=2, n_checkpoints=1, n_samples=4, sample_steps=2)
+    model = ConvEnergyNet(config.energy, key=jax.random.key(0))
+    train(model, _batches(np.random.default_rng(0)), config,
+          out_dir=tmp_path, verbose=False)
+
+    assert (tmp_path / "final" / "model.eqx").exists()
+    events = [json.loads(line) for line in
+              (tmp_path / "log.jsonl").read_text().splitlines()]
+    failed = [e for e in events if "sample_error" in e]
+    assert failed and "RESOURCE_EXHAUSTED" in failed[0]["sample_error"]

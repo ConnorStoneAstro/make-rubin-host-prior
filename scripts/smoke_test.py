@@ -78,7 +78,7 @@ def main() -> None:
     config.train.steps = args.steps
     config.train.batch_size = args.batch_size
     config.train.log_every = max(args.steps // 10, 1)
-    config.train.ckpt_every = 0
+    config.train.n_checkpoints = 0
     pooled, pooled_bands = pool_shards(shards, config)
     config.transform.band_softening = estimate_band_softening(
         pooled, pooled_bands, config.transform.softening_sigma

@@ -180,8 +180,28 @@ class TrainConfig:
     grad_clip: float = 1.0
     ema_decay: float = 0.999
     log_every: int = 100
-    ckpt_every: int = 5_000
     seed: int = 0
+
+    #: Checkpoints spread evenly over the run, rather than an interval that has
+    #: to be recomputed every time ``steps`` changes.  The last one lands on the
+    #: final step.  0 disables them.
+    n_checkpoints: int = 10
+    #: Samples drawn from the EMA model at each checkpoint and written as a
+    #: square grid, so the run's progress is visible as pictures rather than only
+    #: as a loss curve.  0 disables sampling.  64 is an 8x8 grid.
+    n_samples: int = 64
+    #: Probability-flow ODE steps per sample.  Heun costs two score evaluations
+    #: per step, and each one is over a canvas 4R larger than the sample, so this
+    #: is the knob that decides what a checkpoint costs.
+    sample_steps: int = 256
+
+    def checkpoint_steps(self) -> list[int]:
+        """The steps to checkpoint at: ``n_checkpoints`` of them, evenly spread,
+        the last landing exactly on ``steps``."""
+        if self.n_checkpoints <= 0 or self.steps <= 0:
+            return []
+        n = min(self.n_checkpoints, self.steps)
+        return [round(self.steps * (i + 1) / n) for i in range(n)]
 
 
 @dataclass
@@ -250,20 +270,60 @@ class Config:
     def save(self, path: str | Path) -> None:
         Path(path).write_text(json.dumps(self.to_dict(), indent=2, sort_keys=True))
 
+    #: Keys that used to exist, and what to do about each.  A config is written
+    #: by ``prepare_config.py`` and then sits on disk across code changes, so a
+    #: renamed field arrives as a bare ``TypeError`` naming a keyword and
+    #: nothing else.  This turns it into an instruction.
+    #: No annotation: an annotated class attribute in a dataclass becomes a
+    #: field, and a dict default is then refused outright.
+    _RETIRED = {
+        "ckpt_every": "replaced by train.n_checkpoints, which spreads that many "
+                      "checkpoints over the run instead of needing an interval "
+                      "recomputed by hand whenever steps changes",
+        "log_scale": "removed; it was 1.0 everywhere and nothing ever set it, "
+                     "and the transform is now x = log(s*softplus(f/s)) with no "
+                     "rescaling",
+    }
+
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> "Config":
-        return cls(
-            energy=EnergyConfig(**_tuples(d.get("energy", {}), ("channels",))),
-            sde=SDEConfig(**d.get("sde", {})),
-            transform=TransformConfig(**d.get("transform", {})),
-            patch=PatchConfig(**_tuples(d.get("patch", {}), ("out_sizes",))),
-            augment=AugmentConfig(**d.get("augment", {})),
-            train=TrainConfig(**d.get("train", {})),
-        )
+        sections = {
+            "energy": (EnergyConfig, _tuples(d.get("energy", {}), ("channels",))),
+            "sde": (SDEConfig, d.get("sde", {})),
+            "transform": (TransformConfig, d.get("transform", {})),
+            "patch": (PatchConfig, _tuples(d.get("patch", {}), ("out_sizes",))),
+            "augment": (AugmentConfig, d.get("augment", {})),
+            "train": (TrainConfig, d.get("train", {})),
+        }
+        return cls(**{name: _section(name, kind, raw)
+                      for name, (kind, raw) in sections.items()})
 
     @classmethod
     def load(cls, path: str | Path) -> "Config":
         return cls.from_dict(json.loads(Path(path).read_text()))
+
+
+def _section(name: str, kind, raw: dict[str, Any]):
+    """Build one config section, saying what to do about a key it no longer has.
+
+    A config lives on disk between a ``prepare_config.py`` run and a training
+    run, so it outlives code changes.  Without this a renamed field surfaces as
+    ``TypeError: __init__() got an unexpected keyword argument`` -- true, and
+    silent about whether the field moved, was renamed, or was deliberately
+    dropped.
+    """
+    known = {f.name for f in dataclasses.fields(kind)}
+    unknown = sorted(set(raw) - known)
+    if unknown:
+        notes = [f"  {k}: {Config._RETIRED[k]}" for k in unknown
+                 if k in Config._RETIRED]
+        raise ValueError(
+            f"config section {name!r} has no field(s) {unknown}; it has "
+            f"{sorted(known)}."
+            + ("\n" + "\n".join(notes) if notes else "")
+            + "\nRe-run scripts/prepare_config.py to write a current one."
+        )
+    return kind(**raw)
 
 
 def _tuples(d: dict[str, Any], keys: tuple[str, ...]) -> dict[str, Any]:

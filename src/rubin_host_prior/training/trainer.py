@@ -123,6 +123,12 @@ def train(
         return dsm_loss_by_sigma(model, batch, sigmas, key, sde, margin)
 
     key = jax.random.key(cfg.seed)
+    checkpoints = set(cfg.checkpoint_steps())
+    if verbose and checkpoints:
+        print(f"  {len(checkpoints)} checkpoints at steps "
+              f"{sorted(checkpoints)[:3]}...{max(checkpoints)}"
+              + (f", each with {cfg.n_samples} samples"
+                 if cfg.n_samples else ", no samples"))
     log_path = out / "log.jsonl"
     running = None
     t0 = time.time()
@@ -186,11 +192,79 @@ def train(
                 if on_log is not None:
                     on_log(record)
 
-            if cfg.ckpt_every and step % cfg.ckpt_every == 0:
-                save_checkpoint(out / "latest", step, config, model, ema_model, opt_state)
+            if step in checkpoints:
+                # Kept, named by step, so the run leaves a history rather than
+                # one overwritten directory -- but without the optimiser state,
+                # which is two more copies of the parameters and is only ever
+                # needed for the most recent one.  That lives in `latest`, which
+                # is overwritten, so ten checkpoints cost the weights ten times
+                # and the optimiser once.
+                save_checkpoint(out / "checkpoints" / f"step-{step:08d}",
+                                step, config, model, ema_model)
+                save_checkpoint(out / "latest", step, config, model, ema_model,
+                                opt_state)
+                record = {"step": step, "event": "checkpoint",
+                          "seconds": time.time() - t0}
+                if cfg.n_samples:
+                    record.update(_write_samples(
+                        ema_model, sde, config, out, step, key, verbose))
+                log_file.write(json.dumps(record) + "\n")
+                log_file.flush()
+                if on_log is not None:
+                    on_log(record)
 
     save_checkpoint(out / "final", cfg.steps, config, model, ema_model, opt_state)
     return model, ema_model
+
+
+def _write_samples(ema_model, sde, config: Config, out: Path, step: int,
+                   key, verbose: bool) -> dict:
+    """Draw from the EMA weights and write an ``n x n`` grid of them.
+
+    The EMA, not the live weights: it is what inference uses, so it is what a
+    picture of progress should show.
+
+    Never fatal.  A diagnostic that kills a run hours in is worse than no
+    diagnostic -- sampling is the one thing here that can exhaust device memory
+    on its own, since the canvas is 4R larger than the sample and every score
+    evaluation sees all of it at once.  A failure is logged with its reason and
+    training continues.
+    """
+    cfg = config.train
+    t0 = time.time()
+    try:
+        from ..diffusion.sampler import sample_interior
+
+        x = sample_interior(
+            ema_model,
+            jax.random.fold_in(key, step),
+            out_size=config.patch.out_size,
+            n_samples=cfg.n_samples,
+            sde=sde,
+            n_steps=cfg.sample_steps,
+        )
+        x = np.asarray(x)
+        from .. import plots
+
+        _, path = plots.plot_samples(x, step=step, out=out / "samples",
+                                     name=f"step-{step:08d}")
+        if verbose:
+            print(f"  step {step:,}: {cfg.n_samples} samples in "
+                  f"{time.time() - t0:.0f}s -> {path}")
+        return {
+            "samples": str(path),
+            "sample_seconds": round(time.time() - t0, 1),
+            "sample_mean": float(np.mean(x)),
+            "sample_std": float(np.std(x)),
+            # A sampler that diverges produces inf or nan rather than an error,
+            # and a grid of them looks like a blank figure.  Count them.
+            "sample_nonfinite": int(np.sum(~np.isfinite(x))),
+        }
+    except Exception as exc:
+        log = f"sampling failed at step {step}: {exc!r}"
+        if verbose:
+            print(f"  WARNING: {log}")
+        return {"sample_error": repr(exc)}
 
 
 def _validate_geometry(sizes, model: ConvEnergyNet) -> None:

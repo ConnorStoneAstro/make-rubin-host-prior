@@ -6,6 +6,17 @@
 
 Checks the patch/layer geometry before starting, since a too-small patch leaves
 no interior for the loss and that is better caught now than 10 000 steps in.
+
+Writes into ``--out``:
+
+    log.jsonl                  one line per log step, eval and checkpoint
+    checkpoints/step-XXXXXXXX/ the weights at each of ``n_checkpoints`` points
+    samples/step-XXXXXXXX.png  an n x n grid drawn from the EMA model there
+    latest/                    the newest checkpoint, with the optimiser state
+    final/                     the end of the run
+
+The sample grids are in the same log space and the same style as
+``training_batch.png`` from ``diagnose.py``, so the two can be compared directly.
 """
 
 from __future__ import annotations
@@ -40,6 +51,13 @@ def main() -> None:
                    help="train on several patch sizes, cycled round-robin across "
                         "batches; larger patches spend less of themselves on the "
                         "cropped border")
+    p.add_argument("--n-checkpoints", type=int, default=None,
+                   help="checkpoints spread evenly over the run (default: from "
+                        "the config, 10). Each keeps the weights and writes a "
+                        "grid of samples; 0 for none")
+    p.add_argument("--n-samples", type=int, default=None,
+                   help="samples drawn from the EMA model at each checkpoint "
+                        "and written as a square grid; 0 to skip sampling")
     p.add_argument("--eval-every", type=int, default=2000)
     p.add_argument("--eval-size", type=int, default=32)
     p.add_argument("--max-in-memory-gb", type=float, default=16.0)
@@ -60,6 +78,12 @@ def main() -> None:
         config.train.batch_size = args.batch_size
     if args.lr:
         config.train.learning_rate = args.lr
+    # ``is not None``, not truthiness: 0 is a meaningful value for both of these
+    # and means "none", which is exactly what a plain `if` would discard.
+    if args.n_checkpoints is not None:
+        config.train.n_checkpoints = args.n_checkpoints
+    if args.n_samples is not None:
+        config.train.n_samples = args.n_samples
     if args.n_layers:
         base = config.energy.channels
         config.energy = dataclasses.replace(
