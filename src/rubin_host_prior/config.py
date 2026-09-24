@@ -170,7 +170,7 @@ class AugmentConfig:
 @dataclass
 class TrainConfig:
     batch_size: int = 32
-    steps: int = 200_000
+    steps: int = 2_000_000
     learning_rate: float = 2e-4
     warmup_steps: int = 2_000
     cosine_decay: bool = False
@@ -237,9 +237,7 @@ class Config:
         """
         from . import geometry
 
-        lo = 4 * geometry.receptive_radius(
-            self.energy.n_layers, self.energy.kernel_size
-        ) + 1
+        lo = 4 * geometry.receptive_radius(self.energy.n_layers, self.energy.kernel_size) + 1
         hi = self.patch.native_size // self.patch.pool_factor
         return lo, hi
 
@@ -257,17 +255,24 @@ class Config:
             )
         for s in self.patch.training_sizes:
             if s < lo:
-                out.append(f"size {s} is below the minimum {lo} (model crops "
-                           f"{2 * geometry.receptive_radius(self.energy.n_layers, self.energy.kernel_size)} px per side)")
+                out.append(
+                    f"size {s} is below the minimum {lo} (model crops "
+                    f"{2 * geometry.receptive_radius(self.energy.n_layers, self.energy.kernel_size)} px per side)"
+                )
             elif s > hi:
-                out.append(f"size {s} needs {s * self.patch.pool_factor} native "
-                           f"px but the stamps are {self.patch.native_size}")
+                out.append(
+                    f"size {s} needs {s * self.patch.pool_factor} native "
+                    f"px but the stamps are {self.patch.native_size}"
+                )
             else:
-                frac = (geometry.interior_size(s, self.energy.n_layers,
-                                               self.energy.kernel_size) / s) ** 2
+                frac = (
+                    geometry.interior_size(s, self.energy.n_layers, self.energy.kernel_size) / s
+                ) ** 2
                 if frac < 0.10:
-                    out.append(f"size {s} spends {100 * (1 - frac):.0f}% of itself "
-                               f"on the cropped margin -- little signal per step")
+                    out.append(
+                        f"size {s} spends {100 * (1 - frac):.0f}% of itself "
+                        f"on the cropped margin -- little signal per step"
+                    )
         if self.augment.translate and self.patch.max_translate_native == 0:
             out.append(
                 f"translation augmentation has no room: native_size "
@@ -293,8 +298,7 @@ class Config:
             "augment": (AugmentConfig, d.get("augment", {})),
             "train": (TrainConfig, d.get("train", {})),
         }
-        return cls(**{name: _section(name, kind, raw)
-                      for name, (kind, raw) in sections.items()})
+        return cls(**{name: _section(name, kind, raw) for name, (kind, raw) in sections.items()})
 
     @classmethod
     def load(cls, path: str | Path) -> "Config":
