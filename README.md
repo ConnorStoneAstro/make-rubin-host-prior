@@ -226,6 +226,51 @@ figure, so the count is what tells you.
 
 `--n-samples 0` skips sampling; `--n-checkpoints 0` skips checkpoints entirely.
 
+### Running it in chunks
+
+A scheduler that will not give you a long job means the run has to be a series
+of short ones. The same command line works for every chunk:
+
+```bash
+python scripts/train.py --shards data/ecdfs/shards --config config.json \
+    --out runs/ecdfs --resume
+```
+
+Bare `--resume` takes `<out>/latest` if it exists and starts fresh if it does
+not, so the first submission and every later one are identical.
+
+**`train.steps` is the length of the whole run, not of one chunk.** It is what
+the cosine schedule decays over and what the checkpoint spacing is computed
+from; setting it to the chunk length would restart the schedule every time. A
+chunk runs from wherever the last one stopped until that total, or until a
+signal.
+
+**Stop the job before the scheduler kills it.** On `SIGUSR1` — what
+`sbatch --signal=B:USR1@300` sends ahead of the wall clock — the loop finishes
+the step it is on, writes `latest` with the optimiser state, logs a `stopped`
+event, and returns. It deliberately does **not** write `final`: the run is not
+finished, and the absence of `final` is what tells you there is more to do. No
+samples are drawn on the way out, since the point is to be gone inside the grace
+period. The handler only sets a flag — saving a checkpoint from inside a signal
+handler would run JAX and filesystem work at an arbitrary point in a step — and
+the previous disposition is restored when `train()` returns.
+
+**Four things have to come back**, and the optimiser state is the one that gets
+forgotten:
+
+| | why |
+|---|---|
+| weights | the obvious one |
+| EMA copy | a separate set of parameters, and the one inference uses |
+| **optimiser state** | Adam's moments, **and** the schedule's step count — optax drives warmup and cosine decay from a counter inside it, so a fresh one re-runs the warmup from zero learning rate on a half-trained model |
+| step number | so the EMA warmup continues instead of treating a half-trained model as new |
+
+That is why only `latest/` can be resumed from: the numbered checkpoints carry
+no optimiser state by design. The RNG key is folded with the start step so a
+resumed chunk does not replay noise draws it has already used, and `train.py`
+seeds the batch stream from the start step for the same reason — an iterator
+cannot be fast-forwarded, so the same seed would replay the same batches.
+
 ### 5. Sample
 
 ```bash

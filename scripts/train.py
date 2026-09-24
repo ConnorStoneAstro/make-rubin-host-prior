@@ -25,6 +25,7 @@ import argparse
 import dataclasses
 import json
 import logging
+from pathlib import Path
 
 import jax
 
@@ -58,6 +59,11 @@ def main() -> None:
     p.add_argument("--n-samples", type=int, default=None,
                    help="samples drawn from the EMA model at each checkpoint "
                         "and written as a square grid; 0 to skip sampling")
+    p.add_argument("--resume", nargs="?", const="auto", default=None,
+                   help="continue a run. Bare --resume picks <out>/latest if it "
+                        "exists and starts fresh if it does not, which is what a "
+                        "chunked scheduler job wants: the same command works for "
+                        "the first chunk and every one after it")
     p.add_argument("--eval-every", type=int, default=2000)
     p.add_argument("--eval-size", type=int, default=32)
     p.add_argument("--max-in-memory-gb", type=float, default=16.0)
@@ -98,6 +104,15 @@ def main() -> None:
             config.patch, out_sizes=tuple(args.out_sizes)
         )
 
+    # "auto" means "carry on if there is anything to carry on from".  A runner
+    # script submitting chunk after chunk can then use one command line.
+    resume = args.resume
+    if resume == "auto":
+        latest = Path(args.out) / "latest"
+        resume = str(latest) if (latest / "opt_state.eqx").exists() else None
+        print(f"--resume auto: {'continuing from ' + resume if resume else
+                                'nothing to resume from, starting fresh'}")
+
     transform = LogFluxTransform.from_config(config.transform)
     if args.pooled_cache:
         dataset = PatchDataset.from_pooled_cache(
@@ -119,15 +134,25 @@ def main() -> None:
     # train() prints the full valid-convolution geometry, including exactly how
     # much of each patch the loss crop discards.
 
+    # The batch stream is seeded from where this chunk starts, not from the
+    # config alone: an iterator cannot be fast-forwarded, so a resumed run given
+    # the same seed would replay the exact sequence of batches the previous
+    # chunk already trained on.
+    start = 0
+    if resume:
+        start = json.loads((Path(resume) / "state.json").read_text())["step"]
+
     train(
         model,
-        dataset.batches(config.train.batch_size, seed=config.train.seed),
+        dataset.batches(config.train.batch_size,
+                        seed=config.train.seed + start),
         config,
         out_dir=args.out,
         sde=VESDE.from_config(config.sde),
         eval_batch=dataset.validation_batch(args.eval_size),
         eval_every=args.eval_every,
         on_log=lambda r: print(json.dumps(r)) if "event" not in r else None,
+        resume=resume,
     )
 
 

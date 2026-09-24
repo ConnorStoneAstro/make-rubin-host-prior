@@ -497,3 +497,120 @@ def test_sampling_never_costs_a_run(tmp_path, monkeypatch):
               (tmp_path / "log.jsonl").read_text().splitlines()]
     failed = [e for e in events if "sample_error" in e]
     assert failed and "RESOURCE_EXHAUSTED" in failed[0]["sample_error"]
+
+
+# -- stopping and picking up again ------------------------------------------
+
+
+def _stop_after(n_steps, shape=(4, 1, 16, 16)):
+    """A batch stream that raises SIGUSR1 to this process at step ``n_steps``,
+    which is what a scheduler does ahead of the wall clock."""
+    import os
+    import signal as signal_module
+
+    rng = np.random.default_rng(0)
+    step = 0
+    while True:
+        step += 1
+        if step == n_steps:
+            os.kill(os.getpid(), signal_module.SIGUSR1)
+        yield rng.normal(size=shape).astype(np.float32) * 0.5
+
+
+def test_a_chunked_run_picks_up_where_it_stopped(tmp_path):
+    """The workflow this exists for: a scheduler that will not give you a long
+    job, so the run is a series of short ones.
+
+    Four things have to come back or the second chunk is a different training
+    run: the weights, the EMA copy, the optimiser state -- which holds Adam's
+    moments *and* the learning-rate schedule's position -- and the step.
+    """
+    config = _config(steps=12, n_checkpoints=0, n_samples=0)
+    model = ConvEnergyNet(config.energy, key=jax.random.key(0))
+    train(model, _stop_after(4), config, out_dir=tmp_path, verbose=False)
+
+    stopped_at = json.loads((tmp_path / "latest" / "state.json").read_text())["step"]
+    assert 0 < stopped_at < 12
+    assert not (tmp_path / "final").exists()
+
+    # Chunk two: same command, same config, same output directory.
+    fresh = ConvEnergyNet(config.energy, key=jax.random.key(0))
+    train(fresh, _batches(np.random.default_rng(1)), config, out_dir=tmp_path,
+          verbose=False, resume=tmp_path / "latest")
+
+    assert (tmp_path / "final" / "model.eqx").exists()
+    events = [json.loads(l) for l in (tmp_path / "log.jsonl").read_text().splitlines()]
+    headers = [e for e in events if e.get("event") == "start"]
+    assert len(headers) == 2 and headers[1]["start_step"] == stopped_at
+    # The second chunk began after the first, not at step 1.
+    second = [e["step"] for e in events[events.index(headers[1]):] if "step" in e]
+    assert min(second) > stopped_at
+
+
+def test_only_latest_can_be_resumed_from(tmp_path):
+    """The numbered checkpoints deliberately carry no optimiser state -- it is
+    two more copies of the parameters and only the newest one is ever wanted --
+    so `latest` is the one to point at."""
+    config = _config(steps=8, n_checkpoints=2, n_samples=0)
+    model = ConvEnergyNet(config.energy, key=jax.random.key(0))
+    train(model, _batches(np.random.default_rng(0)), config,
+          out_dir=tmp_path, verbose=False)
+
+    with pytest.raises(FileNotFoundError):
+        train(model, _batches(np.random.default_rng(0)), _config(
+                  steps=16, n_checkpoints=0, n_samples=0),
+              out_dir=tmp_path / "two", verbose=False,
+              resume=tmp_path / "checkpoints" / "step-00000004")
+
+
+def test_a_finished_run_cannot_be_resumed_into_nothing(tmp_path):
+    """train.steps is the length of the whole run across every chunk, so a
+    checkpoint already at it has nothing left to do -- said plainly rather than
+    as a loop that runs zero times and writes a misleading `final`."""
+    config = _config(steps=4, n_checkpoints=1, n_samples=0)
+    model = ConvEnergyNet(config.energy, key=jax.random.key(0))
+    train(model, _batches(np.random.default_rng(0)), config,
+          out_dir=tmp_path, verbose=False)
+
+    with pytest.raises(ValueError, match="nothing left to do"):
+        train(model, _batches(np.random.default_rng(0)), config,
+              out_dir=tmp_path / "again", verbose=False,
+              resume=tmp_path / "latest")
+
+
+def test_a_stop_signal_checkpoints_and_leaves_final_alone(tmp_path):
+    """SIGUSR1 is what a scheduler sends ahead of the wall clock.  The loop
+    finishes its step, writes `latest` with the optimiser state, and returns --
+    and deliberately does *not* write `final`, because the run is not finished
+    and that is what tells the next chunk there is more to do."""
+    import os
+    import signal as signal_module
+
+    config = _config(steps=1000, n_checkpoints=0, n_samples=0)
+    model = ConvEnergyNet(config.energy, key=jax.random.key(0))
+
+    fired = {"done": False}
+
+    def batches():
+        rng = np.random.default_rng(0)
+        n = 0
+        while True:
+            n += 1
+            # Raise it to ourselves once, a few steps in.
+            if n == 3 and not fired["done"]:
+                fired["done"] = True
+                os.kill(os.getpid(), signal_module.SIGUSR1)
+            yield rng.normal(size=(4, 1, 16, 16)).astype(np.float32) * 0.5
+
+    train(model, batches(), config, out_dir=tmp_path, verbose=False)
+
+    assert (tmp_path / "latest" / "opt_state.eqx").exists()
+    assert not (tmp_path / "final").exists(), "a stopped run is not a finished one"
+    events = [json.loads(l) for l in (tmp_path / "log.jsonl").read_text().splitlines()]
+    stopped = [e for e in events if e.get("event") == "stopped"]
+    assert len(stopped) == 1
+    assert stopped[0]["signal"] == "SIGUSR1"
+    assert stopped[0]["step"] < config.train.steps
+
+    # And the handler is put back: this is a library, not an application.
+    assert signal_module.getsignal(signal_module.SIGUSR1) is signal_module.SIG_DFL
