@@ -71,23 +71,21 @@ class TransformConfig:
     flux goes negative wherever noise takes it below the subtracted sky, and
     those pixels are smoothly carried towards zero instead.
 
-    ``band_softening`` doubles as the band list: a band with no measured scale
-    is a band the shards had no patches in, and the transform is built over the
-    ones that are there rather than over the ones extraction was asked for.
+    ``s = softening_sigma * pooled sky noise`` sets where the softening turns
+    over, and is the knob that decides how hard the sky is flattened.  At 2.0
+    the pedestal sits at 1.39 sigma and pixels within the noise are compressed
+    towards it: the prior describes the galaxy rather than this realisation of
+    the sky, which is what the likelihood is for.
 
-    ``s_band = softening_sigma * pooled sky noise`` sets where the softening
-    turns over, and is the knob that decides how hard the sky is flattened.  At
-    2.0 the pedestal sits at 1.39 sigma and pixels within the noise are
-    compressed towards it: the prior describes the galaxy rather than this
-    realisation of the sky, which is what the likelihood is for.
-
-    The sky therefore lands at ``log(s_band * log 2)``, which differs between
-    bands.  That is the cost of an absolute flux scale and it is deliberate --
-    see ``data.transform``.
+    **One scale, for every band.**  It used to be a dict per band, which bought
+    the transform nothing once ``forward`` became ``log(f_s)`` -- see
+    ``data.transform``.  With one scale the sky lands at ``log(s * log 2)``
+    everywhere, and the bands differ only in how wide the sky is about it.
     """
 
-    band_softening: dict[str, float] = field(default_factory=dict)  # nJy, per band
-    softening_sigma: float = 2.0  # s_band = softening_sigma * pooled sky noise
+    #: nJy.  Measured by ``prepare_config.py``; None until then.
+    softening: float | None = None
+    softening_sigma: float = 2.0  # s = softening_sigma * pooled sky noise
 
 
 @dataclass
@@ -190,10 +188,25 @@ class TrainConfig:
     #: square grid, so the run's progress is visible as pictures rather than only
     #: as a loss curve.  0 disables sampling.  64 is an 8x8 grid.
     n_samples: int = 64
-    #: Probability-flow ODE steps per sample.  Heun costs two score evaluations
-    #: per step, and each one is over a canvas 4R larger than the sample, so this
-    #: is the knob that decides what a checkpoint costs.
-    sample_steps: int = 256
+    #: Probability-flow ODE steps per sample.  This is the knob that decides
+    #: what a checkpoint costs, and it is easy to get badly wrong: Heun takes
+    #: two score evaluations per step, each over the whole batch on a canvas 4R
+    #: larger than the sample, and a score evaluation is a backward pass because
+    #: the score *is* a gradient.  So a checkpoint is ``2 * sample_steps``
+    #: batched backward passes.
+    #:
+    #: Measured on a NERSC GPU: 64 samples at 128 steps is **7 s**, plus a ~10 s
+    #: one-off compile.  Ten checkpoints therefore cost about a minute, which is
+    #: nothing beside the training they punctuate, so this is not a number worth
+    #: economising on.
+    #:
+    #: It was briefly set to 32 on the strength of a CPU measurement scaled to a
+    #: GPU by a guessed factor of 200.  The real ratio for this workload is
+    #: ~11000x: a GPU absorbs the batch almost for free where a CPU pays linearly
+    #: for it, so scaling across both batch size and hardware at once was never
+    #: going to hold.  On a CPU this is hours either way -- use ``n_samples = 0``
+    #: there rather than trimming steps.
+    sample_steps: int = 128
 
     def checkpoint_steps(self) -> list[int]:
         """The steps to checkpoint at: ``n_checkpoints`` of them, evenly spread,
@@ -270,21 +283,6 @@ class Config:
     def save(self, path: str | Path) -> None:
         Path(path).write_text(json.dumps(self.to_dict(), indent=2, sort_keys=True))
 
-    #: Keys that used to exist, and what to do about each.  A config is written
-    #: by ``prepare_config.py`` and then sits on disk across code changes, so a
-    #: renamed field arrives as a bare ``TypeError`` naming a keyword and
-    #: nothing else.  This turns it into an instruction.
-    #: No annotation: an annotated class attribute in a dataclass becomes a
-    #: field, and a dict default is then refused outright.
-    _RETIRED = {
-        "ckpt_every": "replaced by train.n_checkpoints, which spreads that many "
-                      "checkpoints over the run instead of needing an interval "
-                      "recomputed by hand whenever steps changes",
-        "log_scale": "removed; it was 1.0 everywhere and nothing ever set it, "
-                     "and the transform is now x = log(s*softplus(f/s)) with no "
-                     "rescaling",
-    }
-
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> "Config":
         sections = {
@@ -304,24 +302,21 @@ class Config:
 
 
 def _section(name: str, kind, raw: dict[str, Any]):
-    """Build one config section, saying what to do about a key it no longer has.
+    """Build one config section, refusing a key it does not have.
 
-    A config lives on disk between a ``prepare_config.py`` run and a training
-    run, so it outlives code changes.  Without this a renamed field surfaces as
-    ``TypeError: __init__() got an unexpected keyword argument`` -- true, and
-    silent about whether the field moved, was renamed, or was deliberately
-    dropped.
+    A config is written by ``prepare_config.py`` and then sits on disk across
+    code changes, so it outlives them.  Without this a renamed field surfaces as
+    ``TypeError: __init__() got an unexpected keyword argument``, which is true
+    and says nothing about what to do.  The answer is the same whatever the key
+    was, so that is what it says.
     """
     known = {f.name for f in dataclasses.fields(kind)}
     unknown = sorted(set(raw) - known)
     if unknown:
-        notes = [f"  {k}: {Config._RETIRED[k]}" for k in unknown
-                 if k in Config._RETIRED]
         raise ValueError(
             f"config section {name!r} has no field(s) {unknown}; it has "
-            f"{sorted(known)}."
-            + ("\n" + "\n".join(notes) if notes else "")
-            + "\nRe-run scripts/prepare_config.py to write a current one."
+            f"{sorted(known)}. This config predates the current code; re-run "
+            f"scripts/prepare_config.py to write a new one."
         )
     return kind(**raw)
 

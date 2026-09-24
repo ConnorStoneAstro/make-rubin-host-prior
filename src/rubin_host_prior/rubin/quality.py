@@ -108,6 +108,107 @@ SOURCE_NSIGMA: float = 3.0
 #: block covered by a galaxy has no sky in it to report.
 MIN_USABLE_FRACTION: float = 0.5
 
+#: Side of the central window the host is measured in, native pixels.  16 px is
+#: 3.2 arcsec at the DP2 plate scale, comfortably inside a host selected at
+#: reff >= 1.5 arcsec and small enough that an empty centre cannot hide behind
+#: the galaxy's own outskirts.
+CENTRE_WINDOW_PX: int = 16
+
+#: A peak counts only this far above the sky, after smoothing.
+PEAK_NSIGMA: float = 5.0
+
+#: Box smoothing applied before finding peaks, native pixels.  Without it every
+#: noise wiggle riding on a bright galaxy is a local maximum above the
+#: threshold, and the count measures the *area* above 5 sigma rather than the
+#: number of sources -- a smooth Gaussian galaxy counted 88 peaks that way.
+PEAK_SMOOTH_PX: int = 3
+
+#: A peak must be the largest pixel within this radius.  Roughly the PSF, so two
+#: sources closer than this count once.  At radius 3 a smooth galaxy counts 1,
+#: the same galaxy with six stars on it counts 7, and a field of 200 stars
+#: counts 185; at radius 2 the galaxy alone already counts 7.
+PEAK_RADIUS_PX: int = 3
+
+
+def _box_smooth(a: np.ndarray, k: int) -> np.ndarray:
+    """Separable box mean over a ``k x k`` window.  Wraps at the edges, which
+    the border trim in ``count_peaks`` discards."""
+    out = a
+    for axis in (0, 1):
+        acc = np.zeros_like(out)
+        for shift in range(-(k // 2), k // 2 + 1):
+            acc += np.roll(out, shift, axis=axis)
+        out = acc / k
+    return out
+
+
+def _max_filter(a: np.ndarray, r: int) -> np.ndarray:
+    """Separable maximum over a ``(2r+1) x (2r+1)`` window."""
+    out = a
+    for axis in (0, 1):
+        m = out
+        for k in range(1, r + 1):
+            m = np.maximum(m, np.roll(out, k, axis=axis))
+            m = np.maximum(m, np.roll(out, -k, axis=axis))
+        out = m
+    return out
+
+
+def centre_brightness(image: np.ndarray, sky_noise: float) -> float:
+    """Median of the central window, in units of the sky noise.
+
+    The catalogue says a host is there; this asks the pixels.  DP2's Sersic fits
+    are not always right, and a stamp centred on a fit that found nothing is an
+    empty piece of sky that passed every magnitude and surface-brightness cut on
+    the way in -- the cuts are on catalogue quantities, and if the catalogue is
+    wrong they cannot help.
+
+    The coadd is background-subtracted, so sky is zero and this is a
+    signal-to-noise per pixel.  The median rather than the mean, so a single
+    bright neighbour clipping the window cannot stand in for a host.
+    """
+    h, w = image.shape
+    half = min(CENTRE_WINDOW_PX, h, w) // 2
+    cy, cx = h // 2, w // 2
+    centre = image[cy - half:cy + half, cx - half:cx + half]
+    finite = centre[np.isfinite(centre)]
+    if not finite.size or not np.isfinite(sky_noise) or sky_noise <= 0:
+        return float("nan")
+    return float(np.median(finite) / sky_noise)
+
+
+def count_peaks(image: np.ndarray, sky_noise: float) -> int:
+    """How many distinct sources are in the stamp.
+
+    A crowded star field and a galaxy are both bright and both fill the
+    ``DETECTED`` plane, so no plane fraction tells them apart.  The number of
+    distinct peaks does: a host is one source with a handful of companions, and
+    a field that is nothing but stars has hundreds of them.
+
+    Smooth, then keep every pixel that is the largest within ``PEAK_RADIUS_PX``
+    and more than ``PEAK_NSIGMA`` above the sky.  The radius is what matters:
+    the naive version -- every 8-connected local maximum above the threshold --
+    counts the noise riding on a bright galaxy and so measures how much of the
+    stamp is bright rather than how many sources are in it.  Measured on one
+    host: 102 peaks naively, 12 with the smoothing alone, 1 as shipped.  The
+    smoothing earns its place by letting the radius stay near the PSF instead of
+    having to grow to suppress noise.
+
+    Separable filters over shifted views, so no scipy and a handful of passes.
+    ``np.roll`` wraps, so the border is trimmed.  A saturated flat top counts
+    once per tied pixel rather than once, which is a real overcount -- but a
+    saturated core is gated on its own plane long before this matters.
+    """
+    if not np.isfinite(sky_noise) or sky_noise <= 0:
+        return -1
+    a = _box_smooth(np.where(np.isfinite(image), image, 0.0).astype(float),
+                    PEAK_SMOOTH_PX)
+    # Smoothing over k x k independent pixels divides the noise by k.
+    hit = (a >= _max_filter(a, PEAK_RADIUS_PX)) & (
+        a > PEAK_NSIGMA * sky_noise / PEAK_SMOOTH_PX)
+    trim = PEAK_RADIUS_PX + PEAK_SMOOTH_PX
+    return int(np.count_nonzero(hit[trim:-trim, trim:-trim]))
+
 
 def variance_floors(variance: np.ndarray, image: np.ndarray) -> np.ndarray:
     """Low envelope of the sky variance on a block grid, in reading order.
@@ -189,6 +290,8 @@ def gate(
     max_variance_step: float,
     max_cell_depth_ratio: float,
     min_visits: int | None,
+    min_centre_sigma: float | None,
+    max_peaks: int | None,
     cell_depth_ratio: float,
     n_visits: int,
 ) -> tuple[list[str], dict[str, float]]:
@@ -273,8 +376,23 @@ def gate(
         reasons.append(f"variance_step:{step:.2f}>{max_variance_step}")
 
     finite = variance[~no_data]
-    diag["sky_noise"] = (float(np.sqrt(np.median(finite))) if finite.size
-                         else float("nan"))
+    sky_noise = (float(np.sqrt(np.median(finite))) if finite.size
+                 else float("nan"))
+    diag["sky_noise"] = sky_noise
+
+    # Is there actually a host here, and is it a galaxy?  Every cut before this
+    # one is on a catalogue quantity, so a wrong Sersic fit sails through all of
+    # them: the magnitude and surface-brightness limits are statements about
+    # what the pipeline measured, not about what is in the pixels.
+    diag["centre_sigma"] = centre_brightness(image, sky_noise)
+    if (min_centre_sigma is not None and np.isfinite(diag["centre_sigma"])
+            and diag["centre_sigma"] < min_centre_sigma):
+        reasons.append(f"empty_centre:{diag['centre_sigma']:.2f}<{min_centre_sigma}")
+
+    diag["n_peaks"] = float(count_peaks(image, sky_noise))
+    if (max_peaks is not None and diag["n_peaks"] >= 0
+            and diag["n_peaks"] > max_peaks):
+        reasons.append(f"crowded:{int(diag['n_peaks'])}>{max_peaks}")
 
     zero_bit = plane_bitmask(plane_dict, zero_tol)
     if zero_bit and np.any(mask & zero_bit):

@@ -126,9 +126,17 @@ def train(
     checkpoints = set(cfg.checkpoint_steps())
     if verbose and checkpoints:
         print(f"  {len(checkpoints)} checkpoints at steps "
-              f"{sorted(checkpoints)[:3]}...{max(checkpoints)}"
-              + (f", each with {cfg.n_samples} samples"
-                 if cfg.n_samples else ", no samples"))
+              f"{sorted(checkpoints)[:3]}...{max(checkpoints)}")
+        if cfg.n_samples:
+            # Said up front, because it is easy to ask for far more than
+            # intended and the first checkpoint is a long way into the run.
+            canvas = config.patch.out_size + 2 * margin
+            print(f"  each draws {cfg.n_samples} samples on a {canvas}x{canvas} "
+                  f"canvas ({config.patch.out_size} + 4R) in "
+                  f"{2 * cfg.sample_steps} batched backward passes; "
+                  f"--n-samples 0 to skip")
+        else:
+            print("  no samples (n_samples = 0)")
     log_path = out / "log.jsonl"
     running = None
     t0 = time.time()

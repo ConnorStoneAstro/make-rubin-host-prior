@@ -20,7 +20,7 @@ from rubin_host_prior.data import (
     LogFluxTransform,
     PatchDataset,
     ShardSet,
-    estimate_band_softening,
+    estimate_softening,
     pool_shards,
 )
 from rubin_host_prior.data.synthetic import write_synthetic_shards
@@ -45,11 +45,11 @@ def dataset(shards):
                                       nominal_crop=96, out_size=32,
                                       pool_factor=3, out_sizes=(24, 32)))
     pooled, bands = pool_shards(shards, config)
-    config.transform.band_softening = estimate_band_softening(
-        pooled, bands, config.transform.softening_sigma, bands=shards.bands
+    config.transform.softening = estimate_softening(
+        pooled, config.transform.softening_sigma
     )
     return PatchDataset.from_shards(
-        shards, config, LogFluxTransform.from_config(config.transform, shards.bands)
+        shards, config, LogFluxTransform.from_config(config.transform)
     )
 
 
@@ -89,13 +89,10 @@ def test_transform_figure_marks_the_predicted_sky_position(dataset, tmp_path):
     assert path.exists()
     assert sum(1 for ax in fig.axes if ax.images) == 6  # 2 rows x 3 stages
     hist_ax = [ax for ax in fig.axes if ax.patches and not ax.images][0]
-    # One line per band present, each at that band's log(s*log2).
-    marked = sorted(ln.get_xdata()[0] for ln in hist_ax.lines)
-    expected = sorted(
-        float(dataset.transform.sky_level(np.array([i]))[0])
-        for i in {int(b) for b in dataset.band_idx}
-    )
-    assert marked == pytest.approx(expected)
+    # One line, at log(s*log2): a single softening scale puts every band's sky
+    # in the same place.
+    marked = [ln.get_xdata()[0] for ln in hist_ax.lines]
+    assert marked == pytest.approx([dataset.transform.sky_level])
     assert expected_sky_scatter(dataset.config.transform.softening_sigma) > 0
     plt.close(fig)
 

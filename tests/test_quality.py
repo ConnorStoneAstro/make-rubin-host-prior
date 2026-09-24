@@ -31,8 +31,18 @@ _Y, _X = np.mgrid[0:SIZE, 0:SIZE]
 R2 = ((_X - SIZE / 2) ** 2 + (_Y - SIZE / 2) ** 2) / (SIZE / 2) ** 2
 
 
-def _scene(extra=0.0, seed=0):
-    return np.random.default_rng(seed).normal(0.0, SKY, (SIZE, SIZE)) + extra
+#: A moderate host at the centre, which every candidate stamp has: the gate now
+#: asks whether one is there, so a scene of bare noise is *correctly* rejected
+#: and would make every artefact test below fail for the wrong reason.
+HOST = 30.0 * SKY * np.exp(-(((_X - SIZE / 2) ** 2 + (_Y - SIZE / 2) ** 2)
+                             / (2 * 12.0**2)))
+
+
+def _scene(extra=None, seed=0):
+    """A stamp with a host in it.  Pass ``extra`` for a different one, or
+    ``0.0`` for the empty sky that the centre cut exists to catch."""
+    base = np.random.default_rng(seed).normal(0.0, SKY, (SIZE, SIZE))
+    return base + (HOST if extra is None else extra)
 
 
 #: ``gate`` has no tolerances of its own -- extraction.yaml, via PatchCuts, is
@@ -89,12 +99,18 @@ def test_gating_on_a_plane_that_marks_real_sources_is_refused():
 
 
 @pytest.mark.parametrize("label,extra", [
-    ("blank sky", 0.0),
     ("bright galaxy", 900.0 * np.exp(-R2 * 40)),
     ("steep centre", 4000.0 * np.exp(-R2 * 300)),
 ])
 def test_real_scenes_are_accepted(label, extra):
     assert _gate(_scene(extra))[0] == [], label
+
+
+def test_blank_sky_is_not_a_real_scene():
+    """It used to be in the list above.  A stamp with nothing at its centre is
+    exactly what a wrong Sersic fit delivers, and every cut before the gate is
+    on a catalogue quantity that such a fit satisfies."""
+    assert any(r.startswith("empty_centre") for r in _gate(_scene(0.0))[0])
 
 
 def test_a_single_flagged_pixel_does_not_disqualify_a_stamp():
@@ -201,7 +217,7 @@ def test_a_depth_step_is_measured_at_its_true_ratio(step):
     assert _step(_var(step)) == pytest.approx(step, rel=0.15, abs=0.1)
 
 
-def test_a_step_is_found_wherever_it_falls_and_survives_a_galaxy():
+def test_a_step_is_found_wherever_it_falls_and_survives_a_scene():
     """The blocks are not aligned to cells, so a boundary anywhere must show --
     and masking the source must not mask the evidence."""
     for frac in (0.2, 0.35, 0.5, 0.75):
@@ -281,3 +297,81 @@ def test_absolute_depth_is_recorded_and_gated_only_on_request():
     assert any(r.startswith("too_shallow")
                for r in _gate(_scene(), n_visits=2, min_visits=10)[0])
     assert not _gate(_scene(), n_visits=30, min_visits=10)[0]
+
+
+# -- is a host there, and is it a galaxy? -----------------------------------
+
+
+def _star_field(n=200, seed=1):
+    rng = np.random.default_rng(seed)
+    out = rng.normal(0.0, SKY, (SIZE, SIZE))
+    for _ in range(n):
+        y, x = rng.integers(8, SIZE - 8, 2)
+        out += 40 * SKY * np.exp(-(((_X - x) ** 2 + (_Y - y) ** 2) / (2 * 1.5**2)))
+    return out
+
+
+def test_an_empty_centre_is_caught_by_the_pixels_not_the_catalogue():
+    """Every host cut runs on a catalogue quantity, so a Sersic fit that found
+    nothing passes the magnitude and surface-brightness limits and arrives as a
+    stamp of empty sky.  This is the same question asked of the pixels."""
+    from rubin_host_prior.rubin.quality import centre_brightness
+
+    assert centre_brightness(_scene(0.0), SKY) == pytest.approx(0.0, abs=0.5)
+    assert centre_brightness(_scene(), SKY) > 20
+
+    assert any(r.startswith("empty_centre") for r in _gate(_scene(0.0))[0])
+    assert not any(r.startswith("empty_centre") for r in _gate(_scene())[0])
+    # Recorded either way, so a threshold can be retuned from the manifest.
+    assert _gate(_scene())[1]["centre_sigma"] > 20
+    assert _gate(_scene(0.0))[1]["centre_sigma"] == pytest.approx(0.0, abs=0.5)
+    # None disables it rather than meaning zero.
+    assert not any(r.startswith("empty_centre")
+                   for r in _gate(_scene(0.0), min_centre_sigma=None)[0])
+
+
+def test_a_crowded_field_is_told_from_a_galaxy_by_counting_sources():
+    """Both are bright and both fill the DETECTED plane, so no mask fraction
+    separates them.  The number of distinct peaks does."""
+    from rubin_host_prior.rubin.quality import count_peaks
+
+    assert count_peaks(_scene(0.0), SKY) == 0
+    assert count_peaks(_scene(), SKY) == 1        # one host, not its bright area
+    assert count_peaks(_star_field(), SKY) > 100
+
+    assert any(r.startswith("crowded") for r in _gate(_star_field(), max_peaks=100)[0])
+    assert not any(r.startswith("crowded") for r in _gate(_scene(), max_peaks=100)[0])
+    assert _gate(_scene())[1]["n_peaks"] == 1
+    # None disables it rather than meaning zero.
+    assert not any(r.startswith("crowded")
+                   for r in _gate(_star_field(), max_peaks=None)[0])
+
+
+def test_the_prominence_radius_is_what_stops_a_galaxy_counting_as_a_crowd():
+    """The naive version -- every 8-connected local maximum above 5 sigma --
+    counts noise riding on a bright galaxy, so it measures how much of the stamp
+    is bright rather than how many sources are in it.  Measured on one host:
+    102 peaks naively, 12 with the smoothing alone, 1 as shipped.
+
+    The radius does most of the work and the smoothing is what lets the radius
+    stay small; neither alone is the reason, which is worth pinning down since
+    the docstring first claimed it was the smoothing.
+    """
+    from rubin_host_prior.rubin import quality
+
+    host = _scene()
+    assert quality.count_peaks(host, SKY) == 1
+
+    def with_(**over):
+        keep = {k: getattr(quality, k) for k in over}
+        try:
+            for k, v in over.items():
+                setattr(quality, k, v)
+            return quality.count_peaks(host, SKY)
+        finally:
+            for k, v in keep.items():
+                setattr(quality, k, v)
+
+    assert with_(PEAK_SMOOTH_PX=1, PEAK_RADIUS_PX=1) > 50   # the naive count
+    assert with_(PEAK_RADIUS_PX=1) > 5                      # smoothing alone
+    assert with_(PEAK_SMOOTH_PX=1) == 1                     # radius alone

@@ -29,7 +29,7 @@ from typing import Iterator
 import h5py
 import numpy as np
 
-from ..config import BANDS, Config
+from ..config import Config
 from .augment import random_dihedral
 from .diagnostics import correlation_length
 from .pooling import pool_to_training_grid
@@ -41,10 +41,7 @@ def cache_key(config: Config, transform: LogFluxTransform, shards: ShardSet) -> 
     """Hash of everything that affects the cached pooled array."""
     payload = {
         "patch": asdict(config.patch),
-        "transform": {
-            "softening": list(transform.softening),
-            "bands": list(transform.bands),
-        },
+        "transform": {"softening": transform.softening},
         "shards": [p.name for p in shards.paths],
         "counts": [int(c) for c in shards.counts],
     }
@@ -87,20 +84,9 @@ class PatchDataset:
                 f"shards hold {shards.native_size}-pixel stamps but the config "
                 f"asks for {config.patch.native_size}"
             )
-        # The softening is measured per band, so a band the shards contain but
-        # the config never saw has no scale.  Catch it here, where the band can
-        # be named, rather than as a NaN that propagates into training or an
-        # IndexError from deep inside the transform.
-        present = sorted({int(i) for i in shards.meta["band_idx"]})
-        unscaled = [BANDS[i] for i in present
-                    if i < len(transform.softening)
-                    and not np.isfinite(transform.softening[i])]
-        if unscaled or any(i >= len(transform.softening) for i in present):
-            raise ValueError(
-                f"these shards contain band(s) {unscaled or 'beyond the config'} "
-                f"with no softening scale. The config was prepared against a "
-                f"different shard set; re-run scripts/prepare_config.py on these."
-            )
+        # No per-band check any more: there is one softening scale and
+        # ``from_config`` refuses a config without it, so a shard set cannot
+        # contain a band the transform has no scale for.
         gb = shards.nbytes("image") / 1024**3
         if in_memory == "auto":
             in_memory = gb <= max_in_memory_gb
@@ -181,7 +167,7 @@ class PatchDataset:
     ) -> np.ndarray:
         out = self._pool(indices, rng, translate, scale_jitter, out_size)
         # Pool in flux, THEN take the log.
-        return self.transform.forward(out, self.band_idx[indices])
+        return self.transform.forward(out)
 
     def make_batch(
         self,
@@ -302,19 +288,14 @@ class PatchDataset:
         rng = np.random.default_rng(seed)
         idx = np.sort(rng.choice(len(self), size=min(n, len(self)), replace=False))
         x = self.make_batch(idx, rng=rng, augment=False)[:, 0]
-        # The sky width, measured **within each band** and then taken across
-        # them.  Most pixels in a patch are sky, so the 16-84 half-width is the
-        # sky scatter -- but x is absolute log flux, so each band's sky sits at
-        # its own log(s*log2), and pooling the bands before taking percentiles
-        # would measure the spread between those levels instead.  That is a
-        # different and much larger number, and it would drag sigma_min up with
-        # it.
-        bands_here = np.asarray(self.band_idx[idx], dtype=int)
-        widths = []
-        for i in sorted({int(b) for b in bands_here}):
-            lo, hi = np.percentile(x[bands_here == i], [16, 84])
-            widths.append(0.5 * (hi - lo))
-        sky_scatter = float(np.median(widths))
+        # Most pixels in a patch are sky, so the 16-84 half-width is the sky
+        # scatter.  Taken across all the bands at once, which is meaningful
+        # again now there is a single softening scale: every band's sky sits at
+        # the same log(s * log 2), so this measures the width of one peak rather
+        # than the spread between six of them.  The bands do have different
+        # widths about that shared level, so what this gives is a typical one.
+        p16, p84 = np.percentile(x, [16, 84])
+        sky_scatter = float(0.5 * (p84 - p16))
         deepest_sigma = np.nan
         if self._pooled is None:
             flux = self._pool(idx, rng=None, translate=False, scale_jitter=0.0)
@@ -352,15 +333,9 @@ class PatchDataset:
             # Informational only: softplus has no floor, so however deep this
             # goes the pixel is representable.
             "deepest_flux_sigma": deepest_sigma,
-            # Per band, because x is absolute log flux: the sky sits at
-            # log(s_band * log 2) and the bands have different depths.  Only the
-            # bands actually present, so an unmeasured one shows as absent
-            # rather than as NaN.
-            "sky_level": {
-                self.transform.bands[i]:
-                    float(self.transform.sky_level(np.array([i]))[0])
-                for i in sorted({int(b) for b in self.band_idx[idx]})
-            },
+            # One number: with a single softening scale every band's sky sits
+            # at the same log(s * log 2).
+            "sky_level": self.transform.sky_level,
         }
 
 

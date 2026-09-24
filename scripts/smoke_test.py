@@ -25,7 +25,7 @@ from rubin_host_prior.data import (
     LogFluxTransform,
     PatchDataset,
     ShardSet,
-    estimate_band_softening,
+    estimate_softening,
     expected_sky_scatter,
     pool_shards,
     context_advice,
@@ -80,8 +80,8 @@ def main() -> None:
     config.train.log_every = max(args.steps // 10, 1)
     config.train.n_checkpoints = 0
     pooled, pooled_bands = pool_shards(shards, config)
-    config.transform.band_softening = estimate_band_softening(
-        pooled, pooled_bands, config.transform.softening_sigma
+    config.transform.softening = estimate_softening(
+        pooled, config.transform.softening_sigma
     )
     transform = LogFluxTransform.from_config(config.transform)
     dataset = PatchDataset.from_shards(shards, config, transform)
@@ -90,11 +90,11 @@ def main() -> None:
     # x is absolute log flux, so the data is not centred on zero and the t=1
     # marginal is not either.
     config.sde.data_mean = float(stats["mean"])
-    print(f"[2] softening {({k: round(v, 1) for k, v in config.transform.band_softening.items()})}")
+    print(f"[2] softening {config.transform.softening:.1f} nJy")
     print(f"    sky_scatter {stats['sky_scatter']:.3f} (expect ~"
           f"{expected_sky_scatter(config.transform.softening_sigma):.2f}), "
           f"deepest {stats['deepest_flux_sigma']:.1f} sigma")
-    print(f"    sky level per band {({k: round(v, 2) for k, v in stats['sky_level'].items()})}")
+    print(f"    sky level {stats['sky_level']:.2f} (every band)")
     print(f"    sigma range [{config.sde.sigma_min:.4f}, {config.sde.sigma_max:.2f}]"
           f" about data mean {config.sde.data_mean:.2f}")
     cl = dataset.correlation_length(128)

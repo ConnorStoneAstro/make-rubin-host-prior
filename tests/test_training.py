@@ -29,7 +29,7 @@ def _config(**train_kw):
         patch=PatchConfig(native_size=128, nominal_crop=48, out_size=16,
                           pool_factor=3),
     )
-    c.transform.band_softening = {b: 20.0 for b in BANDS}
+    c.transform.softening = 20.0
     c.train.steps = 12
     c.train.batch_size = 4
     c.train.log_every = 4
@@ -218,7 +218,7 @@ def test_checkpoint_round_trips_exactly(tmp_path):
     back_ema, cfg, step = load_checkpoint(tmp_path / "ck", which="ema")
     assert step == 4242
     assert cfg.energy == config.energy
-    assert cfg.transform.band_softening == config.transform.band_softening
+    assert cfg.transform.softening == config.transform.softening
     np.testing.assert_array_equal(
         np.asarray(back_ema.head.weight), np.asarray(ema.head.weight)
     )
@@ -250,7 +250,7 @@ def test_config_survives_json(tmp_path):
     assert back.energy == config.energy
     assert isinstance(back.energy.channels, tuple)  # JSON gives a list back
     assert back.patch == config.patch
-    assert back.transform.band_softening == config.transform.band_softening
+    assert back.transform.softening == config.transform.softening
 
 
 def test_patch_config_validates_its_own_arithmetic():

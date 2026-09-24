@@ -61,9 +61,7 @@ def main() -> None:
     print(f"log-space: mean {x.mean():+.3f} std {x.std():.3f} "
           f"range [{x.min():+.2f}, {x.max():+.2f}]")
     print(f"flux: median {np.median(flux):.2f} nJy, max {flux.max():.1f} nJy")
-    if args.band in BANDS:
-        sky = float(transform.sky_level(np.array([BANDS.index(args.band)]))[0])
-        print(f"  {args.band}-band sky sits at x = {sky:.2f}")
+    print(f"  sky sits at x = {transform.sky_level:.2f}, in every band")
 
     try:
         import matplotlib

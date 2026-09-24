@@ -205,6 +205,18 @@ class PatchCuts:
     #: Absolute depth: visits in the shallowest cell the stamp covers.
     min_visits: int | None = None
 
+    #: Is there a host in the middle at all?  Median of the central 16 px
+    #: window, in units of the sky noise.  Every host cut before this is on a
+    #: catalogue quantity, so a Sersic fit that found nothing passes the
+    #: magnitude and surface-brightness limits and arrives as empty sky; this
+    #: is the same question asked of the pixels.  None disables it.
+    min_centre_sigma: float | None = 2.0
+    #: Is it a galaxy, or a crowded field?  Distinct sources in the stamp, from
+    #: a smoothed local-maximum count.  A host is one source plus a few
+    #: companions; a field that is nothing but stars runs to hundreds.  None
+    #: disables it.
+    max_peaks: int | None = 200
+
     def __post_init__(self) -> None:
         # YAML has no tuples, so a loaded file would otherwise compare unequal
         # to the object it was written from.
@@ -225,6 +237,8 @@ class PatchCuts:
             "max_variance_step": (float("inf") if self.max_variance_step is None
                                   else self.max_variance_step),
             "min_visits": self.min_visits,
+            "min_centre_sigma": self.min_centre_sigma,
+            "max_peaks": self.max_peaks,
         }
 
 

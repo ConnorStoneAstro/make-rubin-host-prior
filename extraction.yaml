@@ -97,3 +97,16 @@ patches:
   max_cell_depth_ratio: 3.5
   max_variance_step: 4.0
   min_visits: null
+
+  # Two questions the catalogue cannot answer, asked of the pixels instead.
+  #
+  # min_centre_sigma: is a host actually there?  The magnitude and surface
+  # brightness cuts are statements about what the pipeline measured, so a Sersic
+  # fit that found nothing passes all of them and arrives as empty sky.  This is
+  # the median of the central 16 px, in units of the sky noise.
+  #
+  # max_peaks: is it a galaxy, or a hundred stars?  Both are bright and both
+  # fill the DETECTED plane, so no mask fraction separates them; the count of
+  # distinct sources does.  A host is one peak plus a few companions.
+  min_centre_sigma: 2.0
+  max_peaks: 200

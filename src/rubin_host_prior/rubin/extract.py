@@ -1425,6 +1425,8 @@ def _write_manifest(out_dir: Path, records: Iterable[dict]) -> dict:
 #: Diagnostics whose distribution over *every* attempt, accepted or not, is what
 #: a threshold should be chosen from.
 PERCENTILE_DIAGNOSTICS = (
+    "diag_centre_sigma",
+    "diag_n_peaks",
     "diag_cell_depth_ratio",
     "diag_variance_step",
     "diag_frac_no_data",

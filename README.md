@@ -103,7 +103,7 @@ In rough order of how often they catch something:
 | figure | what to look for |
 |---|---|
 | `rejections.png` | **the important one.** Rejection reasons, and accepted vs rejected sky noise. If the rejected patches are systematically brighter or denser, the gate is discarding exactly the regime this project models, and the tolerances need loosening. |
-| `transform.png` | native flux → pooled → log space for a few patches, plus the pixel-value histogram. One red line per band, at that band's `x = log(s·log 2)`; the sky must pile up on each inside the predicted scatter band, with sources clear of it. If it doesn't, the softening scales are wrong. |
+| `transform.png` | native flux → pooled → log space for a few patches, plus the pixel-value histogram. The sky must pile up on the red line at `x = log(s·log 2)` — one line, since one scale serves every band — inside the predicted scatter band, with sources clear of it. If it doesn't, the softening scale is wrong. |
 | `training_batch.png` | exactly what the network receives: pooled, log-space, augmented, at the training size(s), on a shared colour scale so the spread between patches is visible. |
 | `cutouts.png` | raw stamps as `asinh(flux / sky noise)` — a stretch in σ units with a pinned low end, so bands of very different depth are directly comparable. |
 | `hosts.png` | the selected population: size, distortion, magnitude, surface brightness, Sérsic index, blendedness, band counts, sky noise and depth. |
@@ -124,14 +124,15 @@ shear convention at modest ellipticity.
 python scripts/prepare_config.py --shards data/ecdfs/shards --out config.json
 ```
 
-The per-band softening scales and the σ range are not free hyperparameters;
+The softening scale and the σ range are not free hyperparameters;
 they follow from the noise level and dynamic range. This measures them — from
 pooled patches, not the variance planes, since coadd noise is correlated — and
 prints two checks worth reading:
 
 - `sky_scatter` should match `expected_sky_scatter(softening_sigma)`
-  (= `0.721 / softening_sigma`). If not, the per-band softening scales are wrong
-  and the bands are not on a common footing.
+  (= `0.721 / softening_sigma`). If not, the softening scale is wrong. It is a
+  *typical* width: one scale serves every band, so a deeper or shallower band
+  scatters proportionally less or more about the shared sky level.
 - the flux above which the exponential model map is accurate should sit below
   anything you care about photometrically. The sky pedestal
   (`0.693 × softening_sigma`, in σ) is *meant* to sit above 1σ — 1.39σ at the
@@ -146,21 +147,20 @@ pixel variance sits in the zero-lag noise delta; the estimator renormalises at
 lag 1 to exclude it, because a naive 1/e crossing on the raw profile returns
 ξ ≈ 1 regardless of galaxy size (measured: wrong by 4×).
 
-The softening scale is **measured per band**, so a band the shards contain no
-patches in gets no scale — inventing one would put its turnover wherever the
-guess landed. The script prints the patch count per band and says so when one is
-empty; a band missing entirely usually means the run hit its `n_stamps` target
-before reaching it, or that no coadds exist for those tracts.
+The softening scale is **one number for every band**, measured from the pooled
+sky noise across all the patches. It used to be a dict per band, which brought
+with it a whole apparatus that is now gone: a band the shards had no patches in
+had no scale, so the tuple had to be indexed over the whole of `BANDS` with NaN
+in the gaps (building it over the subset that happened to have patches re-bases
+the indexing and hands an r-band patch the i-band scale), and
+`PatchDataset.from_shards` had to check that every band present had a finite one.
+None of that exists now — there is a scale or there is not, and
+`LogFluxTransform.from_config` refuses a config without one.
 
-The transform is nonetheless **always indexed over the whole of `BANDS`**, with
-NaN where a scale was never measured. `band_idx` in the shards is a global index
-into `BANDS`, so the softening tuple has to be too: building it over the subset
-that happened to have patches silently re-bases the indexing, and with
-`('r','i','z','y')` measured, index 4 runs off the end while index 2 quietly
-returns the i-band scale for an r-band patch. `PatchDataset.from_shards` checks
-that every band actually present has a finite scale and names the ones that do
-not, so the failure arrives where the band can be identified rather than as a
-NaN in training.
+The script still prints the patch count per band, because a band missing
+entirely usually means the extraction hit its `n_stamps` target before reaching
+it, or that no coadds exist for those tracts. It just no longer changes the
+transform.
 
 ### 4. Train
 
@@ -197,17 +197,34 @@ and it only works because nothing is stretched differently between them. The
 colour scale is shared across the whole grid: per-panel scaling would make every
 sample look equally structured, including the ones that are noise.
 
-Sampling is the one step in training that can exhaust device memory on its own —
-the canvas is `4R` larger than the sample and every score evaluation sees all of
-it — so a failure is logged with its reason and training continues. Hours of
+**What a checkpoint costs.** It is `2 × sample_steps` batched backward passes —
+Heun takes two score evaluations per step, each over the whole batch on a canvas
+`4R` larger than the sample, and a score evaluation *is* a backward pass because
+the score is a gradient. The count is printed before training starts.
+
+On a NERSC GPU, 64 samples at the default 128 steps is **7 s**, plus a ~10 s
+one-off compile of the sampler. Ten checkpoints cost about a minute — nothing
+beside the training they punctuate.
+
+On a CPU the same thing is *hours*: a 1M-parameter 8-layer model on a 72 px
+canvas measured 4.7 s per sample per score evaluation, so 64×128 extrapolates to
+around a day. Use `--n-samples 0` there rather than trimming steps.
+
+That ratio is about **11000×**, not the 200× this file briefly claimed while
+`sample_steps` was set to 32 on the strength of a CPU measurement. The error was
+scaling across batch size and hardware at once: a GPU absorbs a batch of 64
+almost for free, where a CPU pays linearly for every sample in it. A measured
+number on the machine you will actually use beats an extrapolated one, and there
+is no reason to economise on a minute.
+
+Sampling is also the one step in training that can exhaust device memory on its
+own, so a failure is logged with its reason and training continues — hours of
 training must not be lost to a diagnostic. The log line for each checkpoint
 carries `sample_mean`, `sample_std` and `sample_nonfinite`; a diverged sampler
 produces `inf` rather than an error, and a grid of those looks like a blank
 figure, so the count is what tells you.
 
 `--n-samples 0` skips sampling; `--n-checkpoints 0` skips checkpoints entirely.
-`sample_steps` (default 256) is the probability-flow ODE step count and is what
-decides what a checkpoint costs — Heun is two score evaluations per step.
 
 ### 5. Sample
 
@@ -409,7 +426,7 @@ decades of score magnitude. Set `sigma_scaling="none"` for the unmodified energy
 
 ### The log-space transform
 
-    soften:   f_s = s_band * softplus(f / s_band)       softplus(u) = log(1+e^u)
+    soften:   f_s = s * softplus(f / s)                 softplus(u) = log(1+e^u)
     forward:  x   = log(f_s)                            → log(f) for f ≫ s
     model:    f   = exp(x)                              strictly positive
 
@@ -420,27 +437,32 @@ no band in it at all — `LogFluxTransform.inverse` takes no `band_index` — so
 forward model composing this prior with a likelihood in nJy has no per-band
 offset to undo.
 
-**The price is that each band's sky sits in a different place**, at
-`log(s_band·log 2)`: 2.38 in g and 3.28 in u at DP2-ish depths, a spread of 1.27.
-That is deliberate. An earlier version divided by `s_band` inside the logarithm,
-which put every band's sky at exactly `log(log 2) = −0.367` — it bought a common
-sky level by making `x` a *relative* quantity, so the same flux meant different
-`x` in different bands and the absolute scale of the signal was what got given
-away. Scene flux is what this prior exists to describe, so it is the sky that
-moves. The *width* is unchanged: all six bands scatter by `0.721/softening_sigma`
-about their own level, because the per-band term is an additive constant. What
-the model sees is one sky shape at several levels, not six shapes.
+**There is one softening scale, `s`, for every band.** It was briefly per band,
+and that bought nothing once `forward` became `log(f_s)`: a per-band scale only
+moved each band's sky to its own `log(s_band·log 2)`, spreading the levels over
+1.27 in `x`, while the thing the prior is about — the flux of the scene — was
+already band-independent. With one scale the sky lands at `log(s·log 2)`
+*everywhere*, so the transform gives an absolute flux scale **and** a common sky
+level.
 
-Two things follow, and both are handled rather than assumed away:
+What differs between bands is the *width* of the sky about that level, and that
+is the honest difference: a deep band scatters less than a shallow one, and
+flattening that out was all the per-band scale was doing.
+`expected_sky_scatter(softening_sigma)` is therefore a *typical* width — a band
+deeper or shallower than the noise the scale was measured from scatters
+proportionally less or more.
 
-- **`sky_scatter` is measured per band and then across bands.** Pooling the bands
-  before taking percentiles would measure the spread between their sky *levels*,
-  which is 3–4× larger, and would drag `sigma_min` up with it.
-- **`SDEConfig.data_mean`.** VE only adds noise, so the `t = 1` marginal keeps the
-  data's mean, and `prior_sample` must start from `N(data_mean, σ_max²)`. This was
-  implicitly zero while the sky sat at −0.37; at +3.0 a prior sample centred on
-  zero starts half a `σ_max` away from the distribution the score was trained on.
-  `prepare_config.py` measures it.
+Earlier still, the transform divided by `s_band` inside the logarithm. That also
+gave a common sky level, but by making `x` a *relative* quantity: the same flux
+meant a different `x` in each band, and the absolute scale of the signal was what
+got given away. Scene flux is what this prior exists to describe.
+
+One thing follows that is handled rather than assumed away: **`SDEConfig.data_mean`.**
+VE only adds noise, so the `t = 1` marginal keeps the data's mean, and
+`prior_sample` must start from `N(data_mean, σ_max²)`. This was implicitly zero
+while the sky sat at −0.37; at +3.0 a prior sample centred on zero starts half a
+`σ_max` away from the distribution the score was trained on. `prepare_config.py`
+measures it.
 
 The softening is written as `s · softplus(f/s)` because that form has **one**
 parameter, it is a flux, and above it the map is the identity: `softplus(u) → u`
@@ -460,7 +482,7 @@ band's own scale. `forward` does not call it — it goes through `log_softplus`,
 for the underflow reason above — so a test pins `forward == log(soften(f))` and
 `inverse == soften` to keep the implementation and the definition one thing.
 `softening_sigma` likewise has a single home in `TransformConfig`;
-`estimate_band_softening` takes it as a required argument rather than carrying a
+`estimate_softening` takes it as a required argument rather than carrying a
 default of its own, and `prepare_config.py`'s `--softening-sigma` overrides the
 config only when it is actually passed.
 
@@ -546,6 +568,39 @@ the transient goes, and the fraction is recorded either way. Set
 `patches.max_plane_fraction.SATURATED: 0.0` in `extraction.yaml` to follow the
 guidance literally. `DETECTION_EDGE` pixels *are* excluded outright; `NO_DATA` is
 measured as an inf-variance fraction instead — see below.
+
+### Two questions the catalogue cannot answer
+
+Every host cut runs on a **catalogue quantity** — magnitude, surface brightness,
+Sérsic radius. That makes them statements about what the pipeline measured, and
+when the pipeline is wrong they are no help at all. Two failure modes get through
+all of them, and both are caught in the gate, on the pixels:
+
+**Nothing at the centre.** A Sérsic fit that found nothing still has a magnitude
+and a radius, so it passes every limit and arrives as a stamp of empty sky.
+`centre_sigma` is the median of the central 16 px in units of the sky noise —
+about 0 for empty sky, tens for a real host — and `min_centre_sigma` (2.0) gates
+it. 16 px is 3.2″, comfortably inside a host selected at `reff ≥ 1.5″` and small
+enough that an empty centre cannot hide behind the galaxy's outskirts.
+
+**A crowd of stars instead of a galaxy.** Both are bright and both fill the
+`DETECTED` plane, so no mask fraction separates them. The count of distinct
+sources does: `n_peaks` is a smoothed local-maximum count, and `max_peaks` (200)
+gates it. A host is one peak plus a few companions; a field of nothing but stars
+runs to hundreds.
+
+Getting that count right took two goes. The naive version — every 8-connected
+local maximum above 5σ — counts the noise riding on a bright galaxy, so it
+measures *how much of the stamp is bright* rather than how many sources are in
+it: a single smooth galaxy scored 102. Requiring each peak to be the largest
+within a PSF-sized radius fixes it (1 for that galaxy, 185 for a field of 200
+stars), and the 3 px smoothing is what lets the radius stay near the PSF instead
+of growing to suppress noise.
+
+Both are **recorded for every stamp** whether they gate or not, so the thresholds
+can be retuned from `diagnostic_percentiles` in the summary without re-reading
+pixels; `None` disables either. Neither costs a query — they run on the stamp
+that has already been read.
 
 **`INEXACT_PSF` and `REJECTED` are not quality cuts.** They cover a large
 fraction of the DP2 coadd, so gating on them keeps almost nothing. They are

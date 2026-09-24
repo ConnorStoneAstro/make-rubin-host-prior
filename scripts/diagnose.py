@@ -36,7 +36,7 @@ from rubin_host_prior.data import (
     LogFluxTransform,
     PatchDataset,
     ShardSet,
-    estimate_band_softening,
+    estimate_softening,
     pool_shards,
 )
 
@@ -99,15 +99,12 @@ def main() -> None:
     dataset = None
     if args.config:
         config = Config.load(args.config)
-        if not config.transform.band_softening:
-            # A config written before prepare_config.py ran: derive the scales
+        if config.transform.softening is None:
+            # A config written before prepare_config.py ran: derive the scale
             # here so the loader figures are still available.
-            pooled, pooled_bands = pool_shards(shards, config, n=512)
-            config.transform.band_softening = estimate_band_softening(
-                pooled,
-                pooled_bands,
-                config.transform.softening_sigma,
-                bands=shards.bands,
+            pooled, _ = pool_shards(shards, config, n=512)
+            config.transform.softening = estimate_softening(
+                pooled, config.transform.softening_sigma
             )
         dataset = PatchDataset.from_shards(
             shards, config, LogFluxTransform.from_config(config.transform)

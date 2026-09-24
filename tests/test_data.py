@@ -14,7 +14,7 @@ from rubin_host_prior.data import (
     block_mean,
     cache_key,
     dihedral,
-    estimate_band_softening,
+    estimate_softening,
     log_softplus,
     soften,
     softplus,
@@ -38,14 +38,10 @@ from rubin_host_prior.data.synthetic import write_synthetic_shards
 # carried smoothly towards zero instead of being represented faithfully.
 
 
-def _transform(softening=None, **kw):
-    softening = softening or {b: 4.0 for b in BANDS}
+def _transform(softening=4.0, **kw):
     return LogFluxTransform.from_config(
-        TransformConfig(band_softening=softening, **kw)
+        TransformConfig(softening=softening, **kw)
     )
-
-
-R = np.array([BANDS.index("r")])
 
 
 def test_every_map_is_built_from_the_one_softening_definition():
@@ -60,19 +56,19 @@ def test_every_map_is_built_from_the_one_softening_definition():
     from rubin_host_prior.data.transform import soften
 
     t = _transform()
-    s = t.softening[R[0]]
+    s = t.softening
     f = np.array([[-400.0, -40.0, -4.0, 0.0, 4.0, 40.0, 4e5]])
 
-    assert t.forward(f, R) == pytest.approx(np.log(soften(f, s)))
-    assert t.soften(f, R) == pytest.approx(soften(f, s))
-    assert t.inverse(t.forward(f, R)) == pytest.approx(soften(f, s), rel=1e-10)
+    assert t.forward(f) == pytest.approx(np.log(soften(f, s)))
+    assert t.soften(f) == pytest.approx(soften(f, s))
+    assert t.inverse(t.forward(f)) == pytest.approx(soften(f, s), rel=1e-10)
 
     # And the reason forward is not written that way.  At f/s = -1000 the
     # softened flux underflows to zero and the naive composition is -inf;
     # forward returns the exact limit, f/s + log(s).
     deep = np.array([[-1000.0 * s]])
     assert soften(deep, s)[0, 0] == 0.0
-    assert t.forward(deep, R)[0, 0] == pytest.approx(-1000.0 + np.log(s))
+    assert t.forward(deep)[0, 0] == pytest.approx(-1000.0 + np.log(s))
 
     # Positive everywhere it can be represented.  exp underflows to exactly
     # zero below x = -745 in float64, which is 1e-324 nJy -- far outside
@@ -92,62 +88,68 @@ def test_large_fluxes_pass_through_and_negative_ones_vanish_smoothly():
     to put a hard edge in."""
     t = _transform()
     bright = np.array([[1e3, 1e4, 1e5, 1e6]])
-    assert t.inverse(t.forward(bright, R)) == pytest.approx(bright, rel=1e-3)
+    assert t.inverse(t.forward(bright)) == pytest.approx(bright, rel=1e-3)
 
     negative = np.array([[-2e3, -1e3, -50.0, -5.0]])
-    back = t.inverse(t.forward(negative, R))
-    assert np.all(back > 0) and np.all(back < t.softening[R[0]])
+    back = t.inverse(t.forward(negative))
+    assert np.all(back > 0) and np.all(back < t.softening)
     assert np.all(np.diff(back[0]) > 0)
     # inverse_exact does recover them, which is what makes the loss checkable.
-    assert t.inverse_exact(t.forward(negative, R), R) == pytest.approx(
+    assert t.inverse_exact(t.forward(negative)) == pytest.approx(
         negative, rel=1e-6)
     # Deep negatives go linear in x, which is what keeps the score finite.
-    assert np.all(np.isfinite(t.forward(np.array([[-1e6, -2e6, 0.0, 1e12]]), R)))
+    assert np.all(np.isfinite(t.forward(np.array([[-1e6, -2e6, 0.0, 1e12]]))))
 
 
 def test_the_softening_scale_has_one_source_of_truth():
     """``softening_sigma`` decides how hard the sky is flattened, and it lived
     in two places with different values: TransformConfig said 2.0 (suppress the
-    noise) while estimate_band_softening and prepare_config.py's flag both
+    noise) while estimate_softening and prepare_config.py's flag both
     defaulted to the 1.0 of the earlier preserve-the-noise design, which won
     because the script assigned it unconditionally."""
     import inspect
 
-    from rubin_host_prior.data.transform import estimate_band_softening
+    from rubin_host_prior.data.transform import estimate_softening
 
     assert TransformConfig().softening_sigma == 2.0
-    assert (inspect.signature(estimate_band_softening)
+    assert (inspect.signature(estimate_softening)
             .parameters["softening_sigma"].default is inspect.Parameter.empty)
 
-    script = (Path(__file__).resolve().parent.parent
-              / "scripts" / "prepare_config.py").read_text()
-    assert '"--softening-sigma", type=float, default=None' in script
-    assert "if args.softening_sigma is not None:" in script
+    # Asked of the parser, not grepped out of the source: the same rule stated
+    # as a string literal broke on a reformat, which is a test of the file's
+    # layout rather than of its behaviour.
+    import importlib.util
+
+    root = Path(__file__).resolve().parent.parent
+    spec = importlib.util.spec_from_file_location(
+        "prepare_config", root / "scripts" / "prepare_config.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    defaults = vars(module.parser().parse_args(["--shards", "x", "--out", "y"]))
+    assert defaults["softening_sigma"] is None, (
+        "a numeric default here overrides the config unconditionally")
 
 
-def test_x_is_absolute_log_flux_and_the_sky_is_what_moves():
-    """The trade the transform makes.  A given flux maps to the same x in every
-    band -- x is log(f), so the scene's absolute scale survives -- and the price
-    is that each band's sky sits at its own log(s*log2) instead of all of them
-    landing on one level.  Dividing by s inside the log would buy the common
-    sky level back by making x relative, which is the wrong way round for a
-    prior that has to compose with a likelihood in nJy."""
-    noise = {"u": 28.0, "g": 11.0, "r": 12.0, "i": 16.0, "z": 24.0, "y": 40.0}
-    t = _transform(noise)
+def test_x_is_absolute_log_flux_and_nothing_depends_on_the_band():
+    """One scale for all the data, so neither map takes a band index and both
+    the flux scale and the sky level are shared.
 
-    bright = np.array([[4e5]])
-    everywhere = [t.forward(bright, np.array([i]))[0, 0] for i in range(len(BANDS))]
-    assert everywhere == pytest.approx([np.log(4e5)] * len(BANDS))
+    x is log(f) for anything bright, which is what lets the prior compose with a
+    likelihood in nJy; and zero flux lands at log(s log 2) whatever band the
+    pixel came from.  The per-band scale this replaced gave the first property
+    but not the second, spreading the sky levels over 1.27 in x for nothing.
+    """
+    import inspect
 
-    zeros = np.zeros((1, 1))
-    skies = [t.forward(zeros, np.array([i]))[0, 0] for i in range(len(BANDS))]
-    assert skies == pytest.approx(
-        [np.log(noise[b] * np.log(2.0)) for b in BANDS])
-    assert max(skies) - min(skies) == pytest.approx(np.log(40.0 / 11.0))
-    # Same width about each of those levels, which is what keeps one prior over
-    # all six bands sane: one sky shape at several places, not six shapes.
-    for i in range(len(BANDS)):
-        assert t.sky_level(np.array([i]))[0] == pytest.approx(skies[i])
+    t = _transform(32.0)
+    assert t.forward(np.array([[4e5]]))[0, 0] == pytest.approx(np.log(4e5))
+    assert t.forward(np.zeros((1, 1)))[0, 0] == pytest.approx(t.sky_level)
+    assert t.sky_level == pytest.approx(np.log(32.0 * np.log(2.0)))
+
+    # Not one of these takes a band.
+    for name in ("forward", "soften", "inverse", "inverse_exact", "jacobian"):
+        params = set(inspect.signature(getattr(t, name)).parameters)
+        assert not params & {"band_index", "band", "bands"}, name
 
 
 def test_the_model_map_needs_no_band_and_its_jacobian_is_the_flux():
@@ -162,26 +164,13 @@ def test_the_model_map_needs_no_band_and_its_jacobian_is_the_flux():
     assert t.jacobian(x) == pytest.approx(fd, rel=1e-4)
 
 
-def test_the_softening_is_always_indexed_by_the_global_band_index():
-    """`band_idx` in the shards is an index into BANDS, so the softening tuple
-    has to be too.  Building it over a subset silently re-bases the indexing:
-    with ('r','i','z','y') measured, index 4 runs off the end and index 2
-    quietly returns the i-band scale for an r-band patch."""
-    partial = LogFluxTransform.from_config(
-        TransformConfig(band_softening={"r": 12.0, "i": 16.0, "z": 24.0, "y": 40.0}))
-    assert len(partial.softening) == len(BANDS)
-    assert partial.softening[BANDS.index("r")] == 12.0
-    assert partial.softening[BANDS.index("y")] == 40.0
-    # Unmeasured bands are NaN, which is visible rather than wrong.
-    assert np.isnan(partial.softening[BANDS.index("u")])
-
-    # A caller that knows which bands its data has gets a named error instead.
-    with pytest.raises(ValueError, match="no patches in"):
-        LogFluxTransform.from_config(
-            TransformConfig(band_softening={"r": 12.0}), required_bands=BANDS)
+def test_a_config_without_a_softening_scale_says_so():
+    """It is None until prepare_config.py measures it, and a transform built
+    from that would put the softening's turnover wherever the default landed."""
     with pytest.raises(ValueError, match="prepare_config"):
-        LogFluxTransform.from_config(TransformConfig(band_softening={}),
-                                     required_bands=BANDS)
+        LogFluxTransform.from_config(TransformConfig())
+    with pytest.raises(ValueError, match="positive"):
+        LogFluxTransform.from_config(TransformConfig(softening=-1.0))
 
 
 def test_log_softplus_is_stable_where_the_naive_form_is_not():
@@ -199,9 +188,7 @@ def test_measure_pooled_sky_noise_recovers_a_known_sigma():
 
     rng = np.random.default_rng(0)
     pooled = rng.normal(0.0, 7.0, (60, 32, 32))
-    band = np.arange(60) % 6
-    for v in measure_pooled_sky_noise(pooled, band).values():
-        assert v == pytest.approx(7.0, rel=0.05)
+    assert measure_pooled_sky_noise(pooled) == pytest.approx(7.0, rel=0.05)
 
 
 def test_sky_noise_estimator_is_not_inflated_by_sources():
@@ -217,8 +204,7 @@ def test_sky_noise_estimator_is_not_inflated_by_sources():
     source = 4000.0 * np.exp(-(((xx - 24) ** 2 + (yy - 24) ** 2) / 20.0))
     pooled = sky + source
     assert pooled.std() > 50.0, "the naive std really is badly inflated here"
-    measured = measure_pooled_sky_noise(pooled, np.arange(40) % 6)["u"]
-    assert measured == pytest.approx(5.0, rel=0.1)
+    assert measure_pooled_sky_noise(pooled) == pytest.approx(5.0, rel=0.1)
 
 
 def test_source_dominated_patches_cannot_move_the_answer():
@@ -232,8 +218,7 @@ def test_source_dominated_patches_cannot_move_the_answer():
     yy, xx = np.mgrid[0:48, 0:48]
     filled = 4000.0 * np.exp(-(((xx - 24) ** 2 + (yy - 24) ** 2) / 4000.0))
     pooled[:8] += filled  # a fifth of the patches are hopeless
-    band = np.zeros(40, dtype=int)
-    assert measure_pooled_sky_noise(pooled, band)["u"] == pytest.approx(5.0, rel=0.1)
+    assert measure_pooled_sky_noise(pooled) == pytest.approx(5.0, rel=0.1)
 
 
 def test_softening_measured_not_derived_for_correlated_noise():
@@ -253,24 +238,21 @@ def test_softening_measured_not_derived_for_correlated_noise():
 
     derived = 12.0 / 3.0  # what the old variance-plane route would have given
     truth = float(pooled.std())
-    measured = measure_pooled_sky_noise(pooled, np.zeros(120, dtype=int))["u"]
+    measured = measure_pooled_sky_noise(pooled)
 
     assert truth > 1.6 * derived, "correlation should inflate the pooled noise"
     assert measured == pytest.approx(truth, rel=0.1)
 
 
-def test_estimate_band_softening_scales_the_measured_noise():
-    from rubin_host_prior.data import estimate_band_softening
+def test_estimate_softening_scales_the_measured_noise():
+    from rubin_host_prior.data import estimate_softening
 
     rng = np.random.default_rng(3)
-    # 20 patches per band: the median of a handful of per-patch estimates is
-    # noisy (~15% with five), which is why the estimator wants a real sample.
+    # The median of a handful of per-patch estimates is noisy (~15% with five),
+    # which is why the estimator wants a real sample.
     pooled = rng.normal(0.0, 6.0, (120, 64, 64))
-    band = np.arange(120) % 6
-    soft = estimate_band_softening(pooled, band, softening_sigma=2.0)
-    assert set(soft) == set(BANDS)
-    for v in soft.values():
-        assert v == pytest.approx(12.0, rel=0.03)
+    assert estimate_softening(pooled, softening_sigma=2.0) == pytest.approx(
+        12.0, rel=0.03)
 
 
 # -- pooling ---------------------------------------------------------------
@@ -449,8 +431,8 @@ def _dataset(shard_dir, out_size=32):
         )
     )
     pooled, pooled_bands = pool_shards(ss, config)
-    config.transform.band_softening = estimate_band_softening(
-        pooled, pooled_bands, config.transform.softening_sigma
+    config.transform.softening = estimate_softening(
+        pooled, config.transform.softening_sigma
     )
     return ss, config, PatchDataset.from_shards(
         ss, config, LogFluxTransform.from_config(config.transform)
@@ -491,7 +473,7 @@ def test_cache_key_changes_with_the_transform(shard_dir, tmp_path):
     ss, config, ds = _dataset(shard_dir)
     path = ds.build_pooled_cache(tmp_path / "cache.h5")
     other = Config(patch=config.patch, transform=TransformConfig(
-        band_softening={b: 999.0 for b in BANDS}
+        softening=999.0
     ))
     stale = cache_key(other, LogFluxTransform.from_config(other.transform), ss)
     with pytest.raises(ValueError, match="rebuild it"):
@@ -502,7 +484,7 @@ def test_dataset_refuses_shards_smaller_than_the_config(shard_dir):
     ss = ShardSet.from_dir(shard_dir)
     config = Config(patch=PatchConfig(native_size=512, nominal_crop=192,
                                       out_size=64, pool_factor=3))
-    config.transform.band_softening = {b: 20.0 for b in BANDS}
+    config.transform.softening = 20.0
     with pytest.raises(ValueError, match="shards hold"):
         PatchDataset.from_shards(
             ss, config, LogFluxTransform.from_config(config.transform)
@@ -642,8 +624,8 @@ def _varsize_dataset(shard_dir, out_sizes):
                                       out_size=32, pool_factor=3,
                                       out_sizes=out_sizes))
     pooled, pooled_bands = pool_shards(ss, config)
-    config.transform.band_softening = estimate_band_softening(
-        pooled, pooled_bands, config.transform.softening_sigma
+    config.transform.softening = estimate_softening(
+        pooled, config.transform.softening_sigma
     )
     return ss, config, PatchDataset.from_shards(
         ss, config, LogFluxTransform.from_config(config.transform)
@@ -735,8 +717,7 @@ def test_sky_scatter_matches_the_prediction(shard_dir):
                                           pool_factor=3))
         config.transform.softening_sigma = ss_val
         pooled, pooled_bands = pool_shards(ss, config)
-        config.transform.band_softening = estimate_band_softening(
-            pooled, pooled_bands, ss_val)
+        config.transform.softening = estimate_softening(pooled, ss_val)
         ds = PatchDataset.from_shards(
             ss, config, LogFluxTransform.from_config(config.transform))
         assert ds.stats(48)["sky_scatter"] == pytest.approx(
@@ -777,28 +758,13 @@ def test_a_shard_missing_a_metadata_column_is_refused(shard_dir, tmp_path):
         ShardSet.from_dir(copy)
 
 
-def test_a_band_with_no_patches_gets_no_softening_scale():
-    """The scale is measured, so a band the shards never saw has nothing to
-    measure.  Inventing one would put its turnover wherever the guess landed."""
+def test_patches_with_no_sky_left_to_measure_are_an_error_not_a_guess():
+    """A shard set that is all source or all masked has no noise to scale the
+    softening by, and inventing one would put the turnover anywhere."""
     from rubin_host_prior.data.transform import measure_pooled_sky_noise
 
-    rng = np.random.default_rng(0)
-    pooled = rng.normal(0.0, 12.0, (40, 16, 16))
-    bands = np.zeros(40, dtype=int)          # everything in u
-    got = measure_pooled_sky_noise(pooled, bands, BANDS)
-    assert set(got) == {"u"} and got["u"] == pytest.approx(12.0, rel=0.1)
-
-
-def test_shards_whose_bands_the_config_never_saw_are_refused(shard_dir):
-    """Caught where the band can be named, rather than as a NaN that propagates
-    into training or an IndexError from inside the transform."""
-    ss = ShardSet.from_dir(shard_dir)
-    config = Config(patch=PatchConfig(native_size=ss.native_size,
-                                      nominal_crop=96, out_size=32, pool_factor=3))
-    config.transform.band_softening = {"u": 12.0}
-    with pytest.raises(ValueError, match="no softening scale"):
-        PatchDataset.from_shards(
-            ss, config, LogFluxTransform.from_config(config.transform))
+    with pytest.raises(ValueError, match="no patch"):
+        measure_pooled_sky_noise(np.full((4, 8, 8), np.nan))
 
 
 def test_the_softening_is_the_identity_above_its_scale():

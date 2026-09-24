@@ -1,6 +1,6 @@
 """Flux <-> log-space transform.
 
-    soften:   f_s = s_band * softplus(f / s_band)        softplus(u)=log(1+e^u)
+    soften:   f_s = s * softplus(f / s)                  softplus(u)=log(1+e^u)
     forward:  x   = log(f_s)
     model:    f   = exp(x)                               strictly positive
 
@@ -17,19 +17,23 @@ pass through untouched and the entire adjustment is confined to the low and
 negative regime.  ``exp(forward(f))`` reproduces it exactly, so the model can
 express the softened data and nothing else.
 
-``s_band`` is a per-band *softening* scale in nJy, ``softening_sigma`` times the
-pooled sky noise of that band.
+``s`` is **one** softening scale in nJy for all of the data, ``softening_sigma``
+times the measured pooled sky noise.  It used to be per band, and that bought
+nothing once ``forward`` became ``log(f_s)``: a per-band scale only moved each
+band's sky to its own ``log(s_band * log 2)``, spreading the levels over 1.27 in
+x while the thing the prior is about -- the flux of the scene -- was already
+band-independent.
 
-**The price is that the sky lands in a different place in each band**, at
-``log(s_band * log 2)`` rather than at one shared level -- 2.41 in g and 3.31 in
-u, at DP2-ish depths.  That is deliberate.  An earlier version divided by
-``s_band`` inside the logarithm, which put every band's sky at exactly
-``log(log 2) = -0.367``; it bought a common sky level at the cost of making x a
-*relative* quantity, so the same flux meant different x in different bands and
-the absolute scale of the signal was the thing being given away.  Scene flux is
-what this prior exists to describe, so it is the sky that moves.  The scatter is
-unaffected -- all six bands still have the same width, ``0.721/softening_sigma``
--- so what the model sees is one sky shape at several levels, not six shapes.
+With a single scale the sky lands at ``log(s * log 2)`` for *every* band, so the
+transform now gives both an absolute flux scale and a common sky level.  What
+differs between bands is the *width* of the sky about that level, which is the
+honest difference: a deep band scatters less than a shallow one, and pretending
+otherwise was what the per-band scale was doing.
+
+An earlier version divided by ``s_band`` inside the logarithm.  That also gave a
+common sky level, but by making x a *relative* quantity -- the same flux meant a
+different x in each band, and the absolute scale of the signal was what got given
+away.  Scene flux is what this prior exists to describe.
 
 The asymmetry between the two lines is deliberate, and is the whole point.  A
 source cannot emit negative flux, so the prior's reachable domain in flux space
@@ -62,7 +66,7 @@ untouched.  The prior is meant to describe what a galaxy looks like, not what
 this particular realisation of the sky looked like, and a prior that reproduces
 noise faithfully is spending capacity on a thing the likelihood already models.
 
-``softening_sigma`` is that scale in units of the measured per-band noise, and
+``softening_sigma`` is that scale in units of the measured noise, and
 is the knob.  Lower values preserve the noise distribution more faithfully at
 the cost of a skewed, heavy-tailed ``x``; higher values flatten the sky harder
 and push the flux at which the exponential map becomes accurate proportionately
@@ -75,13 +79,12 @@ whereas softplus converges to the identity exponentially.
 
 from __future__ import annotations
 
-from collections.abc import Sequence
 from dataclasses import dataclass
 from math import log
 
 import numpy as np
 
-from ..config import BANDS, TransformConfig
+from ..config import TransformConfig
 
 #: ``Phi^-1(0.25) - Phi^-1(0.05)`` -- converts the faint-quartile spread of a
 #: Gaussian into a sigma.
@@ -96,20 +99,18 @@ _EXPM1_ABOVE = 30.0
 
 #: ``d x / d f`` at zero flux is ``0.5 / log(2) / s`` -- the softplus slope
 #: (1/2) divided by softplus(0) (log 2).  The ``log(s)`` that ``forward`` adds is
-#: a constant, so it shifts the sky without widening it: sky pixels of noise
-#: sigma scatter by ``0.5/log(2) / softening_sigma`` whatever the band.
+#: a constant, so it shifts the sky without widening it.
 SKY_SLOPE = 0.5 / log(2.0)
 
 
 def expected_sky_scatter(softening_sigma: float) -> float:
     """Predicted spread of ``x`` for sky pixels, ``0.721 / softening_sigma``.
 
-    The same in every band, because the per-band term in ``forward`` is an
-    additive constant.  Compare against the measured
-    ``PatchDataset.stats()["sky_scatter"]``: a large disagreement means the
-    per-band softening scales are wrong, which would put the bands on different
-    footings -- the widths would no longer match even though the levels differ
-    by design.
+    Exact for a band at the noise level the single scale was measured from, and
+    proportionally wider or narrower for a band deeper or shallower than that:
+    the scatter is ``0.721 * sigma_band / s``.  So this is the *typical* width,
+    which is what ``PatchDataset.stats()["sky_scatter"]`` measures across the
+    whole set.  A large disagreement means the softening scale is wrong.
     """
     return SKY_SLOPE / softening_sigma
 
@@ -166,79 +167,48 @@ def log_softplus(u, xp=None):
 
 @dataclass(frozen=True)
 class LogFluxTransform:
-    #: One entry per band of ``BANDS``, in nJy, indexed by the same global
-    #: band index the shards store.  NaN for a band never measured.
-    softening: tuple[float, ...]
-    bands: tuple[str, ...] = BANDS
+    #: The softening scale in nJy.  One number for all of the data, in every
+    #: band: see the module docstring for why it is not per band.
+    softening: float
 
     @classmethod
-    def from_config(cls, config: TransformConfig,
-                    required_bands: Sequence[str] | None = None):
-        """Always indexed over the whole of ``BANDS``.
+    def from_config(cls, config: TransformConfig):
+        s = config.softening
+        if s is None or not np.isfinite(s):
+            raise ValueError(
+                "the config has no softening scale. Run "
+                "scripts/prepare_config.py on the shards; it measures one from "
+                "the pooled sky noise."
+            )
+        if s <= 0:
+            raise ValueError(
+                f"softening is a flux in nJy and must be positive, not {s}"
+            )
+        return cls(softening=float(s))
 
-        ``band_idx`` in the shards is a global index into ``BANDS``, so the
-        softening tuple has to be too.  Building it over a *subset* -- which is
-        what a ``bands`` argument invited -- silently re-bases the indexing: with
-        ('r','i','z','y') present, index 4 runs off the end, and index 2 quietly
-        returns the i-band scale for an r-band patch.  Absent bands hold NaN,
-        which makes an unmeasured band visible rather than wrong; callers that
-        know which bands their data contains pass ``required_bands`` and get a
-        named error instead.
-        """
-        if required_bands is not None:
-            missing = [b for b in required_bands if b not in config.band_softening]
-            if missing:
-                have = sorted(config.band_softening)
-                raise ValueError(
-                    f"no softening scale for band(s) {missing}. "
-                    + (f"The config has scales for {have}, so it was prepared "
-                       f"against a shard set with no patches in {missing}; "
-                       f"re-run scripts/prepare_config.py on the current shards."
-                       if have else
-                       "The config has no scales at all; run "
-                       "scripts/prepare_config.py on the shards first.")
-                )
-        return cls(
-            softening=tuple(
-                float(config.band_softening.get(b, np.nan)) for b in BANDS
-            ),
-            bands=tuple(BANDS),
-        )
+    def soften(self, flux):
+        """``s * softplus(flux / s)``: nJy in, nJy out.
 
-    def softening_for(self, band_index):
-        xp = _xp(band_index)
-        return xp.asarray(self.softening)[band_index]
-
-    def soften(self, flux, band_index):
-        """``s_band * softplus(flux / s_band)``: nJy in, nJy out.
-
-        The definition the other two maps are built from.  ``forward`` is
-        ``log(soften(f)/s)/c`` and ``inverse`` is exactly this composed with it,
-        so this is the one place the softening is stated and the only shape the
+        The definition the other maps are built from.  ``forward`` is
+        ``log(soften(f))`` and ``inverse`` is exactly this composed with it, so
+        this is the one place the softening is stated and the only shape the
         model can express.
         """
-        xp = _xp(flux)
-        return soften(flux, self._s(xp, band_index, xp.ndim(flux)), xp)
-
-    def _s(self, xp, band_index, ndim):
-        s = self.softening_for(xp.asarray(band_index))
-        return xp.reshape(s, xp.shape(s) + (1,) * (ndim - xp.ndim(s)))
+        return soften(flux, self.softening, _xp(flux))
 
     # -- the two maps ------------------------------------------------------
 
-    def forward(self, flux, band_index):
+    def forward(self, flux):
         """nJy -> log space: ``log(soften(f))``, which tends to ``log(f)``.
 
-        Defined and finite for every real input.  Written as
+        Takes no band.  Defined and finite for every real input.  Written as
         ``log_softplus(f/s) + log(s)`` rather than by composing ``soften`` and
         taking a logarithm, which are algebraically the same thing: below
         ``f/s = -745`` the softened flux underflows to zero in float64 and its
         log is ``-inf``, where ``log_softplus`` returns the exact limit instead.
         A test pins the two forms together.
         """
-        xp = _xp(flux)
-        s = self._s(xp, band_index, flux.ndim)
-        return log_softplus(flux / s, xp) + xp.log(s)
+        return log_softplus(flux / self.softening, _xp(flux)) + log(self.softening)
 
     def inverse(self, x):
         """log space -> nJy: ``exp(x)``.  **This is what a forward model calls.**
@@ -261,27 +231,25 @@ class LogFluxTransform:
         """
         return _xp(x).exp(x)
 
-    def inverse_exact(self, x, band_index):
+    def inverse_exact(self, x):
         """The true inverse of ``forward``: ``s * log(expm1(exp(x) / s))``.
 
         For round-trip checks and for recovering the measured flux, including its
         negative values.  Agrees with ``inverse`` to double precision wherever
-        the flux is more than ~10 s.  Needs the band, unlike ``inverse``: undoing
-        the softening is the one step that depends on where the softening turned
-        over.
+        the flux is more than ~10 s.
         """
         xp = _xp(x)
-        s = self._s(xp, band_index, xp.ndim(x))
-        # ``u = log(softplus(f/s))`` -- x with the band's constant removed, which
-        # is the quantity the three regimes below are expressed in.
-        cx = x - xp.log(s)
+        s = self.softening
+        # ``u = log(softplus(f/s))`` -- x with the scale's constant removed,
+        # which is the quantity the three regimes below are expressed in.
+        cx = x - log(s)
         v = xp.exp(cx)
         # Three regimes.  Large v: log(expm1(v)) == v to double precision, and
         # expm1 would overflow.  Very negative cx: v underflows towards zero,
         # expm1(v) ~ v, so log(expm1(v)) ~ cx -- computing it directly would give
         # log(0) = -inf.  In between, the direct expression is fine.
-        big = v > _EXPM1_ABOVE          # expm1 would overflow; log(expm1(v)) == v
-        small = cx < _LINEAR_BELOW      # expm1(v) ~ v; log(expm1(v)) == c*x
+        big = v > _EXPM1_ABOVE  # expm1 would overflow; log(expm1(v)) == v
+        small = cx < _LINEAR_BELOW  # expm1(v) ~ v; log(expm1(v)) == c*x
         mid = xp.where(big | small, 1.0, v)
         direct = xp.log(xp.expm1(mid))
         return s * xp.where(big, v, xp.where(small, cx, direct))
@@ -292,16 +260,15 @@ class LogFluxTransform:
 
     # -- analytic diagnostics ---------------------------------------------
 
-    def sky_level(self, band_index):
-        """``x`` at zero flux: ``log(s_band * log 2)``.  Where the sky sits.
+    @property
+    def sky_level(self) -> float:
+        """``x`` at zero flux: ``log(s * log 2)``.  Where the sky sits.
 
-        Per band, because x is absolute log flux and the bands have different
-        depths.  All of them have the same *width* about their own level --
-        ``expected_sky_scatter`` -- so ``plot_transform`` draws one line per
-        band and the sky should pile up on each.
+        The same in every band, because there is one scale.  What differs is the
+        *width* about it -- a deep band scatters less than a shallow one, which
+        is a real difference rather than one the transform should erase.
         """
-        xp = _xp(band_index)
-        return xp.log(self.softening_for(band_index) * log(2.0))
+        return log(self.softening * log(2.0))
 
     @property
     def sky_pedestal(self) -> float:
@@ -332,12 +299,8 @@ class LogFluxTransform:
         return 0.5 * (lo + hi)
 
 
-def measure_pooled_sky_noise(
-    pooled: np.ndarray,
-    band_index: np.ndarray,
-    bands: tuple[str, ...] = BANDS,
-) -> dict[str, float]:
-    """Per-band sky noise of *pooled* patches, in nJy -- measured, not derived.
+def measure_pooled_sky_noise(pooled: np.ndarray) -> float:
+    """Sky noise of *pooled* patches, in nJy -- measured, not derived.
 
     Deriving it as ``sqrt(median variance) / pool_factor`` assumes the pixel
     noise is uncorrelated, which is true of unwarped visit images and **false of
@@ -357,32 +320,29 @@ def measure_pooled_sky_noise(
     median is then taken across patches, so the few source-dominated patches that
     do defeat it cannot move the answer.
 
-    That median wants a real sample: with five patches per band it scatters by
-    ~15%, with twenty by ~1%.  Pass a few hundred.
+    That median wants a real sample: with five patches it scatters by ~15%, with
+    twenty by ~1%.  Pass a few hundred.
+
+    One number across every band.  It used to be one per band, which is a more
+    faithful description of the data and bought the transform nothing -- see the
+    module docstring.  The median is over patches of all bands together, so a
+    band contributes in proportion to how much of the set it is.
     """
     pooled = np.asarray(pooled, dtype=np.float64)
-    band_index = np.asarray(band_index)
-    out: dict[str, float] = {}
-    for i, band in enumerate(bands):
-        sel = band_index == i
-        if not np.any(sel):
-            continue
-        patches = pooled[sel].reshape(int(np.sum(sel)), -1)
-        p25, p05 = np.percentile(patches, [25.0, 5.0], axis=1)
-        per_patch = (p25 - p05) / _P25_P05_TO_SIGMA
-        good = np.isfinite(per_patch) & (per_patch > 0)
-        if np.any(good):
-            out[band] = float(np.median(per_patch[good]))
-    return out
+    patches = pooled.reshape(len(pooled), -1)
+    p25, p05 = np.percentile(patches, [25.0, 5.0], axis=1)
+    per_patch = (p25 - p05) / _P25_P05_TO_SIGMA
+    good = np.isfinite(per_patch) & (per_patch > 0)
+    if not np.any(good):
+        raise ValueError(
+            "no patch had a measurable sky noise; they are probably all source "
+            "or all masked"
+        )
+    return float(np.median(per_patch[good]))
 
 
-def estimate_band_softening(
-    pooled: np.ndarray,
-    band_index: np.ndarray,
-    softening_sigma: float,
-    bands: tuple[str, ...] = BANDS,
-) -> dict[str, float]:
-    """``s_band = softening_sigma * measured pooled sky noise``, in nJy.
+def estimate_softening(pooled: np.ndarray, softening_sigma: float) -> float:
+    """``s = softening_sigma * measured pooled sky noise``, in nJy.
 
     ``softening_sigma`` has no default here.  It had one, 1.0, left from when
     the aim was to preserve the noise rather than suppress it, and a second
@@ -393,7 +353,4 @@ def estimate_band_softening(
     as well as visit images.  Pooling needs no transform, so this can be run
     before one exists -- see ``data.dataset.pool_shards``.
     """
-    return {
-        band: softening_sigma * noise
-        for band, noise in measure_pooled_sky_noise(pooled, band_index, bands).items()
-    }
+    return softening_sigma * measure_pooled_sky_noise(pooled)

@@ -195,10 +195,10 @@ def plot_transform(dataset, n: int = 4, seed: int = 0, out: Path | None = None):
     """The chain from native flux to the training representation, plus the
     pixel-value histogram that says whether the transform is set up right.
 
-    ``x`` is absolute log flux, so the sky sits at ``log(s_band * log 2)`` --
-    one level per band, all with the same width.  Each band present gets a line;
-    the sky should pile up on it with a spread near ``expected_sky_scatter``,
-    and sources should sit clearly above.
+    ``x`` is absolute log flux and there is one softening scale, so every band's
+    sky sits at the same ``log(s * log 2)``.  The sky should pile up on that line
+    with a spread near ``expected_sky_scatter``, and sources should sit clearly
+    above it.
     """
     plt = _plt()
     from .data.transform import expected_sky_scatter
@@ -208,7 +208,7 @@ def plot_transform(dataset, n: int = 4, seed: int = 0, out: Path | None = None):
     idx = np.sort(rng.choice(len(dataset), size=n, replace=False))
     native = dataset._native_stamps(idx)
     pooled = dataset._pool(idx, rng=None, translate=False, scale_jitter=0.0)
-    logged = dataset.transform.forward(pooled, dataset.band_idx[idx])
+    logged = dataset.transform.forward(pooled)
     noise = np.asarray(dataset.shards.meta["sky_noise"])[idx]
 
     fig = plt.figure(figsize=(10.5, 2.4 * n + 2.6))
@@ -244,24 +244,16 @@ def plot_transform(dataset, n: int = 4, seed: int = 0, out: Path | None = None):
         augment=False,
     )[:, 0].ravel()
     ax.hist(allx, bins=200, color="0.3")
-    ss = dataset.config.transform.softening_sigma
-    scatter = expected_sky_scatter(ss)
-    # One sky level per band, at log(s_band * log 2).  They differ because x is
-    # absolute log flux and the bands have different depths; the widths do not.
-    present = sorted({int(b) for b in dataset.band_idx})
-    for n, i in enumerate(present):
-        sky = float(dataset.transform.sky_level(np.array([i]))[0])
-        if not np.isfinite(sky):
-            continue
-        ax.axvline(sky, color="crimson", lw=1.2)
-        ax.axvspan(
-            sky - scatter, sky + scatter, color="crimson", alpha=0.15,
-            label=(f"zero flux per band, $\\pm${scatter:.2f} predicted scatter"
-                   if n == 0 else None),
-        )
-        ax.annotate(dataset.transform.bands[i], (sky, 1.0),
-                    xycoords=("data", "axes fraction"), ha="center", va="bottom",
-                    fontsize=7, color="crimson", annotation_clip=False)
+    scatter = expected_sky_scatter(dataset.config.transform.softening_sigma)
+    # One line: a single softening scale puts every band's sky at the same
+    # log(s * log 2).  The predicted width is a typical one, since a band deeper
+    # or shallower than the scale was measured from scatters proportionally
+    # less or more about that shared level.
+    sky = dataset.transform.sky_level
+    ax.axvline(sky, color="crimson", lw=1.2,
+               label=f"zero flux: x = log(s log 2) = {sky:.2f}")
+    ax.axvspan(sky - scatter, sky + scatter, color="crimson", alpha=0.15,
+               label=f"typical sky scatter $\\pm${scatter:.2f}")
     ax.set_yscale("log")
     ax.set_xlabel("x (log space)")
     ax.set_ylabel("pixels")
