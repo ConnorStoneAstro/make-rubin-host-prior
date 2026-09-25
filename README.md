@@ -226,6 +226,52 @@ figure, so the count is what tells you.
 
 `--n-samples 0` skips sampling; `--n-checkpoints 0` skips checkpoints entirely.
 
+### Using the whole node
+
+Training is data-parallel across **every GPU JAX can see**, which is what a
+scheduler that allocates whole nodes wants. Nothing has to be passed for that;
+`--devices 1` opts out.
+
+The parameters are replicated on every device and `--batch-size` is the
+**global** batch, split evenly across them. Four GPUs therefore make the *same
+run* go faster rather than changing it: same global batch, same learning rate,
+same loss curve. Raise `--batch-size` deliberately if a larger batch is what you
+want — and then revisit the learning rate, which four devices on their own never
+force you to do.
+
+The gradients are all-reduced **every step**, not averaged periodically. The
+model is 1.01 M parameters = 4.1 MB, so an all-reduce moves about 6 MB and takes
+tens of microseconds over NVLink, against a step that is a
+gradient-of-a-gradient: under 1%. Local SGD — run independently, average every
+*k* steps — exists to hide a slow link *between nodes*. Inside one node it would
+trade exact gradients for nothing, and cost a second optimiser state per replica,
+a rule for what happens to Adam's moments and to the EMA at each average, and a
+checkpoint format that has to decide which replica it is.
+
+Because the weights are replicated rather than sharded, **a checkpoint says
+nothing about how many devices wrote it**. A chunk trained on four GPUs resumes
+on one and vice versa, which matters when the queue gives you what it has. The
+device count is a command-line argument and deliberately *not* a config field,
+for the same reason: it is a property of the allocation, not of the run. It is
+recorded in the `log.jsonl` header as `n_devices`, where it is provenance rather
+than something anything reads back.
+
+`--batch-size` must be a multiple of the device count; the error says which
+number to use. The evaluation batch and the checkpoint samples are left
+replicated — they run every few thousand steps, so the redundant work is
+invisible, and that keeps `--eval-size` and `--n-samples` free of a divisibility
+rule of their own.
+
+**Launch one process that can see all four GPUs**, not one process per GPU.
+`srun --ntasks=1` with the whole node's GPUs bound to it is what this wants;
+`--ntasks=4` starts four independent single-GPU trainings that will overwrite
+each other's checkpoints, and nothing in the output will say so — each one is a
+valid-looking run. `n_devices` in the `log.jsonl` header is where to check.
+
+This is single-node. Spreading across nodes needs `jax.distributed.initialize`
+and a larger mesh, but not different trainer code — try plain sharding across
+nodes before reaching for anything cleverer.
+
 ### Running it in chunks
 
 A scheduler that will not give you a long job means the run has to be a series

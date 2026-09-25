@@ -7,6 +7,10 @@
 Checks the patch/layer geometry before starting, since a too-small patch leaves
 no interior for the loss and that is better caught now than 10 000 steps in.
 
+Data-parallel across every GPU JAX can see unless ``--devices`` says otherwise.
+``--batch-size`` is the global batch split across them, so more devices make the
+same run faster rather than changing it.
+
 Writes into ``--out``:
 
     log.jsonl                  one line per log step, eval and checkpoint
@@ -64,6 +68,12 @@ def main() -> None:
                         "exists and starts fresh if it does not, which is what a "
                         "chunked scheduler job wants: the same command works for "
                         "the first chunk and every one after it")
+    p.add_argument("--devices", type=int, default=None,
+                   help="data-parallel devices (default: every GPU JAX can "
+                        "see). The parameters are replicated and --batch-size "
+                        "is the global batch split across them, so this makes "
+                        "the same run faster rather than changing it; 1 for "
+                        "the single-device path")
     p.add_argument("--eval-every", type=int, default=2000)
     p.add_argument("--eval-size", type=int, default=32)
     p.add_argument("--max-in-memory-gb", type=float, default=16.0)
@@ -153,6 +163,7 @@ def main() -> None:
         eval_every=args.eval_every,
         on_log=lambda r: print(json.dumps(r)) if "event" not in r else None,
         resume=resume,
+        n_devices=args.devices,
     )
 
 

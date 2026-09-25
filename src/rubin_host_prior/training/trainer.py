@@ -24,6 +24,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import optax
+from jax.sharding import AxisType, NamedSharding, PartitionSpec
 
 from .. import geometry
 from ..config import Config, TrainConfig
@@ -110,6 +111,53 @@ def make_optimizer(cfg: TrainConfig) -> optax.GradientTransformation:
     return optax.chain(*chain)
 
 
+def _shardings(n_devices: int | None, batch_size: int, verbose: bool):
+    """Return ``(n, replicated, over_batch)`` for plain data parallelism.
+
+    Replicated parameters, a batch split evenly across devices, gradients
+    all-reduced every step.  There is no local-SGD mode and no averaging
+    interval: the parameters are 4 MB, so an all-reduce is tens of microseconds
+    against a step that is a gradient-of-a-gradient, and the exact gradient is
+    free.  Periodic averaging exists to hide a slow interconnect between nodes,
+    which is not the situation on one node.
+
+    Almost none of this file knows about it, because nothing else has to.  The
+    mean in ``dsm_loss`` over a sharded batch axis is what makes XLA insert the
+    all-reduce; the weights are then identical on every device, so the EMA, the
+    checkpoints and the sampler are unchanged.  In particular a checkpoint says
+    nothing about how many devices wrote it -- a chunk trained on four GPUs
+    resumes on one, which is what a scheduler that gives you what it has
+    requires.
+
+    ``batch_size`` is the *global* batch, split evenly.  Four devices make the
+    same run go faster; they do not quadruple the batch behind the learning
+    rate.  Raise ``--batch-size`` deliberately if that is what you want.
+    """
+    available = jax.local_device_count()
+    n = available if n_devices is None else int(n_devices)
+    if not 1 <= n <= available:
+        kinds = sorted({d.device_kind for d in jax.local_devices()})
+        raise ValueError(
+            f"asked for {n} devices; JAX can see {available} ({', '.join(kinds)})"
+        )
+    if batch_size % n:
+        raise ValueError(
+            f"batch size {batch_size} does not divide across {n} devices. It is "
+            f"the global batch, split evenly, so it must be a multiple of the "
+            f"device count -- raise it to {batch_size + n - batch_size % n} or "
+            f"pass fewer devices."
+        )
+    # Auto, not the default Explicit: `filter_shard` is a sharding *constraint*,
+    # which is only defined on auto axes.
+    mesh = jax.make_mesh((n,), ("batch",), axis_types=(AxisType.Auto,),
+                         devices=jax.devices()[:n])
+    if verbose and n > 1:
+        print(f"  {n} devices, {batch_size // n} of the {batch_size} batch each, "
+              f"gradients all-reduced every step")
+    return (n, NamedSharding(mesh, PartitionSpec()),
+            NamedSharding(mesh, PartitionSpec("batch")))
+
+
 def train(
     model: ConvEnergyNet,
     batches: Iterator[np.ndarray],
@@ -122,6 +170,7 @@ def train(
     verbose: bool = True,
     resume: str | Path | None = None,
     stop_signals: Sequence[int] = STOP_SIGNALS,
+    n_devices: int | None = None,
 ) -> tuple[ConvEnergyNet, ConvEnergyNet]:
     """Train and return ``(model, ema_model)``.
 
@@ -155,6 +204,21 @@ def train(
     returns.  It does *not* write ``final``, because the run is not finished --
     that is what tells the next chunk there is more to do.  No samples are drawn
     on the way out: the point is to be gone inside the grace period.
+
+    **Devices.**  ``n_devices`` defaults to every device JAX can see, which on a
+    whole NERSC node is all four GPUs and on a laptop is one.  The parameters
+    are replicated and the batch is split, so the run is the same run either
+    way -- same global batch, same learning rate, same loss curve, just faster.
+    ``n_devices=1`` is the single-device path, bit-identical to not having this
+    at all.  It is an argument and not a config field on purpose: how many GPUs
+    an allocation happened to contain is a property of the machine, not of the
+    run, and writing it into the checkpoint would make a 4-GPU chunk look
+    incompatible with a 1-GPU one.
+
+    The evaluation batch and the checkpoint samples are left replicated rather
+    than sharded.  They run every few thousand steps, so the redundant work is
+    invisible, and not sharding them means neither ``--eval-size`` nor
+    ``--n-samples`` acquires a divisibility rule.
     """
     sde = sde or VESDE.from_config(config.sde)
     cfg = config.train
@@ -182,6 +246,8 @@ def train(
         for warning in config.check_sizes():
             print(f"  WARNING: {warning}")
     _validate_geometry(sizes, model)
+    n_devices, replicated, over_batch = _shardings(
+        n_devices, cfg.batch_size, verbose)
     optimizer = make_optimizer(cfg)
     params = eqx.filter(model, eqx.is_inexact_array)
     opt_state = optimizer.init(params)
@@ -196,9 +262,12 @@ def train(
                 f"{cfg.steps}; there is nothing left to do. Raise steps to "
                 f"continue this run, or point --out somewhere new to start over."
             )
+    model, ema_model, opt_state = eqx.filter_shard(
+        (model, ema_model, opt_state), replicated)
 
     @eqx.filter_jit
     def step_fn(model, ema_model, opt_state, batch, key, decay):
+        batch = eqx.filter_shard(batch, over_batch)
         loss, grads = eqx.filter_value_and_grad(dsm_loss)(
             model, batch, key, sde, margin
         )
@@ -207,6 +276,12 @@ def train(
         )
         model = eqx.apply_updates(model, updates)
         ema_model = ema_update(ema_model, model, decay)
+        # Pin the layout rather than leave XLA to infer it every compilation:
+        # everything the loop carries between steps is replicated, and the only
+        # thing crossing the interconnect is the gradient all-reduce implied by
+        # the mean over the sharded batch axis.
+        model, ema_model, opt_state = eqx.filter_shard(
+            (model, ema_model, opt_state), replicated)
         return model, ema_model, opt_state, loss
 
     @eqx.filter_jit
@@ -254,13 +329,17 @@ def train(
             "sigma_max": sde.sigma_max,
             "start_step": start_step,
             "resumed_from": str(resume) if resume is not None else None,
+            "n_devices": n_devices,
         }
         log_file.write(json.dumps(header) + "\n")
         log_file.flush()
 
         step = start_step
         for step in range(start_step + 1, cfg.steps + 1):
-            batch = jnp.asarray(next(batches))
+            # Placed across the devices here rather than left for the constraint
+            # inside step_fn to move: this scatters straight from the host
+            # instead of landing the whole batch on device 0 and redistributing.
+            batch = eqx.filter_shard(jnp.asarray(next(batches)), over_batch)
             if step == 1:
                 _check_batch(batch, model)
             key, k_step = jax.random.split(key)
