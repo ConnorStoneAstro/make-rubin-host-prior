@@ -89,9 +89,7 @@ class EnergyConfig:
         if not self.channels:
             raise ValueError("an energy needs at least one branch")
         if not self.dilations:
-            object.__setattr__(
-                self, "dilations", tuple((1,) * len(c) for c in self.channels)
-            )
+            object.__setattr__(self, "dilations", tuple((1,) * len(c) for c in self.channels))
         if len(self.channels) != len(self.dilations):
             raise ValueError(
                 f"{len(self.channels)} channel tuples but "
@@ -214,9 +212,9 @@ class PatchConfig:
     every sub-pixel phase.
     """
 
-    native_size: int = 512  # pixels cut from the coadd
-    nominal_crop: int = 384  # native pixels feeding one training image
-    out_size: int = 128  # nominal_crop / pool_factor; the reference size
+    native_size: int = 1024  # pixels cut from the coadd
+    nominal_crop: int = 768  # native pixels feeding one training image
+    out_size: int = 256  # nominal_crop / pool_factor; the reference size
     pool_factor: int = 3
     #: Extra training sizes.  Each batch is drawn at one size (a batch must be
     #: shape-homogeneous), cycling over ``training_sizes``.  Larger patches
@@ -292,13 +290,13 @@ class TrainConfig:
     #: ``train.py`` for the reason everything else in this file is here: a
     #: default that lives in a script is a second source of truth, and two
     #: sources of truth drift.
-    eval_every: int = 2000
+    eval_every: int = 5000
     eval_size: int = 32
 
     #: Checkpoints spread evenly over the run, rather than an interval that has
     #: to be recomputed every time ``steps`` changes.  The last one lands on the
     #: final step.  0 disables them.
-    n_checkpoints: int = 10
+    n_checkpoints: int = 25
     #: Samples drawn from the EMA model at each checkpoint and written as a
     #: square grid, so the run's progress is visible as pictures rather than only
     #: as a loss curve.  0 disables sampling.  64 is an 8x8 grid.
@@ -379,8 +377,7 @@ class Config:
                 )
             else:
                 frac = (
-                    geometry.interior_size(
-                        s, self.energy.dilations, self.energy.kernel_size) / s
+                    geometry.interior_size(s, self.energy.dilations, self.energy.kernel_size) / s
                 ) ** 2
                 if frac < 0.10:
                     out.append(
@@ -405,8 +402,7 @@ class Config:
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> "Config":
         sections = {
-            "energy": (EnergyConfig,
-                       _tuples(d.get("energy", {}), ("channels", "dilations"), 2)),
+            "energy": (EnergyConfig, _tuples(d.get("energy", {}), ("channels", "dilations"), 2)),
             "sde": (SDEConfig, d.get("sde", {})),
             "transform": (TransformConfig, d.get("transform", {})),
             "patch": (PatchConfig, _tuples(d.get("patch", {}), ("out_sizes",))),
@@ -450,6 +446,5 @@ def _tuples(d: dict[str, Any], keys: tuple[str, ...], depth: int = 1) -> dict[st
     out = dict(d)
     for k in keys:
         if k in out and out[k] is not None:
-            out[k] = (tuple(tuple(v) for v in out[k]) if depth == 2
-                      else tuple(out[k]))
+            out[k] = tuple(tuple(v) for v in out[k]) if depth == 2 else tuple(out[k])
     return out
