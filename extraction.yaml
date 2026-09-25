@@ -94,8 +94,8 @@ patches:
   inner_fraction: 0.34
   max_no_data: 0.02
   max_inner_no_data: 0.0
-  max_cell_depth_ratio: 3.5
-  max_variance_step: 4.0
+  max_cell_depth_ratio: null
+  max_variance_step: null
   min_visits: null
 
   # Two questions the catalogue cannot answer, asked of the pixels instead.
