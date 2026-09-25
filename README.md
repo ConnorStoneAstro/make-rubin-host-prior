@@ -121,8 +121,27 @@ shear convention at modest ellipticity.
 ### 3. Derive the config from the data
 
 ```bash
-python scripts/prepare_config.py --shards data/ecdfs/shards --out config.json
+python scripts/prepare_config.py
 ```
+
+Both paths default: `--shards` to `<ExtractionConfig.out>/shards` and `--out` to
+`config.json`. Pass them when they differ.
+
+**`config.py` is the one source of truth for defaults.** Every flag on
+`prepare_config.py`, `train.py` and `sample.py` that names a config field
+defaults to `None` and is applied only when it is actually given; the numbers
+themselves live in the dataclasses in `src/rubin_host_prior/config.py`, and
+`sample.py` reads them out of the checkpoint the model was trained with.
+
+This is enforced by a test (`test_no_script_decides_a_config_value_for_itself`)
+because it has already gone wrong twice. A flag with a number of its own
+overrides the config on *every* run, passed or not: `prepare_config.py` reset
+`softening_sigma` to the 1.0 of the old preserve-the-noise design, and reset
+`out_size` to 64 — so the 128 px patch geometry `PatchConfig` documents was
+never the geometry anything trained on. Three kinds of flag legitimately carry
+values, and none of them is a config field: paths (`--shards`, `--out`,
+`--config`, `--resume`), machine properties (`--devices`, `--max-in-memory-gb`),
+and per-invocation choices (`--seed`, `--sampler`, `--weights`, `--n-stats`).
 
 The softening scale and the σ range are not free hyperparameters;
 they follow from the noise level and dynamic range. This measures them — from
@@ -320,7 +339,7 @@ cannot be fast-forwarded, so the same seed would replay the same batches.
 ### 5. Sample
 
 ```bash
-python scripts/sample.py --checkpoint runs/ecdfs/final --n 16 --out samples
+python scripts/sample.py --checkpoint runs/ecdfs/final --out samples
 ```
 
 ## Design decisions, and why

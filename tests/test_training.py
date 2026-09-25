@@ -166,14 +166,16 @@ def test_training_writes_a_log_and_a_final_checkpoint(tmp_path):
 
 
 def test_eval_logs_a_loss_curve_against_sigma(tmp_path):
-    config = _config(steps=8)
+    # The cadence is a config field, not a train() argument: a default in the
+    # signature would be a second source of truth alongside TrainConfig.
+    config = _config(steps=8, eval_every=4)
     model = ConvEnergyNet(config.energy, key=jax.random.key(0))
     rng = np.random.default_rng(2)
     records = []
     train(
         model, _batches(rng), config, out_dir=tmp_path / "run",
         eval_batch=rng.normal(size=(8, 1, 16, 16)).astype(np.float32),
-        eval_every=4, on_log=records.append,
+        on_log=records.append,
     )
     evals = [r for r in records if r.get("event") == "eval"]
     assert evals
@@ -251,6 +253,58 @@ def test_config_survives_json(tmp_path):
     assert isinstance(back.energy.channels, tuple)  # JSON gives a list back
     assert back.patch == config.patch
     assert back.transform.softening == config.transform.softening
+
+
+def _script(name: str):
+    """Import a script by path -- ``scripts/`` is not a package."""
+    import importlib.util
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parent.parent
+    spec = importlib.util.spec_from_file_location(
+        name.removesuffix(".py"), root / "scripts" / name)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_no_script_decides_a_config_value_for_itself():
+    """``config.py`` is the one source of truth for defaults.
+
+    A flag that carries its own number overrides the config on every run,
+    passed or not.  That is not hypothetical: ``prepare_config.py`` assigned
+    ``out_size = 64`` and ``softening_sigma = 1.0`` unconditionally, so the
+    values in ``config.py`` -- and the 128 px geometry its docstring describes
+    -- were never the ones that got trained.
+
+    Asked of each parser rather than grepped out of the source: the same rule
+    written as a string literal is a test of the file's formatting.
+    """
+    must_defer = {
+        "prepare_config.py": ("softening_sigma", "pool_factor", "out_size"),
+        "train.py": ("steps", "batch_size", "lr", "n_layers", "out_sizes",
+                     "n_checkpoints", "n_samples", "eval_every", "eval_size"),
+        "sample.py": ("n", "size", "steps"),
+    }
+    for name, flags in must_defer.items():
+        p = _script(name).parser()
+        for flag in flags:
+            assert p.get_default(flag) is None, (
+                f"{name} --{flag.replace('_', '-')} carries its own default, "
+                f"which overrides the config whether or not it is passed"
+            )
+
+
+def test_the_config_builder_still_knows_where_to_read_and_write():
+    """The exception, and why it is one: ``--shards`` and ``--out`` are not
+    config fields but where the script runs, and in practice always the same
+    two paths.  The shard default follows ``ExtractionConfig.out`` rather than
+    writing the extraction's output directory down a second time."""
+    from rubin_host_prior.selection import ExtractionConfig
+
+    p = _script("prepare_config.py").parser()
+    assert p.get_default("out")
+    assert p.get_default("shards").startswith(ExtractionConfig.out)
 
 
 def test_patch_config_validates_its_own_arithmetic():

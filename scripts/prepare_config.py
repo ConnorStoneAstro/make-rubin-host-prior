@@ -21,8 +21,10 @@ from __future__ import annotations
 
 import argparse
 import json
+from pathlib import Path
 
 from rubin_host_prior.config import Config
+from rubin_host_prior.selection import ExtractionConfig
 from rubin_host_prior import geometry
 from rubin_host_prior.data import (
     LogFluxTransform,
@@ -36,6 +38,13 @@ from rubin_host_prior.data import (
 )
 
 
+#: Where the extraction writes its shards, taken from the extraction config
+#: rather than written out again here.  ``extract_dp2_patches.py`` writes
+#: ``<out>/shards``, and ``out`` has exactly one definition.
+DEFAULT_SHARDS = Path(ExtractionConfig.out) / "shards"
+DEFAULT_OUT = "config.json"
+
+
 def _band_counts(shards) -> dict[str, int]:
     """How many patches each band actually contributed."""
     import numpy as np
@@ -47,15 +56,26 @@ def _band_counts(shards) -> dict[str, int]:
 def parser() -> argparse.ArgumentParser:
     """Built separately so a test can ask what a flag defaults to.
 
-    ``--softening-sigma`` must default to None rather than to a number: it
-    overrides the config, and a numeric default assigned unconditionally is how
-    this script spent a while silently resetting ``softening_sigma`` to 1.0
-    whatever the config said.  A test that greps this file for the literal is a
-    test of its formatting; a test that asks the parser is a test of the rule.
+    **Every flag that names a config field defaults to None**, and is applied
+    only when given.  ``config.py`` holds the defaults for the whole project;
+    a number written here as well is a second source of truth, and the two
+    drift -- this script spent a while resetting ``softening_sigma`` to the 1.0
+    of the old preserve-the-noise design and ``out_size`` to 64, whatever the
+    config said, because it assigned its own defaults unconditionally.
+
+    A test that greps this file for the literals is a test of its formatting;
+    a test that asks the parser is a test of the rule.
+
+    ``--shards`` and ``--out`` are the exception, because they are not config
+    fields at all -- they say where this script reads and writes.  They still
+    have defaults, since in practice they are always the same two paths, and
+    the shard default follows ``ExtractionConfig.out`` rather than repeating it.
     """
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("--shards", required=True, help="directory of *.h5 shards")
-    p.add_argument("--out", required=True, help="config JSON to write")
+    p.add_argument("--shards", default=str(DEFAULT_SHARDS),
+                   help=f"directory of *.h5 shards (default: {DEFAULT_SHARDS})")
+    p.add_argument("--out", default=DEFAULT_OUT,
+                   help=f"config JSON to write (default: {DEFAULT_OUT})")
     p.add_argument("--base-config", default=None, help="config to start from")
     p.add_argument(
         "--softening-sigma",
@@ -66,9 +86,16 @@ def parser() -> argparse.ArgumentParser:
         "and the flux above which the exponential model map is "
         "accurate. Omit to use the config's own value",
     )
-    p.add_argument("--pool-factor", type=int, default=3)
-    p.add_argument("--out-size", type=int, default=64)
-    p.add_argument("--n-stats", type=int, default=512)
+    p.add_argument("--pool-factor", type=int, default=None,
+                   help="omit to use the config's own value")
+    p.add_argument("--out-size", type=int, default=None,
+                   help="pooled training patch size; omit to use the config's "
+                        "own value. nominal_crop follows as out_size x "
+                        "pool_factor")
+    p.add_argument("--n-stats", type=int, default=512,
+                   help="patches to measure the statistics from. Not a config "
+                        "field: it changes how well this script measures, not "
+                        "what the model is")
     p.add_argument("--pooled-cache", default=None, help="also build a pooled cache")
     return p
 
@@ -78,15 +105,32 @@ def main() -> None:
 
     shards = ShardSet.from_dir(args.shards)
     config = Config.load(args.base_config) if args.base_config else Config()
-    config.patch.pool_factor = args.pool_factor
-    config.patch.out_size = args.out_size
-    config.patch.nominal_crop = args.out_size * args.pool_factor
-    config.patch.native_size = max(shards.native_size, config.patch.nominal_crop)
-    # Only when asked.  Assigning the flag's default unconditionally is how
-    # this script spent a while quietly resetting softening_sigma to the 1.0 of
-    # the old preserve-the-noise formulation, whatever the config said.
+
+    # Only what was actually asked for.  Assigning a flag's own default
+    # unconditionally is how this script spent a while resetting out_size to 64
+    # and softening_sigma to 1.0 whatever the config said -- the defaults live
+    # in config.py, and this script's job is to measure, not to decide.
+    if args.pool_factor is not None:
+        config.patch.pool_factor = args.pool_factor
+    if args.out_size is not None:
+        config.patch.out_size = args.out_size
     if args.softening_sigma is not None:
         config.transform.softening_sigma = args.softening_sigma
+
+    # Not a default but an invariant: PatchConfig requires these to agree, and
+    # checks it at construction only -- assigning to a field afterwards does not
+    # re-run __post_init__.  A no-op unless a flag above moved one of them.
+    config.patch.nominal_crop = config.patch.out_size * config.patch.pool_factor
+    # Measured, like everything below it: the stamps are as big as the
+    # extraction made them.
+    config.patch.native_size = shards.native_size
+    if shards.native_size < config.patch.nominal_crop:
+        raise SystemExit(
+            f"the shards are {shards.native_size} px native, but out_size "
+            f"{config.patch.out_size} x pool_factor {config.patch.pool_factor} "
+            f"needs {config.patch.nominal_crop}. Lower --out-size, or extract "
+            f"larger stamps."
+        )
     softening_sigma = config.transform.softening_sigma
     # Measured from pooled patches, not derived from the variance plane:
     # coadd pixel noise is correlated, so pooling reduces it by less than

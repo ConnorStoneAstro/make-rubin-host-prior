@@ -165,7 +165,6 @@ def train(
     out_dir: str | Path,
     sde: VESDE | None = None,
     eval_batch: np.ndarray | None = None,
-    eval_every: int = 0,
     on_log: Callable[[dict], None] | None = None,
     verbose: bool = True,
     resume: str | Path | None = None,
@@ -362,7 +361,8 @@ def train(
                 if on_log is not None:
                     on_log(record)
 
-            if eval_every and eval_batch is not None and step % eval_every == 0:
+            if (eval_batch is not None and cfg.eval_every
+                    and step % cfg.eval_every == 0):
                 key, k_eval = jax.random.split(key)
                 n = eval_batch.shape[0]
                 sigmas = sde.sigma(jnp.linspace(0.0, 1.0, n))

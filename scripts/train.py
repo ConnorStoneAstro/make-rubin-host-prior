@@ -41,7 +41,20 @@ from rubin_host_prior.nn import ConvEnergyNet, n_parameters
 from rubin_host_prior.training import train
 
 
-def main() -> None:
+def parser() -> argparse.ArgumentParser:
+    """Built separately so a test can ask what a flag defaults to.
+
+    Every flag that names a config field defaults to None and is applied only
+    when given.  ``config.py`` holds the defaults for the whole project; a
+    number written here as well would override the config on every run, passed
+    or not, which is how ``prepare_config.py`` spent a while resetting
+    ``out_size`` to 64 whatever the config said.
+
+    Two kinds of flag are not config fields and do carry values:
+    ``--max-in-memory-gb`` and ``--devices`` describe the machine this run
+    happens to be on rather than the run, and ``--shards``, ``--pooled-cache``,
+    ``--config``, ``--out`` and ``--resume`` say where to read and write.
+    """
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--shards", default=None, help="directory of *.h5 shards")
     p.add_argument("--pooled-cache", default=None, help="use a pooled cache instead")
@@ -74,10 +87,19 @@ def main() -> None:
                         "is the global batch split across them, so this makes "
                         "the same run faster rather than changing it; 1 for "
                         "the single-device path")
-    p.add_argument("--eval-every", type=int, default=2000)
-    p.add_argument("--eval-size", type=int, default=32)
+    p.add_argument("--eval-every", type=int, default=None,
+                   help="steps between validation passes; omit to use the "
+                        "config's own value, 0 to switch it off")
+    p.add_argument("--eval-size", type=int, default=None,
+                   help="patches in the validation batch; omit to use the "
+                        "config's own value")
     p.add_argument("--max-in-memory-gb", type=float, default=16.0)
     p.add_argument("--verbose", "-v", action="count", default=1)
+    return p
+
+
+def main() -> None:
+    p = parser()
     args = p.parse_args()
 
     logging.basicConfig(
@@ -100,6 +122,10 @@ def main() -> None:
         config.train.n_checkpoints = args.n_checkpoints
     if args.n_samples is not None:
         config.train.n_samples = args.n_samples
+    if args.eval_every is not None:
+        config.train.eval_every = args.eval_every
+    if args.eval_size is not None:
+        config.train.eval_size = args.eval_size
     if args.n_layers:
         base = config.energy.channels
         config.energy = dataclasses.replace(
@@ -159,8 +185,7 @@ def main() -> None:
         config,
         out_dir=args.out,
         sde=VESDE.from_config(config.sde),
-        eval_batch=dataset.validation_batch(args.eval_size),
-        eval_every=args.eval_every,
+        eval_batch=dataset.validation_batch(config.train.eval_size),
         on_log=lambda r: print(json.dumps(r)) if "event" not in r else None,
         resume=resume,
         n_devices=args.devices,

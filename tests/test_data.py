@@ -115,19 +115,9 @@ def test_the_softening_scale_has_one_source_of_truth():
     assert (inspect.signature(estimate_softening)
             .parameters["softening_sigma"].default is inspect.Parameter.empty)
 
-    # Asked of the parser, not grepped out of the source: the same rule stated
-    # as a string literal broke on a reformat, which is a test of the file's
-    # layout rather than of its behaviour.
-    import importlib.util
-
-    root = Path(__file__).resolve().parent.parent
-    spec = importlib.util.spec_from_file_location(
-        "prepare_config", root / "scripts" / "prepare_config.py")
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    defaults = vars(module.parser().parse_args(["--shards", "x", "--out", "y"]))
-    assert defaults["softening_sigma"] is None, (
-        "a numeric default here overrides the config unconditionally")
+    # That the script's flag defers to this rather than overriding it is
+    # `test_no_script_decides_a_config_value_for_itself`, which checks the same
+    # rule for every flag on every script.
 
 
 def test_x_is_absolute_log_flux_and_nothing_depends_on_the_band():
@@ -397,6 +387,47 @@ def test_shardset_spans_multiple_files(shard_dir):
     assert len(ss.paths) == 3
     assert ss.native_size == 112
     assert ss.bands == BANDS
+
+
+def test_prepare_config_measures_without_deciding(tmp_path, shard_dir, monkeypatch):
+    """What it writes is what it measured, on top of whatever it started from.
+
+    The regression: it assigned its own flag defaults unconditionally, so every
+    config it produced came out at ``out_size`` 64 and ``softening_sigma`` 1.0
+    however it was invoked -- the base config's values, and ``config.py``'s,
+    were overwritten on the way past.
+    """
+    import importlib.util
+    import sys
+
+    base = Config()
+    base.patch = PatchConfig(native_size=112, nominal_crop=96, out_size=32,
+                             pool_factor=3)
+    base.transform.softening_sigma = 2.5
+    base.save(tmp_path / "base.json")
+
+    root = Path(__file__).resolve().parent.parent
+    spec = importlib.util.spec_from_file_location(
+        "prepare_config", root / "scripts" / "prepare_config.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    written = tmp_path / "written.json"
+    monkeypatch.setattr(sys, "argv", [
+        "prepare_config.py", "--shards", str(shard_dir), "--out", str(written),
+        "--base-config", str(tmp_path / "base.json"), "--n-stats", "32",
+    ])
+    module.main()
+
+    out = Config.load(written)
+    # Untouched, because nothing on the command line said to touch them.
+    assert out.patch.out_size == 32
+    assert out.patch.pool_factor == 3
+    assert out.transform.softening_sigma == 2.5
+    # Measured, which is the script's actual job.
+    assert out.transform.softening is not None and out.transform.softening > 0
+    assert out.sde.sigma_min < out.sde.sigma_max
+    assert out.patch.native_size == 112  # the stamps are as big as they are
 
 
 def test_gather_returns_rows_in_the_requested_order(shard_dir):

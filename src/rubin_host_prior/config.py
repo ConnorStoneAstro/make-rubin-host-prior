@@ -169,16 +169,22 @@ class AugmentConfig:
 
 @dataclass
 class TrainConfig:
-    batch_size: int = 32
+    batch_size: int = 128
     steps: int = 2_000_000
-    learning_rate: float = 2e-4
+    learning_rate: float = 1e-4
     warmup_steps: int = 2_000
     cosine_decay: bool = False
     weight_decay: float = 0.0
     grad_clip: float = 1.0
     ema_decay: float = 0.999
-    log_every: int = 100
+    log_every: int = 1000
     seed: int = 0
+    #: Validation cadence and size.  Here rather than as a default on
+    #: ``train.py`` for the reason everything else in this file is here: a
+    #: default that lives in a script is a second source of truth, and two
+    #: sources of truth drift.
+    eval_every: int = 2000
+    eval_size: int = 32
 
     #: Checkpoints spread evenly over the run, rather than an interval that has
     #: to be recomputed every time ``steps`` changes.  The last one lands on the
