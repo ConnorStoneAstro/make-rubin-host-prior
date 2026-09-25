@@ -25,28 +25,28 @@ from ..config import EnergyConfig
 from .layers import ConvBlock, SigmaEmbedding
 
 
-class ConvEnergyNet(eqx.Module):
-    """Stack of valid convolutions summed into a scalar energy."""
+class EnergyBranch(eqx.Module):
+    """One stack of valid convolutions ending in a 1x1 head.
+
+    Complete on its own, so its contribution is already a scalar field over the
+    scene -- which is what makes summing several of them still an energy, and
+    the score still an exact gradient.
+    """
 
     blocks: tuple[ConvBlock, ...]
     head: eqx.nn.Conv2d
-    embed: SigmaEmbedding
-    config: EnergyConfig = eqx.field(static=True)
+    radius: int = eqx.field(static=True)
 
-    def __init__(self, config: EnergyConfig, *, key: PRNGKeyArray):
-        if config.sigma_scaling not in ("inverse_sigma", "none"):
-            raise ValueError(f"bad sigma_scaling {config.sigma_scaling!r}")
-        self.config = config
-        keys = jax.random.split(key, config.n_layers + 2)
-        self.embed = SigmaEmbedding(
-            config.embed_dim,
-            config.n_fourier,
-            config.fourier_scale,
-            config.activation,
-            config.fourier_seed,
-            key=keys[0],
-        )
-        widths = (config.in_channels,) + tuple(config.channels)
+    def __init__(
+        self,
+        config: EnergyConfig,
+        channels: tuple[int, ...],
+        dilations: tuple[int, ...],
+        *,
+        key: PRNGKeyArray,
+    ):
+        keys = jax.random.split(key, len(channels) + 1)
+        widths = (config.in_channels,) + tuple(channels)
         self.blocks = tuple(
             ConvBlock(
                 widths[i],
@@ -56,9 +56,10 @@ class ConvEnergyNet(eqx.Module):
                 config.activation,
                 config.residual,
                 config.film_init_scale,
-                key=keys[i + 1],
+                dilations[i],
+                key=keys[i],
             )
-            for i in range(config.n_layers)
+            for i in range(len(channels))
         )
         # 1x1 projection to a single channel, then sum.  No bias: a constant
         # added to the energy is invisible to the score, so it is pure gauge.
@@ -71,33 +72,83 @@ class ConvEnergyNet(eqx.Module):
         # head keeps the initial energy landscape nearly flat (loss ~ 1, as it
         # should be) while letting gradients reach the whole network immediately.
         head = eqx.nn.Conv2d(
-            config.channels[-1], 1, 1, padding=0, use_bias=False, key=keys[-1]
+            channels[-1], 1, 1, padding=0, use_bias=False, key=keys[-1]
         )
-        fan_in = config.channels[-1]
         w_head = (
             config.head_init_scale
             * jax.random.normal(keys[-1], head.weight.shape)
-            / jnp.sqrt(fan_in)
+            / jnp.sqrt(channels[-1])
         )
         self.head = eqx.tree_at(lambda m: m.weight, head, w_head)
+        self.radius = geometry.branch_radius(dilations, config.kernel_size)
+
+    def __call__(
+        self, x: Float[Array, "c h w"], emb: Float[Array, " d"]
+    ) -> Float[Array, "1 e e"]:
+        h = x
+        for block in self.blocks:
+            h = block(h, emb)
+        return self.head(h)
+
+
+class ConvEnergyNet(eqx.Module):
+    """Parallel stacks of valid convolutions, summed into a scalar energy.
+
+    One branch is the ordinary case.  A second, narrow, heavily dilated branch
+    is how the model gets a scale the first cannot reach: see ``EnergyConfig``
+    for why dilation rather than pooling, and ``geometry`` for what the extra
+    reach costs in crop.
+    """
+
+    branches: tuple[EnergyBranch, ...]
+    embed: SigmaEmbedding
+    config: EnergyConfig = eqx.field(static=True)
+
+    def __init__(self, config: EnergyConfig, *, key: PRNGKeyArray):
+        if config.sigma_scaling not in ("inverse_sigma", "none"):
+            raise ValueError(f"bad sigma_scaling {config.sigma_scaling!r}")
+        self.config = config
+        keys = jax.random.split(key, config.n_branches + 1)
+        # One embedding shared by every branch: it is a function of sigma alone,
+        # so a copy per branch would be the same function learned twice -- and
+        # the branches are meant to specialise by *scale*, which they do through
+        # their own FiLM projections of this one embedding.
+        self.embed = SigmaEmbedding(
+            config.embed_dim,
+            config.n_fourier,
+            config.fourier_scale,
+            config.activation,
+            config.fourier_seed,
+            key=keys[0],
+        )
+        self.branches = tuple(
+            EnergyBranch(config, config.channels[i], config.dilations[i],
+                         key=keys[i + 1])
+            for i in range(config.n_branches)
+        )
 
     # -- geometry ---------------------------------------------------------
 
     @property
     def n_layers(self) -> int:
-        return len(self.blocks)
+        """Across every branch.  Not the geometry -- that follows the dilations."""
+        return self.config.n_layers
+
+    @property
+    def n_branches(self) -> int:
+        return len(self.branches)
 
     @property
     def receptive_radius(self) -> int:
-        return geometry.receptive_radius(self.n_layers, self.config.kernel_size)
+        return self.config.receptive_radius
 
     @property
     def loss_margin(self) -> int:
-        return geometry.loss_margin(self.n_layers, self.config.kernel_size)
+        return self.config.loss_margin
 
     @property
     def min_input_size(self) -> int:
-        return geometry.min_input_size(self.n_layers, self.config.kernel_size)
+        return 2 * self.receptive_radius + 1
 
     # -- forward ----------------------------------------------------------
 
@@ -112,15 +163,24 @@ class ConvEnergyNet(eqx.Module):
         need = self.min_input_size
         if min(h, w) < need:
             raise ValueError(
-                f"scene is {h}x{w} but a model with {self.n_layers} "
-                f"{self.config.kernel_size}x{self.config.kernel_size} valid "
-                f"convolutions needs at least {need} pixels per side"
+                f"scene is {h}x{w} but this architecture has a receptive radius "
+                f"of {self.receptive_radius}, so it needs at least {need} pixels "
+                f"per side"
             )
         emb = self.embed(jnp.asarray(sigma))
-        h = x
-        for block in self.blocks:
-            h = block(h, emb)
-        return self.head(h)
+        radius = self.receptive_radius
+        total = None
+        for branch in self.branches:
+            m = branch(x, emb)
+            # Centre-crop every branch to the longest one's map.  Cropped this
+            # way each cell sits on the same input centre whatever its reach,
+            # which is what leaves the loss margin at 2R of the *longest* branch
+            # rather than something larger.
+            c = radius - branch.radius
+            if c:
+                m = m[:, c:-c, c:-c]
+            total = m if total is None else total + m
+        return total
 
     def __call__(
         self, x: Float[Array, "c h w"], sigma: Float[Array, ""]

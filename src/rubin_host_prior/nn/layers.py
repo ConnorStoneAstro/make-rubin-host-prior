@@ -138,7 +138,11 @@ class FiLM(eqx.Module):
 
 
 class ConvBlock(eqx.Module):
-    """valid conv -> FiLM -> activation, with an optional centre-cropped skip."""
+    """valid conv -> FiLM -> activation, with an optional centre-cropped skip.
+
+    ``radius`` is the per-side shrinkage, ``(k - 1) // 2 * dilation``, which is
+    also what the skip connection has to crop by.
+    """
 
     conv: eqx.nn.Conv2d
     film: FiLM
@@ -155,12 +159,17 @@ class ConvBlock(eqx.Module):
         activation: str,
         residual: bool,
         film_init_scale: float = 0.01,
+        dilation: int = 1,
         *,
         key: PRNGKeyArray,
     ):
         kc, kf = jax.random.split(key)
+        # Dilation spreads the same k*k taps over d times the span: identical
+        # parameters and identical arithmetic, reaching d times as far.  The
+        # valid-mode shrinkage scales with it, 2*r*d per layer.
         conv = eqx.nn.Conv2d(
-            in_channels, out_channels, kernel_size, padding=0, key=kc
+            in_channels, out_channels, kernel_size, padding=0,
+            dilation=dilation, key=kc
         )
         # He-style init for a smooth, roughly half-rectifying activation: the
         # equinox default (uniform 1/sqrt(fan_in)) loses variance layer over layer
@@ -172,7 +181,7 @@ class ConvBlock(eqx.Module):
         self.conv = conv
         self.film = FiLM(embed_dim, out_channels, film_init_scale, key=kf)
         self.act = get_activation(activation)
-        self.radius = (kernel_size - 1) // 2
+        self.radius = (kernel_size - 1) // 2 * dilation
         self.residual = residual and (in_channels == out_channels)
 
     def __call__(

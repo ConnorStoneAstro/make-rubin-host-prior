@@ -3,9 +3,15 @@
 
     python scripts/prepare_config.py --shards data/ecdfs_r/shards --out config.json
 
-The offsets and the sigma range are not free hyperparameters -- they follow from
-the data's noise level and dynamic range.  This script measures both, writes a
-config, and prints the diagnostics you should look at before training:
+The softening scale, the sigma range and the data mean are not free
+hyperparameters -- they follow from the data's noise level and dynamic range.
+They are ``None`` in ``config.py`` for that reason, and this script fills them
+in.  A value already set is kept and reported, never overwritten: setting one
+yourself is the only way to override the heuristic, and there is deliberately
+no flag for it.
+
+It writes a config and prints the diagnostics you should look at before
+training:
 
 * ``sky_scatter`` should match ``expected_sky_scatter(softening_sigma)``.  If it
   does not, the softening scale is wrong.  It is a check on a *typical* width:
@@ -76,7 +82,10 @@ def parser() -> argparse.ArgumentParser:
                    help=f"directory of *.h5 shards (default: {DEFAULT_SHARDS})")
     p.add_argument("--out", default=DEFAULT_OUT,
                    help=f"config JSON to write (default: {DEFAULT_OUT})")
-    p.add_argument("--base-config", default=None, help="config to start from")
+    p.add_argument("--base-config", default=None,
+                   help="config to start from. Any measured field it already "
+                        "carries (softening, sigma range, data mean) is kept "
+                        "rather than re-measured, and the script says which")
     p.add_argument(
         "--softening-sigma",
         type=float,
@@ -136,7 +145,14 @@ def main() -> None:
     # coadd pixel noise is correlated, so pooling reduces it by less than
     # pool_factor and the derived value would be badly low.
     pooled, _ = pool_shards(shards, config, n=args.n_stats)
-    config.transform.softening = estimate_softening(pooled, softening_sigma)
+    # Measured only where nothing has been set.  None means "not measured yet";
+    # a number means someone chose it, and choosing one is the only way to
+    # override the heuristic -- there is deliberately no flag for that.
+    kept: list[str] = []
+    if config.transform.softening is None:
+        config.transform.softening = estimate_softening(pooled, softening_sigma)
+    else:
+        kept.append(f"transform.softening = {config.transform.softening}")
 
     # One scale for every band, so the band counts are reported and nothing
     # more: a band with no patches no longer leaves a hole in the transform.
@@ -157,13 +173,31 @@ def main() -> None:
     dataset = PatchDataset.from_shards(shards, config, transform)
     stats = dataset.stats(args.n_stats)
     sigma_min, sigma_max = suggest_sigma_range(stats)
-    config.sde.sigma_min = round(sigma_min, 5)
-    config.sde.sigma_max = round(sigma_max, 3)
+    if config.sde.sigma_min is None:
+        config.sde.sigma_min = round(sigma_min, 5)
+    else:
+        kept.append(f"sde.sigma_min = {config.sde.sigma_min}")
+    if config.sde.sigma_max is None:
+        config.sde.sigma_max = round(sigma_max, 3)
+    else:
+        kept.append(f"sde.sigma_max = {config.sde.sigma_max}")
     # x is absolute log flux, so the data is centred wherever the fluxes put it
     # -- near +3 at DP2 depths, not near zero.  VE keeps the mean, so the t=1
     # marginal is centred here and prior_sample has to start from the same place.
-    config.sde.data_mean = round(float(stats["mean"]), 4)
+    if config.sde.data_mean is None:
+        config.sde.data_mean = round(float(stats["mean"]), 4)
+    else:
+        kept.append(f"sde.data_mean = {config.sde.data_mean}")
     config.save(args.out)
+
+    if kept:
+        # Said out loud, because a value carried over from a base config was not
+        # measured against *these* shards -- and after a change to out_size or
+        # pool_factor the statistics it came from no longer exist.
+        print("\nkept from the base config rather than measured:")
+        for line in kept:
+            print(f"  {line}")
+        print("  clear these fields (or drop --base-config) to re-measure")
 
     print(
         json.dumps(
@@ -217,14 +251,16 @@ def main() -> None:
 
     lo, hi = config.usable_size_range()
     print(
-        f"\nusable training sizes with {config.energy.n_layers} layers and "
+        f"\nusable training sizes with R = {config.energy.receptive_radius} "
+        f"({config.energy.n_branches} branch(es), "
+        f"{config.energy.n_layers} layers) and "
         f"{config.patch.native_size} px stamps: {lo} .. {hi}"
     )
     for w in config.check_sizes():
         print(f"  WARNING: {w}")
 
     cl = dataset.correlation_length(args.n_stats)
-    margin = geometry.loss_margin(config.energy.n_layers, config.energy.kernel_size)
+    margin = config.energy.loss_margin
     print(f"\ncorrelation length (pooled, log space, over {cl['n_patches']} patches)")
     print(f"  profile: " + " ".join(f"{v:.2f}" for v in cl["profile"][:10]))
     print(

@@ -127,12 +127,15 @@ def main() -> None:
     if args.eval_size is not None:
         config.train.eval_size = args.eval_size
     if args.n_layers:
-        base = config.energy.channels
+        # The first branch only: it is the one whose depth is a free choice.
+        # A long-range branch's layer count is set by the reach it has to cover,
+        # so resizing it here would silently change R and the loss crop.
+        base = config.energy.channels[0]
+        resized = tuple(base[min(i, len(base) - 1)] for i in range(args.n_layers))
         config.energy = dataclasses.replace(
             config.energy,
-            channels=tuple(
-                base[min(i, len(base) - 1)] for i in range(args.n_layers)
-            ),
+            channels=(resized,) + config.energy.channels[1:],
+            dilations=((1,) * args.n_layers,) + config.energy.dilations[1:],
         )
 
     if args.out_sizes:

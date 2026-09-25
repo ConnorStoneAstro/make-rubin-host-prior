@@ -7,7 +7,7 @@
 # this file does not recognise is an error rather than a silently ignored line --
 # a cut that looks applied and is not is the worst of the three outcomes.
 
-out: data/hosts
+out: data3/hosts
 
 # Where to look.  radius_deg: null is the whole DP2 footprint, which is what you
 # want for a selective size cut: big galaxies are rare per square degree, so the
@@ -21,7 +21,7 @@ sky:
 # what a query service is for -- the footprint is ~10^9 rows and the survivors
 # ~10^4.  Needs network and a token with read:tap; the cache means once.
 catalogue:
-  cache: data/host_catalogue.parquet
+  cache: data3/host_catalogue.parquet
   limit_hosts: null      # TOP N on the query; null for no limit
   tap_url: null          # found from the RSP discovery document
 

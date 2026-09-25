@@ -41,10 +41,11 @@ from rubin_host_prior.training.trainer import _shardings
 
 
 def config(steps=6):
-    c = Config(energy=EnergyConfig(channels=(8, 12), embed_dim=16, n_fourier=8),
+    c = Config(energy=EnergyConfig(channels=((8, 12),), embed_dim=16, n_fourier=8),
                patch=PatchConfig(native_size=128, nominal_crop=48, out_size=16,
                                  pool_factor=3))
     c.transform.softening = 20.0
+    c.sde.sigma_min, c.sde.sigma_max, c.sde.data_mean = 0.01, 10.0, 0.0
     c.train.steps, c.train.batch_size = steps, 8
     c.train.log_every, c.train.n_checkpoints, c.train.n_samples = 100, 1, 0
     return c

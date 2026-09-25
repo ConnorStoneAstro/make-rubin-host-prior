@@ -226,11 +226,11 @@ def train(
     config.save(out / "config.json")
 
     # The crop is a function of the architecture, never a configured number.
-    # Print it, so that changing n_layers or kernel_size announces what it did
-    # rather than silently changing how much of each patch is trained on.
+    # Print it, so that changing the dilations or the kernel size announces what
+    # it did rather than silently changing how much of each patch is trained on.
     margin = model.loss_margin
     sizes = config.patch.training_sizes
-    setup = geometry.report(sizes, model.n_layers, model.config.kernel_size)
+    setup = geometry.report(sizes, model.config.dilations, model.config.kernel_size)
     if verbose:
         print(setup)
         if len(sizes) > 1:
@@ -316,12 +316,15 @@ def train(
             "event": "start",
             "n_parameters": n_parameters(model),
             "n_layers": model.n_layers,
+            "n_branches": model.n_branches,
+            "dilations": [list(d) for d in model.config.dilations],
             "kernel_size": model.config.kernel_size,
             "receptive_radius": model.receptive_radius,
             "loss_margin": margin,
             "training_sizes": list(sizes),
             "interior_sizes": [
-                geometry.interior_size(s, model.n_layers, model.config.kernel_size)
+                geometry.interior_size(
+                    s, model.config.dilations, model.config.kernel_size)
                 for s in sizes
             ],
             "sigma_min": sde.sigma_min,
@@ -516,11 +519,12 @@ def _validate_geometry(sizes, model: ConvEnergyNet) -> None:
     bad = [s for s in sizes if s < need]
     if bad:
         raise ValueError(
-            f"patch size(s) {bad} leave no interior for the loss: a model with "
-            f"{model.n_layers} {model.config.kernel_size}x{model.config.kernel_size} "
-            f"layers crops {model.loss_margin} px per side, so it needs more than "
-            f"4R = {2 * model.loss_margin} px per side. Use larger patches or "
-            f"fewer layers."
+            f"patch size(s) {bad} leave no interior for the loss: this "
+            f"architecture has R = {model.receptive_radius}, so it crops "
+            f"{model.loss_margin} px per side and needs more than 4R = "
+            f"{2 * model.loss_margin} px. Use larger patches, or shorten the "
+            f"longest branch -- reach is the sum of its dilations "
+            f"{[list(d) for d in model.config.dilations]}."
         )
 
 
@@ -536,7 +540,7 @@ def _check_batch(batch: jnp.ndarray, model: ConvEnergyNet) -> None:
     need = 2 * model.loss_margin + 1
     if min(h, w) < need:
         raise ValueError(
-            f"patches are {h}x{w} but a model with {model.n_layers} layers needs "
-            f"at least {need} pixels per side to leave any interior for the loss; "
-            f"use larger patches or fewer layers"
+            f"patches are {h}x{w} but a model with R = {model.receptive_radius} "
+            f"needs more than 4R = {need - 1} pixels per side to leave any "
+            f"interior for the loss; use larger patches or less reach"
         )

@@ -16,12 +16,57 @@ from typing import Any
 BANDS = ("u", "g", "r", "i", "z", "y")
 
 
+#: One long-range branch to sum with the default one: six layers at 32 channels
+#: reaching R = 32 (65 px across).  Append it to ``channels``/``dilations`` to
+#: give the model a scale it cannot otherwise represent -- and note that R = 32
+#: means a 64 px loss crop per side, so ``patch.out_size`` must clear 4R = 128.
+COARSE_CHANNELS: tuple[int, ...] = (32, 32, 32, 32, 32, 32)
+COARSE_DILATIONS: tuple[int, ...] = (1, 2, 4, 8, 16, 1)
+
+
 @dataclass(frozen=True)  # hashable: stored as a static field on the module
 class EnergyConfig:
-    """Fully convolutional energy network."""
+    """Fully convolutional energy, summed over one or more parallel branches.
+
+    ``channels`` and ``dilations`` hold **one tuple per branch**.  Each branch is
+    an independent stack of valid convolutions ending in a 1x1 head, and their
+    energy maps are centre-cropped to a common size and added.  A sum of energies
+    is an energy, so the score stays an exact gradient however many there are.
+
+    The default is a single branch and is exactly the model that existed before
+    branches did.
+
+    **Why more than one.**  Reach is ``r * sum(dilations)``, so a long-range
+    branch needs few layers -- but every layer of a *single* stack would have to
+    be as wide as the widest, and that width is there for texture, not for
+    large-scale structure.  Two branches let the long-range path run narrow: the
+    suggested ``COARSE_*`` pair reaches R = 32 for about 5% of the fine branch's
+    arithmetic.
+
+    **Why dilation and not pooling.**  Pooling reaches the same distance more
+    cheaply, but it downsamples, and a stack with total stride ``j`` is invariant
+    only to shifts that are multiples of ``j``.  The resulting score carries a
+    bias locked to the pixel lattice rather than to the image, which the other
+    branch cannot cancel -- it is translation-equivariant, so it can only
+    produce content-locked structure -- and which accumulates coherently over the
+    hundred-odd score evaluations of a sampling run.  Dilation never
+    downsamples, so full pixel-level equivariance survives.
+
+    A doubling series leaves no holes: after ``n`` layers the reach is
+    ``2^n - 1``, and the next dilation ``2^n`` is within ``2R + 1`` of what is
+    already covered.  Gridding comes from *repeating* a large dilation with no
+    small ones beneath it, not from doubling.
+    """
 
     in_channels: int = 1
-    channels: tuple[int, ...] = (32, 64, 96, 128, 128, 128, 128, 128)
+    #: One tuple per branch.  ``((32, 64, ...),)`` is one branch of eight layers.
+    channels: tuple[tuple[int, ...], ...] = ((32, 64, 96, 128, 128, 128, 128, 128),)
+    #: Per-layer dilation, same shape as ``channels``.  Left empty it is all
+    #: ones -- an ordinary stack -- filled in to match ``channels`` so that what
+    #: is stored, hashed and compared against a checkpoint is always explicit.
+    #: ``(1, 2, 4, 8, 16, 1)`` reaches R = 32 in six layers, the trailing 1
+    #: mixing neighbouring long-range features back together.
+    dilations: tuple[tuple[int, ...], ...] = ()
     kernel_size: int = 3
     activation: str = "silu"  # must be C^1; see nn.layers.ACTIVATIONS
     embed_dim: int = 128  # width of the log-sigma embedding MLP
@@ -33,25 +78,89 @@ class EnergyConfig:
     residual: bool = False  # center-cropped skip where channel counts match
     sigma_scaling: str = "inverse_sigma"  # "inverse_sigma" | "none"
 
+    def __post_init__(self) -> None:
+        flat = [c for c in self.channels if isinstance(c, int)]
+        if flat:
+            raise ValueError(
+                "channels is now one tuple per branch, e.g. ((32, 64, 96),) for "
+                "a single branch; this one is a flat list of widths. The config "
+                "predates branches -- re-run scripts/prepare_config.py."
+            )
+        if not self.channels:
+            raise ValueError("an energy needs at least one branch")
+        if not self.dilations:
+            object.__setattr__(
+                self, "dilations", tuple((1,) * len(c) for c in self.channels)
+            )
+        if len(self.channels) != len(self.dilations):
+            raise ValueError(
+                f"{len(self.channels)} channel tuples but "
+                f"{len(self.dilations)} dilation tuples; there must be one of "
+                f"each per branch"
+            )
+        for i, (c, d) in enumerate(zip(self.channels, self.dilations)):
+            if not c:
+                raise ValueError(f"branch {i} has no layers")
+            if len(c) != len(d):
+                raise ValueError(
+                    f"branch {i} has {len(c)} layers but {len(d)} dilations; "
+                    f"every layer needs one"
+                )
+            if any(x < 1 for x in d):
+                raise ValueError(f"branch {i} has a dilation below 1: {tuple(d)}")
+
+    @property
+    def n_branches(self) -> int:
+        return len(self.channels)
+
     @property
     def n_layers(self) -> int:
-        return len(self.channels)
+        """Total across every branch -- for parameter counts and log lines, not
+        for geometry, which depends on the dilations rather than the depth."""
+        return sum(len(c) for c in self.channels)
+
+    @property
+    def receptive_radius(self) -> int:
+        """``R``: the largest reach among the summed branches."""
+        from . import geometry
+
+        return geometry.receptive_radius(self.dilations, self.kernel_size)
+
+    @property
+    def loss_margin(self) -> int:
+        return 2 * self.receptive_radius
 
 
 @dataclass
 class SDEConfig:
-    """Variance-exploding SDE, geometric sigma schedule, no preconditioning."""
+    """Variance-exploding SDE, geometric sigma schedule, no preconditioning.
 
-    sigma_min: float = 0.01
-    sigma_max: float = 10.0
-    #: Mean of ``x`` over the training set.  The ``t = 1`` marginal is centred on
-    #: the data, not on zero, and sampling has to start from the same place.
-    #: This was implicitly zero while the transform put every band's sky at
-    #: ``log(log 2) = -0.37``; under absolute log flux the sky sits near +3 and
-    #: a prior sample centred on zero starts half a sigma_max away from the
-    #: distribution it is meant to be drawn from.  Measured, not chosen --
-    #: ``prepare_config.py`` sets it from ``stats["mean"]``.
-    data_mean: float = 0.0
+    **All three are measured, not chosen**, which is why all three are None
+    rather than carrying plausible-looking numbers.  They follow from the data's
+    noise level and dynamic range, and ``prepare_config.py`` fills them in from
+    the shards -- exactly as it does ``TransformConfig.softening``.
+
+    None also makes "not yet measured" distinguishable from "measured and it
+    came out at 10.0", which is what lets the script measure only what is
+    missing and leave a value you set yourself alone.  While these carried
+    defaults there was no such distinction: a number written here was silently
+    overwritten on the next run, so the defaults could never take effect and the
+    file claimed a say it did not have.
+    """
+
+    #: Below the sky scatter in x, where the score is dominated by noise the
+    #: data already contains.
+    sigma_min: float | None = None
+    #: Must dominate the data's own spread, or the ``t = 1`` marginal is not
+    #: really Gaussian and sampling starts from the wrong distribution.
+    sigma_max: float | None = None
+    #: Mean of ``x`` over the training set.  VE does not move the mean, so the
+    #: ``t = 1`` marginal is centred here and ``prior_sample`` has to start from
+    #: the same place.  This was implicitly zero while the transform put every
+    #: band's sky at ``log(log 2) = -0.37``; under absolute log flux the sky sits
+    #: near +3, and a prior sample centred on zero starts half a ``sigma_max``
+    #: away from the distribution it is meant to be drawn from.
+    data_mean: float | None = None
 
 
 @dataclass
@@ -241,9 +350,7 @@ class Config:
         which is why this lives on ``Config`` -- and why it is easy to configure a
         size that one half allows and the other does not.
         """
-        from . import geometry
-
-        lo = 4 * geometry.receptive_radius(self.energy.n_layers, self.energy.kernel_size) + 1
+        lo = 4 * self.energy.receptive_radius + 1
         hi = self.patch.native_size // self.patch.pool_factor
         return lo, hi
 
@@ -263,7 +370,7 @@ class Config:
             if s < lo:
                 out.append(
                     f"size {s} is below the minimum {lo} (model crops "
-                    f"{2 * geometry.receptive_radius(self.energy.n_layers, self.energy.kernel_size)} px per side)"
+                    f"{self.energy.loss_margin} px per side)"
                 )
             elif s > hi:
                 out.append(
@@ -272,7 +379,8 @@ class Config:
                 )
             else:
                 frac = (
-                    geometry.interior_size(s, self.energy.n_layers, self.energy.kernel_size) / s
+                    geometry.interior_size(
+                        s, self.energy.dilations, self.energy.kernel_size) / s
                 ) ** 2
                 if frac < 0.10:
                     out.append(
@@ -297,7 +405,8 @@ class Config:
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> "Config":
         sections = {
-            "energy": (EnergyConfig, _tuples(d.get("energy", {}), ("channels",))),
+            "energy": (EnergyConfig,
+                       _tuples(d.get("energy", {}), ("channels", "dilations"), 2)),
             "sde": (SDEConfig, d.get("sde", {})),
             "transform": (TransformConfig, d.get("transform", {})),
             "patch": (PatchConfig, _tuples(d.get("patch", {}), ("out_sizes",))),
@@ -331,10 +440,16 @@ def _section(name: str, kind, raw: dict[str, Any]):
     return kind(**raw)
 
 
-def _tuples(d: dict[str, Any], keys: tuple[str, ...]) -> dict[str, Any]:
-    """JSON round-trips tuples as lists; put them back."""
+def _tuples(d: dict[str, Any], keys: tuple[str, ...], depth: int = 1) -> dict[str, Any]:
+    """JSON round-trips tuples as lists; put them back, ``depth`` levels deep.
+
+    ``EnergyConfig.channels`` is a tuple of tuples -- one per branch -- and it is
+    a *static* pytree field, so it has to come back hashable or two models built
+    from the same file compare unequal and ``tree_map`` across them fails.
+    """
     out = dict(d)
     for k in keys:
         if k in out and out[k] is not None:
-            out[k] = tuple(out[k])
+            out[k] = (tuple(tuple(v) for v in out[k]) if depth == 2
+                      else tuple(out[k]))
     return out

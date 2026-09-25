@@ -83,7 +83,7 @@ def test_sigma_conditioning_is_spatially_constant():
     invariant) input is uniform.
     """
     model = ConvEnergyNet(
-        EnergyConfig(channels=(6, 8), embed_dim=16, n_fourier=8, sigma_scaling="none"),
+        EnergyConfig(channels=((6, 8),), embed_dim=16, n_fourier=8, sigma_scaling="none"),
         key=jax.random.key(5),
     )
     x = jnp.full((1, 24, 24), 0.2)
@@ -118,7 +118,7 @@ def test_inverse_sigma_scaling_flattens_the_loss_residual_across_sigma():
     spans = {}
     for mode in ("none", "inverse_sigma"):
         m = ConvEnergyNet(
-            EnergyConfig(channels=(6, 8), embed_dim=16, n_fourier=8,
+            EnergyConfig(channels=((6, 8),), embed_dim=16, n_fourier=8,
                          sigma_scaling=mode),
             key=jax.random.key(8),
         )
@@ -151,7 +151,7 @@ def test_activations_are_smooth():
 
 def test_head_has_no_bias(tiny_model):
     """A constant added to the energy is invisible to the score: pure gauge."""
-    assert tiny_model.head.bias is None
+    assert all(b.head.bias is None for b in tiny_model.branches)
 
 
 def test_fourier_frequencies_are_not_trainable(tiny_model):
@@ -178,9 +178,117 @@ def test_all_parameters_receive_gradients_at_step_zero(tiny_model):
 
 def test_residual_blocks_preserve_valid_shapes():
     model = ConvEnergyNet(
-        EnergyConfig(channels=(8, 8, 8), embed_dim=16, n_fourier=8, residual=True),
+        EnergyConfig(channels=((8, 8, 8),), embed_dim=16, n_fourier=8, residual=True),
         key=jax.random.key(12),
     )
     x = jax.random.normal(jax.random.key(13), (1, 20, 20))
     assert model.energy_map(x, jnp.asarray(1.0)).shape == (1, 14, 14)
     assert n_parameters(model) > 0
+
+
+# -- dilation and summed branches ------------------------------------------
+#
+# Two claims are being pinned here.  That a sum of branches is still one energy,
+# so the score stays an exact gradient however many there are.  And that dilation
+# buys reach without breaking translation equivariance -- which is the whole
+# reason the long-range branch is dilated rather than pooled: a stack with total
+# stride j is invariant only to shifts that are multiples of j, and the resulting
+# bias is locked to the pixel lattice rather than to the image, so the other
+# branch cannot cancel it and a sampling run accumulates it coherently.
+
+
+def _branched(fine=(1, 1), coarse=(1, 2, 4, 1), width=4, key=0):
+    cfg = EnergyConfig(
+        channels=((width,) * len(fine), (width,) * len(coarse)),
+        dilations=(fine, coarse),
+        embed_dim=8,
+        n_fourier=4,
+    )
+    return ConvEnergyNet(cfg, key=jax.random.key(key))
+
+
+def _mute(model, i):
+    """The same model with branch ``i``'s head zeroed, so it contributes no
+    energy at all -- the clean way to isolate one branch's share."""
+    return eqx.tree_at(
+        lambda m: m.branches[i].head.weight,
+        model,
+        jnp.zeros_like(model.branches[i].head.weight),
+    )
+
+
+def test_a_sum_of_branches_is_still_one_energy():
+    """E = E0 + E1 exactly, so -grad E is the sum of the branches' scores and
+    every conservativity guarantee carries over unchanged."""
+    model = _branched()
+    x = jax.random.normal(jax.random.key(3), (1, 40, 40))
+    sigma = jnp.asarray(1.0)
+
+    both = float(model(x, sigma))
+    only0 = float(_mute(model, 1)(x, sigma))
+    only1 = float(_mute(model, 0)(x, sigma))
+    assert both == pytest.approx(only0 + only1, rel=1e-5)
+
+    s_both = np.asarray(score(model, x, sigma))
+    s0 = np.asarray(score(_mute(model, 1), x, sigma))
+    s1 = np.asarray(score(_mute(model, 0), x, sigma))
+    assert s_both == pytest.approx(s0 + s1, rel=1e-4, abs=1e-7)
+
+
+def test_the_short_branch_is_cropped_onto_the_long_one():
+    """Both branches contribute a map of the same size, so R is the longest
+    branch's and not the sum of anything."""
+    model = _branched()
+    assert model.receptive_radius == 8  # 1+2+4+1
+    assert model.branches[0].radius == 2 and model.branches[1].radius == 8
+    emap = model.energy_map(jnp.zeros((1, 40, 40)), jnp.asarray(1.0))
+    assert emap.shape == (1, 40 - 16, 40 - 16)
+
+
+def test_the_long_branch_actually_reaches_further():
+    """Functional, not arithmetic.
+
+    Reach is a statement about the *score*, not the energy: ``dE/dx_i`` depends
+    on ``x_j`` only for ``|i - j| <= 2R``, so the Hessian of the energy is banded
+    at exactly twice the radius.  Muting the long branch must shrink that band
+    from ``2*8`` to ``2*2``, which is the claim "the long branch reaches
+    further" with nothing left to interpret.
+    """
+    model = _branched()
+    size = 41
+    sigma = jnp.asarray(1.0)
+
+    def bandwidth(m):
+        def centre_score(xx):
+            return score(m, xx, sigma)[0, size // 2, size // 2]
+
+        g = np.asarray(jax.grad(centre_score)(jnp.zeros((1, size, size))))[0]
+        yy, xx = np.mgrid[0:size, 0:size]
+        reach = np.abs(g) > 1e-9
+        return int(max(np.abs(yy[reach] - size // 2).max(),
+                       np.abs(xx[reach] - size // 2).max()))
+
+    assert bandwidth(_mute(model, 1)) == 2 * 2   # fine branch alone, R = 2
+    assert bandwidth(model) == 2 * 8             # with the dilated branch, R = 8
+
+
+def test_dilation_keeps_the_score_translation_equivariant():
+    """Shift the scene by one pixel and the score shifts with it, exactly.
+
+    This is what a pooled long-range branch would lose: with total stride j the
+    energy is invariant only to shifts that are multiples of j, so a one-pixel
+    shift changes the score by an amount tied to the lattice rather than to the
+    image.  Here the agreement is to float32 round-off at every shift.
+    """
+    model = _branched()
+    sigma = jnp.asarray(1.0)
+    scene = jax.random.normal(jax.random.key(4), (1, 64, 64))
+    base = np.asarray(score(model, scene, sigma))
+
+    for shift in (1, 2, 3, 5):
+        moved = np.asarray(score(model, jnp.roll(scene, shift, axis=-1), sigma))
+        # Compare where neither crop nor the roll's wraparound interferes.
+        m = model.loss_margin
+        a = base[0, m:-m, m : -m - shift]
+        b = moved[0, m:-m, m + shift : -m]
+        assert a == pytest.approx(b, rel=2e-4, abs=1e-6), f"shift {shift}"

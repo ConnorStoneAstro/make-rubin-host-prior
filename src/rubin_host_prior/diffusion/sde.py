@@ -31,7 +31,29 @@ class VESDE:
 
     @classmethod
     def from_config(cls, config: SDEConfig) -> "VESDE":
-        return cls(config.sigma_min, config.sigma_max, config.data_mean)
+        """Build from a config, refusing one whose range was never measured.
+
+        All three are None until ``prepare_config.py`` measures them.  A default
+        used here instead would be wrong in a way nothing reports: the wrong
+        ``sigma_max`` trains the score on noise levels the data never reaches,
+        and the wrong ``data_mean`` starts every sample half a ``sigma_max``
+        from the distribution it is meant to come from.
+        """
+        missing = [n for n in ("sigma_min", "sigma_max", "data_mean")
+                   if getattr(config, n) is None]
+        if missing:
+            raise ValueError(
+                f"the config has no {', '.join(missing)}. Run "
+                f"scripts/prepare_config.py on the shards; it measures the "
+                f"sigma range and the data mean from them."
+            )
+        if not 0 < config.sigma_min < config.sigma_max:
+            raise ValueError(
+                f"need 0 < sigma_min < sigma_max, got sigma_min="
+                f"{config.sigma_min} and sigma_max={config.sigma_max}"
+            )
+        return cls(float(config.sigma_min), float(config.sigma_max),
+                   float(config.data_mean))
 
     @property
     def log_ratio(self) -> float:

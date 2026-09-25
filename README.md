@@ -143,6 +143,26 @@ values, and none of them is a config field: paths (`--shards`, `--out`,
 `--config`, `--resume`), machine properties (`--devices`, `--max-in-memory-gb`),
 and per-invocation choices (`--seed`, `--sampler`, `--weights`, `--n-stats`).
 
+**Measured fields are `None`, not a plausible number.** `transform.softening`,
+`sde.sigma_min`, `sde.sigma_max` and `sde.data_mean` follow from the data, so
+`config.py` does not pretend to choose them — it says `None` and
+`prepare_config.py` fills them in. `LogFluxTransform.from_config` and
+`VESDE.from_config` both refuse a config still carrying `None` and name the
+script to run.
+
+`None` is doing real work beyond documentation: it distinguishes *not measured
+yet* from *measured, and it came out at 10.0*. That is what lets the script
+measure only what is missing and leave a value you set yourself alone — setting
+the field is the only way to override the heuristic, and there is deliberately
+no flag for it. When a `--base-config` already carries measured values they are
+kept and listed on stdout, because a number carried over was not measured
+against *these* shards, and after a change to `out_size` the statistics it came
+from no longer exist.
+
+While those fields carried defaults (`0.01`, `10.0`, `0.0`) none of them could
+ever take effect: `prepare_config.py` overwrote all three unconditionally, so
+the file claimed a say it did not have.
+
 The softening scale and the σ range are not free hyperparameters;
 they follow from the noise level and dynamic range. This measures them — from
 pooled patches, not the variance planes, since coadd noise is correlated — and
@@ -369,7 +389,9 @@ quantity:
 ### Valid convolutions everywhere, and the `2R` crop
 
 No padding, so no border artefacts and no dependence on patch size — the model
-runs on any scene above `4R + 1` pixels, where `R = n_layers` for 3×3 kernels.
+runs on any scene above `4R + 1` pixels, where `R = r · Σ dilations` and
+`r = (k−1)/2`. An undilated 3×3 stack has `R = n_layers`; see **Reach** below
+for why that is not the only option.
 
 But the energy is a *sum* over the final feature map, and that does not weight
 input pixels equally. Energy cell `p` sees input pixels `[p, p+2R]`, so
@@ -412,6 +434,56 @@ valid-convolution geometry (derived from the architecture, not configured)
     patch   96x96   -> energy map 80x80, loss on interior 64x64 (44% of pixels)
   at inference: a trustworthy region of N px needs a canvas of N + 32 px
 ```
+
+### Reach: dilated branches, summed
+
+Reach is `r · Σ dilations`, not `r · n_layers`. A 3×3 conv with dilation `d`
+reads the same nine taps spread over `d` times the span — identical parameters,
+identical arithmetic, `d` times the distance — so a doubling series buys
+geometric growth for linear depth: `1, 2, 4, 8, 16, 1` reaches `R = 32` in six
+layers where 32 undilated layers would be needed.
+
+`EnergyConfig.channels` and `.dilations` hold **one tuple per branch**. Each
+branch is its own stack ending in a 1×1 head; their energy maps are centre-
+cropped to a common size and summed. A sum of energies is an energy, so the
+score stays an exact gradient however many branches there are. The default is a
+single branch and is byte-for-byte the model that existed before branches did.
+
+**Why a second branch rather than a deeper one.** Every layer of a single stack
+would have to be as wide as the widest, and that width is there for texture, not
+for large-scale structure. A separate branch can run narrow: `COARSE_CHANNELS`
+/ `COARSE_DILATIONS` reach `R = 32` at 32 channels for about 5% of the fine
+branch's arithmetic and 9% more parameters.
+
+**Why dilation rather than pooling.** Pooling reaches as far for fewer FLOPs,
+but it downsamples, and a stack with total stride `j` is invariant only to
+shifts that are multiples of `j`. The resulting bias is locked to the *pixel
+lattice* rather than to the image — and the fine branch cannot cancel it, because
+a stride-1 valid CNN is exactly translation-equivariant and so can only produce
+content-locked structure. Worse, a sampling run evaluates the score ~128 times
+on the same canvas at the same phase, so a grid-locked bias integrates coherently
+where a random one would average away. `test_dilation_keeps_the_score_translation_equivariant`
+is what pins this down.
+
+A doubling series leaves no holes: after `n` layers the reach is `2ⁿ − 1`, and
+the next dilation `2ⁿ` is within `2R + 1` of what is already covered. Gridding
+comes from *repeating* a large dilation with no small ones beneath it. The
+trailing `1` in `1, 2, 4, 8, 16, 1` mixes neighbouring long-range features back
+together.
+
+**What it costs.** `R = 32` means a **64 px crop per side**, so a patch needs to
+clear `4R = 128` before it has any interior at all:
+
+| `out_size` | native @ pool 3 | on sky | interior | % of pixels |
+|---|---|---|---|---|
+| 168 | 504 | 1.7′ | 40 | 6% |
+| 192 | 576 | 1.9′ | 64 | 11% |
+| 256 | 768 | 2.6′ | 128 | 25% |
+| 320 | 960 | 3.2′ | 192 | 36% |
+
+Existing 512 px native stamps pool to 170, which clears 128 — so the two-branch
+model can be trained on the current extraction, at 6% interior, to find out
+whether the long-range branch earns its keep before paying for larger cutouts.
 
 **2. How much context does a scene need before its middle is trustworthy?**
 This is *not* set by `R`. It is set by the **correlation length** ξ of the

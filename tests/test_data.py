@@ -430,6 +430,44 @@ def test_prepare_config_measures_without_deciding(tmp_path, shard_dir, monkeypat
     assert out.patch.native_size == 112  # the stamps are as big as they are
 
 
+def test_prepare_config_keeps_a_value_you_set_yourself(tmp_path, shard_dir,
+                                                       monkeypatch, capsys):
+    """Setting the field *is* the override -- there is deliberately no flag.
+
+    That only works because the measured fields are None until measured: a
+    default would make "chosen" and "not yet known" the same state, and the
+    script would have to overwrite both.
+    """
+    import importlib.util
+    import sys
+
+    base = Config()
+    base.patch = PatchConfig(native_size=112, nominal_crop=96, out_size=32,
+                             pool_factor=3)
+    base.sde.sigma_max = 7.5  # chosen; sigma_min and data_mean left to measure
+    base.save(tmp_path / "base.json")
+
+    root = Path(__file__).resolve().parent.parent
+    spec = importlib.util.spec_from_file_location(
+        "prepare_config", root / "scripts" / "prepare_config.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    written = tmp_path / "written.json"
+    monkeypatch.setattr(sys, "argv", [
+        "prepare_config.py", "--shards", str(shard_dir), "--out", str(written),
+        "--base-config", str(tmp_path / "base.json"), "--n-stats", "32",
+    ])
+    module.main()
+
+    out = Config.load(written)
+    assert out.sde.sigma_max == 7.5, "a value that was set got overwritten"
+    assert out.sde.sigma_min is not None and out.sde.data_mean is not None
+    # And it is not silent about it: a kept value was not measured against
+    # these shards.
+    assert "sde.sigma_max = 7.5" in capsys.readouterr().out
+
+
 def test_gather_returns_rows_in_the_requested_order(shard_dir):
     """Reads are reordered per shard for efficiency; the caller must not see it."""
     ss = ShardSet.from_dir(shard_dir)

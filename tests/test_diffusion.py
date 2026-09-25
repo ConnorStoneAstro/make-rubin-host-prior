@@ -201,6 +201,38 @@ def test_sample_interior_returns_the_padded_middle(tiny_model):
     assert out.shape == (2, 1, 12, 12)
 
 
+def test_a_config_without_a_measured_sigma_range_says_so():
+    """The three SDE numbers are measured, so ``config.py`` leaves them None
+    rather than offering a plausible default.
+
+    A default here is wrong in a way nothing reports: the wrong sigma_max trains
+    the score on noise levels the data never reaches, and the wrong data_mean
+    starts every sample half a sigma_max from the distribution it should come
+    from.  Both produce output, neither produces a complaint.
+    """
+    from rubin_host_prior.config import SDEConfig
+
+    assert (SDEConfig().sigma_min, SDEConfig().sigma_max,
+            SDEConfig().data_mean) == (None, None, None)
+    with pytest.raises(ValueError, match="prepare_config"):
+        VESDE.from_config(SDEConfig())
+    with pytest.raises(ValueError, match="data_mean"):
+        VESDE.from_config(SDEConfig(sigma_min=0.1, sigma_max=1.0))
+    with pytest.raises(ValueError, match="0 < sigma_min < sigma_max"):
+        VESDE.from_config(SDEConfig(sigma_min=5.0, sigma_max=1.0, data_mean=0.0))
+
+    sde = VESDE.from_config(SDEConfig(sigma_min=0.02, sigma_max=8.0, data_mean=3.1))
+    assert (sde.sigma_min, sde.sigma_max, sde.data_mean) == (0.02, 8.0, 3.1)
+
+
+def test_sampling_will_not_invent_a_schedule(tiny_model):
+    """``sde`` used to default to ``VESDE()``, a schedule no trained model has.
+    Sampling ran, produced plausible noise, and reported nothing wrong."""
+    with pytest.raises(TypeError):
+        sample_interior(tiny_model, jax.random.key(0), out_size=12, n_samples=1)
+
+
 def test_unknown_sampler_rejected(tiny_model):
     with pytest.raises(ValueError, match="unknown sampler"):
-        sample_interior(tiny_model, jax.random.key(11), 12, sampler="nope")
+        sample_interior(tiny_model, jax.random.key(11), 12, VESDE(),
+                        sampler="nope")

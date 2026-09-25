@@ -14,22 +14,47 @@ from rubin_host_prior.nn import ConvEnergyNet, score
 def test_shrinkage_matches_a_real_forward_pass(tiny_model):
     for size in (16, 25, 40):
         emap = tiny_model.energy_map(jnp.zeros((1, size, size)), jnp.asarray(1.0))
-        assert emap.shape[-1] == g.energy_size(size, tiny_model.n_layers)
+        assert emap.shape[-1] == g.energy_size(size, tiny_model.config.dilations)
 
 
 def test_margin_is_twice_the_receptive_radius():
     for n_layers in (1, 3, 8):
-        r = g.receptive_radius(n_layers)
+        plain = ((1,) * n_layers,)
+        r = g.receptive_radius(plain)
         assert r == n_layers
-        assert g.loss_margin(n_layers) == 2 * r
-        assert g.interior_size(64, n_layers) == 64 - 4 * r
+        assert g.loss_margin(plain) == 2 * r
+        assert g.interior_size(64, plain) == 64 - 4 * r
+
+
+def test_reach_is_the_sum_of_the_dilations():
+    """The whole reason for dilation: reach grows with the sum, not the depth,
+    so a doubling series buys geometric growth for linear depth."""
+    assert g.branch_radius((1, 2, 4, 8, 16, 1)) == 32
+    assert g.branch_radius((1,) * 32) == 32  # the same reach, 32 layers deep
+    assert g.branch_radius((1, 2, 4, 8, 16), kernel_size=5) == 62
+
+
+def test_several_branches_take_the_longest_margin():
+    """Shorter branches are centre-cropped onto the longest one's grid, so their
+    cells sit on the same input centres and never bind the margin."""
+    fine, coarse = (1,) * 8, (1, 2, 4, 8, 16, 1)
+    assert g.receptive_radius((fine,)) == 8
+    assert g.receptive_radius((coarse,)) == 32
+    assert g.receptive_radius((fine, coarse)) == 32
+    assert g.loss_margin((fine, coarse)) == 64
+    # 2R + 1 produces a 1x1 energy map; 4R + 1 is the first size with any loss
+    # interior at all.  Two different thresholds, and it is the second that
+    # decides what has to come out of the extraction.
+    assert g.min_input_size((fine, coarse)) == 65
+    assert g.interior_size(129, (fine, coarse)) == 1
+    assert g.interior_size(128, (fine, coarse)) == 0
 
 
 def test_min_input_size_is_the_smallest_that_works():
     n_layers = 3
-    smallest = g.min_input_size(n_layers)
+    smallest = g.min_input_size(((1,) * n_layers,))
     model = ConvEnergyNet(
-        EnergyConfig(channels=(4,) * n_layers, embed_dim=8, n_fourier=4),
+        EnergyConfig(channels=((4,) * n_layers,), embed_dim=8, n_fourier=4),
         key=jax.random.key(0),
     )
     assert model.energy_map(
@@ -121,7 +146,7 @@ def test_energy_hessian_bandwidth_is_2r(tiny_model):
 def test_report_states_the_crop_and_its_consequences():
     """The crop is derived from the architecture, never configured, so the
     report is the only thing that tells you what changing n_layers did."""
-    text = g.report((48, 64, 96), n_layers=8, kernel_size=3)
+    text = g.report((48, 64, 96), ((1,) * 8,), kernel_size=3)
     assert "2R = 16 px from every side" in text
     assert "smallest usable patch = 4R + 1 = 33 px" in text
     assert "N + 32 px" in text  # inference needs region + 4R
@@ -131,13 +156,18 @@ def test_report_states_the_crop_and_its_consequences():
 
 
 def test_report_tracks_the_hyperparameters():
-    """Changing layers or kernel size must change the reported crop."""
-    assert "2R = 6 px" in g.report(64, n_layers=3, kernel_size=3)
-    assert "2R = 16 px" in g.report(64, n_layers=8, kernel_size=3)
-    assert "2R = 32 px" in g.report(64, n_layers=8, kernel_size=5)
+    """Changing layers, dilations or kernel size must change the reported crop."""
+    assert "2R = 6 px" in g.report(64, ((1,) * 3,), kernel_size=3)
+    assert "2R = 16 px" in g.report(64, ((1,) * 8,), kernel_size=3)
+    assert "2R = 32 px" in g.report(64, ((1,) * 8,), kernel_size=5)
+    assert "2R = 64 px" in g.report(300, ((1, 2, 4, 8, 16, 1),))
+    # And a second branch is named, so a run's log says what it was given.
+    two = g.report(300, ((1,) * 8, (1, 2, 4, 8, 16, 1)))
+    assert "branch 0" in two and "branch 1" in two
+    assert "dilations 1x2x4x8x16x1" in two
 
 
 def test_report_flags_a_size_that_is_too_small():
-    text = g.report((24, 64), n_layers=8)
+    text = g.report((24, 64), ((1,) * 8,))
     assert "TOO SMALL" in text
     assert "loss on interior 32x32" in text  # the workable one still reported

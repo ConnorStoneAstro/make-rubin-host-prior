@@ -25,11 +25,14 @@ from rubin_host_prior.training import (
 
 def _config(**train_kw):
     c = Config(
-        energy=EnergyConfig(channels=(8, 12), embed_dim=16, n_fourier=8),
+        energy=EnergyConfig(channels=((8, 12),), embed_dim=16, n_fourier=8),
         patch=PatchConfig(native_size=128, nominal_crop=48, out_size=16,
                           pool_factor=3),
     )
+    # The measured fields, which a real config gets from prepare_config.py and
+    # which VESDE.from_config refuses to invent.
     c.transform.softening = 20.0
+    c.sde.sigma_min, c.sde.sigma_max, c.sde.data_mean = 0.01, 10.0, 0.0
     c.train.steps = 12
     c.train.batch_size = 4
     c.train.log_every = 4
@@ -59,8 +62,8 @@ def test_ema_decay_warms_up():
 def test_ema_update_mixes_only_array_leaves(tiny_model):
     other = ConvEnergyNet(tiny_model.config, key=jax.random.key(99))
     mixed = ema_update(tiny_model, other, jnp.asarray(0.25))
-    expected = 0.25 * tiny_model.head.weight + 0.75 * other.head.weight
-    np.testing.assert_allclose(np.asarray(mixed.head.weight), np.asarray(expected))
+    expected = 0.25 * tiny_model.branches[0].head.weight + 0.75 * other.branches[0].head.weight
+    np.testing.assert_allclose(np.asarray(mixed.branches[0].head.weight), np.asarray(expected))
     # Static fields survive untouched.
     assert mixed.config == tiny_model.config
     assert mixed.embed.fourier.freqs == tiny_model.embed.fourier.freqs
@@ -70,7 +73,7 @@ def test_ema_at_decay_zero_is_the_live_model(tiny_model):
     other = ConvEnergyNet(tiny_model.config, key=jax.random.key(98))
     mixed = ema_update(tiny_model, other, jnp.asarray(0.0))
     np.testing.assert_allclose(
-        np.asarray(mixed.head.weight), np.asarray(other.head.weight)
+        np.asarray(mixed.branches[0].head.weight), np.asarray(other.branches[0].head.weight)
     )
 
 
@@ -81,7 +84,7 @@ def test_optimizer_warms_up_then_holds():
     cfg = _config(learning_rate=1e-3, warmup_steps=10, cosine_decay=False).train
     opt = make_optimizer(cfg)
     model = ConvEnergyNet(
-        EnergyConfig(channels=(4,), embed_dim=8, n_fourier=4), key=jax.random.key(0)
+        EnergyConfig(channels=((4,),), embed_dim=8, n_fourier=4), key=jax.random.key(0)
     )
     params = eqx.filter(model, eqx.is_inexact_array)
     state = opt.init(params)
@@ -89,7 +92,7 @@ def test_optimizer_warms_up_then_holds():
     steps = []
     for _ in range(20):
         updates, state = opt.update(grads, state, params)
-        steps.append(float(jnp.abs(updates.head.weight).max()))
+        steps.append(float(jnp.abs(updates.branches[0].head.weight).max()))
     assert steps[0] < steps[5] < steps[9]  # warming up
     assert steps[15] == pytest.approx(steps[19], rel=1e-3)  # then flat
 
@@ -98,7 +101,7 @@ def test_cosine_schedule_decays():
     cfg = _config(learning_rate=1e-3, warmup_steps=2, cosine_decay=True, steps=50).train
     opt = make_optimizer(cfg)
     model = ConvEnergyNet(
-        EnergyConfig(channels=(4,), embed_dim=8, n_fourier=4), key=jax.random.key(0)
+        EnergyConfig(channels=((4,),), embed_dim=8, n_fourier=4), key=jax.random.key(0)
     )
     params = eqx.filter(model, eqx.is_inexact_array)
     state = opt.init(params)
@@ -106,7 +109,7 @@ def test_cosine_schedule_decays():
     mags = []
     for _ in range(50):
         updates, state = opt.update(grads, state, params)
-        mags.append(float(jnp.abs(updates.head.weight).max()))
+        mags.append(float(jnp.abs(updates.branches[0].head.weight).max()))
     assert mags[-1] < mags[5]
 
 
@@ -187,7 +190,7 @@ def test_too_small_patches_fail_immediately_with_a_useful_message(tmp_path):
     """A model with 8 layers needs > 4R pixels.  Caught from the config before
     a single batch is drawn, not on step 1 and not 10 000 steps in."""
     config = _config()
-    config.energy = EnergyConfig(channels=(8,) * 8, embed_dim=16, n_fourier=8)
+    config.energy = EnergyConfig(channels=((8,) * 8,), embed_dim=16, n_fourier=8)
     model = ConvEnergyNet(config.energy, key=jax.random.key(0))
     with pytest.raises(ValueError, match=r"leave no interior"):
         train(
@@ -222,11 +225,12 @@ def test_checkpoint_round_trips_exactly(tmp_path):
     assert cfg.energy == config.energy
     assert cfg.transform.softening == config.transform.softening
     np.testing.assert_array_equal(
-        np.asarray(back_ema.head.weight), np.asarray(ema.head.weight)
+        np.asarray(back_ema.branches[0].head.weight),
+        np.asarray(ema.branches[0].head.weight),
     )
     back_live, _, _ = load_checkpoint(tmp_path / "ck", which="model")
     np.testing.assert_array_equal(
-        np.asarray(back_live.head.weight), np.asarray(model.head.weight)
+        np.asarray(back_live.branches[0].head.weight), np.asarray(model.branches[0].head.weight)
     )
 
 
@@ -323,7 +327,7 @@ def test_models_from_one_config_are_pytree_compatible():
     skeleton's basis in place, so a reloaded checkpoint would compute different
     scores from the same weights.
     """
-    cfg = EnergyConfig(channels=(6, 8), embed_dim=16, n_fourier=8)
+    cfg = EnergyConfig(channels=((6, 8),), embed_dim=16, n_fourier=8)
     a = ConvEnergyNet(cfg, key=jax.random.key(1))
     b = ConvEnergyNet(cfg, key=jax.random.key(2))
     assert a.embed.fourier.freqs == b.embed.fourier.freqs
@@ -331,7 +335,7 @@ def test_models_from_one_config_are_pytree_compatible():
     ema_update(a, b, jnp.asarray(0.5))  # must not raise
 
     other = ConvEnergyNet(
-        EnergyConfig(channels=(6, 8), embed_dim=16, n_fourier=8, fourier_seed=7),
+        EnergyConfig(channels=((6, 8),), embed_dim=16, n_fourier=8, fourier_seed=7),
         key=jax.random.key(1),
     )
     assert other.embed.fourier.freqs != a.embed.fourier.freqs
@@ -344,11 +348,11 @@ def test_setup_note_is_printed_and_reports_the_derived_crop(tmp_path, capsys):
     """Requested behaviour: training announces how much it is cropping, so that
     tinkering with n_layers or kernel_size is never silent."""
     config = _config()
-    config.energy = EnergyConfig(channels=(8,) * 3, embed_dim=16, n_fourier=8)
+    config.energy = EnergyConfig(channels=((8,) * 3,), embed_dim=16, n_fourier=8)
     model = ConvEnergyNet(config.energy, key=jax.random.key(0))
     train(model, _batches(np.random.default_rng(0)), config, out_dir=tmp_path / "r")
     out = capsys.readouterr().out
-    assert "3 x 3x3 valid convolutions" in out
+    assert "branch 0: 3 x 3x3, dilations 1x1x1" in out
     assert "loss crop = 2R = 6 px from every side" in out
     assert "loss on interior 4x4" in out  # 16 px patches, margin 6
     assert "N + 12 px" in out
@@ -398,7 +402,7 @@ def test_all_configured_sizes_are_validated_before_training_starts(tmp_path):
     """A mixed-size run must not fail thousands of steps in, when the smallest
     size first comes round."""
     config = _config()
-    config.energy = EnergyConfig(channels=(8,) * 8, embed_dim=16, n_fourier=8)
+    config.energy = EnergyConfig(channels=((8,) * 8,), embed_dim=16, n_fourier=8)
     config.patch = dataclasses.replace(config.patch, out_sizes=(16, 40))
     # 40 is fine for 8 layers (needs > 32); 16 is not.
     model = ConvEnergyNet(config.energy, key=jax.random.key(0))
@@ -411,22 +415,22 @@ def test_usable_size_range_combines_both_halves_of_the_config():
     """The lower bound comes from the architecture, the upper from the stamp.
     Neither dataclass knows both, which is how a size can satisfy one and not
     the other -- exactly the trap that motivates this helper."""
-    c = Config(energy=EnergyConfig(channels=(32,) * 8),
+    c = Config(energy=EnergyConfig(channels=((32,) * 8,)),
                patch=PatchConfig(native_size=224, nominal_crop=192, out_size=64,
                                  pool_factor=3))
     assert c.usable_size_range() == (33, 74)  # 4R+1 = 33, 224//3 = 74
-    big = Config(energy=EnergyConfig(channels=(32,) * 8),
+    big = Config(energy=EnergyConfig(channels=((32,) * 8,)),
                  patch=PatchConfig(native_size=384, nominal_crop=288, out_size=96,
                                    pool_factor=3))
     assert big.usable_size_range() == (33, 128)
-    shallow = Config(energy=EnergyConfig(channels=(32,) * 3),
+    shallow = Config(energy=EnergyConfig(channels=((32,) * 3,)),
                      patch=PatchConfig(native_size=224, nominal_crop=192,
                                        out_size=64, pool_factor=3))
     assert shallow.usable_size_range() == (13, 74)  # 4R+1 with R=3
 
 
 def test_check_sizes_flags_too_small_and_mostly_margin():
-    c = Config(energy=EnergyConfig(channels=(32,) * 8),
+    c = Config(energy=EnergyConfig(channels=((32,) * 8,)),
                patch=PatchConfig(native_size=224, nominal_crop=192, out_size=64,
                                  pool_factor=3))
     assert c.check_sizes() == []
@@ -438,7 +442,7 @@ def test_check_sizes_flags_too_small_and_mostly_margin():
 
 
 def test_check_sizes_reports_when_no_size_works_at_all():
-    c = Config(energy=EnergyConfig(channels=(32,) * 20),  # 4R+1 = 81
+    c = Config(energy=EnergyConfig(channels=((32,) * 20,)),  # 4R+1 = 81
                patch=PatchConfig(native_size=96, nominal_crop=96, out_size=32,
                                  pool_factor=3))
     assert c.usable_size_range() == (81, 32)
@@ -448,7 +452,7 @@ def test_check_sizes_reports_when_no_size_works_at_all():
 def test_report_marks_patches_that_are_mostly_margin():
     from rubin_host_prior import geometry as geo
 
-    text = geo.report((40, 64), n_layers=8)
+    text = geo.report((40, 64), ((1,) * 8,))
     assert "mostly margin" in text.split("patch   40")[1].split("\n")[0]
     assert "mostly margin" not in text.split("patch   64")[1].split("\n")[0]
 

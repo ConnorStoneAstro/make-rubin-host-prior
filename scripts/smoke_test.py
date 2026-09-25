@@ -73,7 +73,7 @@ def main() -> None:
             config.patch, out_sizes=tuple(args.out_sizes)
         )
     config.energy = EnergyConfig(
-        channels=tuple([16, 24, 32, 32][min(i, 3)] for i in range(args.n_layers))
+        channels=(tuple([16, 24, 32, 32][min(i, 3)] for i in range(args.n_layers)),)
     )
     config.train.steps = args.steps
     config.train.batch_size = args.batch_size
@@ -98,7 +98,7 @@ def main() -> None:
     print(f"    sigma range [{config.sde.sigma_min:.4f}, {config.sde.sigma_max:.2f}]"
           f" about data mean {config.sde.data_mean:.2f}")
     cl = dataset.correlation_length(128)
-    print(f"    {context_advice(cl['xi'], 2 * args.n_layers)}"
+    print(f"    {context_advice(cl['xi'], config.energy.loss_margin)}"
           f"   ({cl['noise_fraction']:.0%} of variance is noise)")
 
     model = ConvEnergyNet(config.energy, key=jax.random.key(0))

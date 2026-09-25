@@ -131,8 +131,8 @@ def sample_interior(
     model: ConvEnergyNet,
     key: PRNGKeyArray,
     out_size: int,
+    sde: VESDE,
     n_samples: int = 1,
-    sde: VESDE | None = None,
     sampler: str = "pflow",
     **kwargs,
 ) -> Float[Array, "b c h w"]:
@@ -140,9 +140,11 @@ def sample_interior(
 
     The canvas is ``out_size + 4R`` on a side and only the centre is returned,
     so every returned pixel had a fully supported score throughout sampling.
+
+    ``sde`` is required.  It used to default to ``VESDE()``, whose own field
+    defaults are a schedule no trained model has: sampling would run, produce
+    plausible-looking noise, and report nothing wrong.
     """
-    if sde is None:
-        sde = VESDE()
     margin = model.loss_margin
     canvas = out_size + 2 * margin
     shape = (n_samples, model.config.in_channels, canvas, canvas)
