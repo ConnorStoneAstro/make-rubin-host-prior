@@ -32,7 +32,7 @@ catalogue:
 # is most of the way to the frame edge.
 stamps:
   bands: [u, g, r, i, z, y]
-  native_size: 512
+  native_size: 1024
   patches_per_shard: 1024
 
 # How much to do.  n_stamps counts accepted cutouts, not hosts: a host yields at
