@@ -41,7 +41,7 @@ stamps:
 # out, and the check happens between hosts, so it can overshoot by up to one
 # host's worth of bands.
 run:
-  n_stamps: 2048
+  n_stamps: 1024
   seed: 0
   prefix: patches
 
