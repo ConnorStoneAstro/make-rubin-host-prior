@@ -471,19 +471,59 @@ comes from *repeating* a large dilation with no small ones beneath it. The
 trailing `1` in `1, 2, 4, 8, 16, 1` mixes neighbouring long-range features back
 together.
 
-**What it costs.** `R = 32` means a **64 px crop per side**, so a patch needs to
-clear `4R = 128` before it has any interior at all:
+**What it costs.** `R = 32` means a **64 px crop per side**. Under the old
+contract — patch in, `patch − 4R` trained on — a 512 px native stamp pooled to
+170 would have left a 42 px interior, 6% of the arithmetic. That is what the
+context border exists to avoid.
 
-| `out_size` | native @ pool 3 | on sky | interior | % of pixels |
-|---|---|---|---|---|
-| 168 | 504 | 1.7′ | 40 | 6% |
-| 192 | 576 | 1.9′ | 64 | 11% |
-| 256 | 768 | 2.6′ | 128 | 25% |
-| 320 | 960 | 3.2′ | 192 | 36% |
+### The context border
 
-Existing 512 px native stamps pool to 170, which clears 128 — so the two-branch
-model can be trained on the current extraction, at 6% interior, to find out
-whether the long-range branch earns its keep before paying for larger cutouts.
+**`out_size` is the size the loss is computed on, not the size the net is fed.**
+The loader carries `2R` pixels of context on every side and the net is fed
+`out_size + 4R`, so `crop_interior` lands on exactly the nominal crop:
+
+```
+fed 256 = [ 64 context ][ 128 nominal crop ][ 64 context ]
+loss on         ^-- these 128 --^
+```
+
+The border is taken **from the rest of the stamp wherever there is any**, and
+only the shortfall is reflect-padded. For `native_size` 512, `nominal_crop` 384
+and a centred crop that is 21 real pooled pixels and 43 reflected per side;
+translation moves real context from one side to the other rather than creating
+more, so a crop pushed to one edge has a wholly synthetic border there and a
+wholly real one opposite. `Config.real_context()` is the number, and
+`prepare_config.py` and `train()` both print the split.
+
+**Padding cannot manufacture clean signal.** The loss pixels whose receptive
+field holds no reflected pixel number ~43 per side — exactly what a bare crop of
+the whole stamp would have given. What the border buys is training on the *rest*
+of the nominal crop as well, at the cost of a seam somewhere in those pixels'
+receptive fields. That is a deliberate trade, taken because the alternative is
+6% efficiency:
+
+| | loss region | never sees the seam | clean px |
+|---|---|---|---|
+| context 64 | 128 | 43 (11%) | 1,820 |
+| no context, whole stamp as one patch | 42 | 42 (100%) | 1,764 |
+
+The defect it introduces is mild for a reason worth stating: **mirrored sky is
+valid sky.** The augmentation already teaches dihedral invariance, so reflected
+pixels are drawn from the same distribution as real ones. The only thing
+reflection creates that nature does not is the *correlation across the seam* — a
+locally mirror-symmetric neighbourhood. That is far milder than the truncated
+energy sum the `2R` crop exists to avoid, which no amount of training can fix.
+`reflect` and not `symmetric`, so the edge pixel is not duplicated.
+
+The loss is unweighted: once padded, every pixel in the nominal crop counts the
+same. If symmetric artefacts ever show up in the checkpoint sample grids, the
+knobs are `nominal_crop` (smaller crop, more real context) and the coarse
+branch's reach (shorter dilation series, smaller `2R`).
+
+Two things deliberately do *not* see the border: `correlation_length` and
+`stats` pass `context=0`, because a reflected border would put a mirror
+correlation straight into ξ and double-count pixels in the sky scatter that sets
+the σ range.
 
 **2. How much context does a scene need before its middle is trustworthy?**
 This is *not* set by `R`. It is set by the **correlation length** ξ of the
@@ -568,11 +608,6 @@ size). This does three things:
 Translation room is capped at the reference size's room (`max_translate_native`).
 Without that cap a small crop would roam the whole stamp and land mostly on blank
 sky far from the host, silently changing the data distribution with patch size.
-
-The pooled cache serves any size at or below the one it was built at, by
-sub-cropping: a sub-crop of a pooled, transformed image is exactly the pooled
-transform of the corresponding native sub-region, because pooling is local and
-the transform is pointwise.
 
 ### σ conditioning: FiLM only, no spatial normalisation
 
@@ -1279,10 +1314,11 @@ manifest needs.
 have non-zero origins, bit assignments are not guaranteed stable across releases,
 and without both a saved stamp cannot be mapped back to the sky or interpreted.
 
-`PatchDataset.build_pooled_cache()` writes a derived pooled-and-transformed array
-keyed by a hash of the transform config, for fast iteration. It only supports
-dihedral augmentation (the crop is baked in), so the default loader path reads
-native stamps.
+**Every batch is built from the shards.** There was once a second loader path
+serving a pre-pooled, pre-transformed cache keyed by a hash of the config. It was
+faster, but it baked the crop in — so it lost the translation augmentation — and
+it was one more derived file to fall out of step with the shards it came from.
+The shards load fast enough; the cache is gone rather than switched off.
 
 ## Porting to NERSC: what to verify
 

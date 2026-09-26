@@ -212,9 +212,9 @@ class PatchConfig:
     every sub-pixel phase.
     """
 
-    native_size: int = 1024  # pixels cut from the coadd
-    nominal_crop: int = 768  # native pixels feeding one training image
-    out_size: int = 256  # nominal_crop / pool_factor; the reference size
+    native_size: int = 512  # pixels cut from the coadd
+    nominal_crop: int = 384  # native pixels feeding one training image
+    out_size: int = 128  # nominal_crop / pool_factor; the reference size
     pool_factor: int = 3
     #: Extra training sizes.  Each batch is drawn at one size (a batch must be
     #: shape-homogeneous), cycling over ``training_sizes``.  Larger patches
@@ -339,51 +339,55 @@ class Config:
     augment: AugmentConfig = field(default_factory=AugmentConfig)
     train: TrainConfig = field(default_factory=TrainConfig)
 
+    def real_context(self, out_size: int | None = None) -> float:
+        """Pooled px of genuine sky either side of a centred nominal crop.
+
+        The loss discards ``2R`` from every side, so the loader carries that
+        much context along; this is how much of it the stamp can supply.  The
+        rest is reflected, which is a deliberate trade -- see
+        ``data.pooling.pool_to_training_grid``.  Note that a crop is not always
+        centred: translation moves real context from one side to the other, it
+        does not create more.
+        """
+        p = self.patch
+        out_size = p.out_size if out_size is None else out_size
+        return (p.native_size / p.pool_factor - out_size) / 2
+
     def usable_size_range(self) -> tuple[int, int]:
         """``(smallest, largest)`` training size this config can actually serve.
 
-        The lower bound comes from the architecture (a patch must exceed ``4R``
-        or the loss has no interior); the upper bound from the extracted stamp
-        (``native_size // pool_factor``).  Neither dataclass knows both halves,
-        which is why this lives on ``Config`` -- and why it is easy to configure a
-        size that one half allows and the other does not.
+        The lower bound used to be architectural -- a patch had to exceed ``4R``
+        or the loss had no interior.  That is gone: the loader carries ``2R`` of
+        context on every side, so the loss lands on the whole nominal crop
+        whatever its size.  What remains is the stamp: the nominal crop itself
+        must be real pixels, so ``out_size * pool_factor`` cannot exceed
+        ``native_size``.  How much of the *context* is real is a separate
+        question -- ``real_context``.
         """
-        lo = 4 * self.energy.receptive_radius + 1
-        hi = self.patch.native_size // self.patch.pool_factor
-        return lo, hi
+        return 1, self.patch.native_size // self.patch.pool_factor
 
     def check_sizes(self) -> list[str]:
         """Warnings about the configured training sizes; empty means fine."""
-        from . import geometry
-
-        lo, hi = self.usable_size_range()
+        _, hi = self.usable_size_range()
+        margin = self.energy.loss_margin
         out = []
-        if lo > hi:
-            out.append(
-                f"no usable patch size: the model needs > {lo - 1} px but the "
-                f"{self.patch.native_size} px stamps only yield {hi} px. "
-                f"Extract larger stamps or use fewer layers."
-            )
+        # A size that does not fit the stamp cannot get here: PatchConfig
+        # rejects it at construction, and dataclasses.replace re-runs that.
         for s in self.patch.training_sizes:
-            if s < lo:
+            if self.real_context(s) <= 0:
                 out.append(
-                    f"size {s} is below the minimum {lo} (model crops "
-                    f"{self.energy.loss_margin} px per side)"
+                    f"size {s} leaves no real context: the whole {margin} px "
+                    f"border on every side would be reflection, so nothing "
+                    f"outside the nominal crop is new information. Extract "
+                    f"larger stamps, or reduce out_size below {hi}."
                 )
-            elif s > hi:
+            frac = (s / (s + 2 * margin)) ** 2
+            if frac < 0.10:
                 out.append(
-                    f"size {s} needs {s * self.patch.pool_factor} native "
-                    f"px but the stamps are {self.patch.native_size}"
+                    f"size {s} is fed {s + 2 * margin} px to train on {s} -- "
+                    f"only {100 * frac:.0f}% of the arithmetic reaches the "
+                    f"loss. Use a larger out_size, or less reach."
                 )
-            else:
-                frac = (
-                    geometry.interior_size(s, self.energy.dilations, self.energy.kernel_size) / s
-                ) ** 2
-                if frac < 0.10:
-                    out.append(
-                        f"size {s} spends {100 * (1 - frac):.0f}% of itself "
-                        f"on the cropped margin -- little signal per step"
-                    )
         if self.augment.translate and self.patch.max_translate_native == 0:
             out.append(
                 f"translation augmentation has no room: native_size "

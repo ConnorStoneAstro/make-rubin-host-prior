@@ -34,11 +34,17 @@ from pathlib import Path
 import jax
 
 from rubin_host_prior.config import Config
+from rubin_host_prior.selection import ExtractionConfig
 from rubin_host_prior.data import (LogFluxTransform, PatchDataset, ShardSet,
                                    context_advice)
 from rubin_host_prior.diffusion import VESDE
 from rubin_host_prior.nn import ConvEnergyNet, n_parameters
 from rubin_host_prior.training import train
+
+
+#: Where the extraction writes its shards, from the extraction config rather
+#: than written down a second time.  Same default as prepare_config.py.
+DEFAULT_SHARDS = Path(ExtractionConfig.out) / "shards"
 
 
 def parser() -> argparse.ArgumentParser:
@@ -52,12 +58,12 @@ def parser() -> argparse.ArgumentParser:
 
     Two kinds of flag are not config fields and do carry values:
     ``--max-in-memory-gb`` and ``--devices`` describe the machine this run
-    happens to be on rather than the run, and ``--shards``, ``--pooled-cache``,
-    ``--config``, ``--out`` and ``--resume`` say where to read and write.
+    happens to be on rather than the run, and ``--shards``, ``--config``,
+    ``--out`` and ``--resume`` say where to read and write.
     """
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("--shards", default=None, help="directory of *.h5 shards")
-    p.add_argument("--pooled-cache", default=None, help="use a pooled cache instead")
+    p.add_argument("--shards", default=str(DEFAULT_SHARDS),
+                   help=f"directory of *.h5 shards (default: {DEFAULT_SHARDS})")
     p.add_argument("--config", required=True)
     p.add_argument("--out", required=True)
     p.add_argument("--steps", type=int, default=None)
@@ -99,16 +105,12 @@ def parser() -> argparse.ArgumentParser:
 
 
 def main() -> None:
-    p = parser()
-    args = p.parse_args()
+    args = parser().parse_args()
 
     logging.basicConfig(
         level=[logging.WARNING, logging.INFO, logging.DEBUG][min(args.verbose, 2)],
         format="%(asctime)s %(levelname)s: %(message)s",
     )
-    if not args.shards and not args.pooled_cache:
-        p.error("need --shards or --pooled-cache")
-
     config = Config.load(args.config)
     if args.steps:
         config.train.steps = args.steps
@@ -153,19 +155,13 @@ def main() -> None:
                                 'nothing to resume from, starting fresh'}")
 
     transform = LogFluxTransform.from_config(config.transform)
-    if args.pooled_cache:
-        dataset = PatchDataset.from_pooled_cache(
-            args.pooled_cache, config, transform
-        )
-    else:
-        shards = ShardSet.from_dir(args.shards)
-        dataset = PatchDataset.from_shards(
-            shards, config, transform, max_in_memory_gb=args.max_in_memory_gb
-        )
+    shards = ShardSet.from_dir(args.shards)
+    dataset = PatchDataset.from_shards(
+        shards, config, transform, max_in_memory_gb=args.max_in_memory_gb
+    )
 
     model = ConvEnergyNet(config.energy, key=jax.random.key(config.train.seed))
-    print(f"{n_parameters(model):,} parameters | {len(dataset):,} patches "
-          f"| loader mode {dataset.mode}")
+    print(f"{n_parameters(model):,} parameters | {len(dataset):,} patches")
     print(json.dumps(dataset.stats(min(256, len(dataset))), indent=2))
     cl = dataset.correlation_length(min(256, len(dataset)))
     print(context_advice(cl["xi"], model.loss_margin))

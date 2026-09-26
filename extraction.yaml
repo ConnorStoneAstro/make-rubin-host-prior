@@ -32,7 +32,7 @@ catalogue:
 # is most of the way to the frame edge.
 stamps:
   bands: [u, g, r, i, z, y]
-  native_size: 1024
+  native_size: 512
   patches_per_shard: 1024
 
 # How much to do.  n_stamps counts accepted cutouts, not hosts: a host yields at
@@ -41,7 +41,7 @@ stamps:
 # out, and the check happens between hosts, so it can overshoot by up to one
 # host's worth of bands.
 run:
-  n_stamps: 1024
+  n_stamps: 2048
   seed: 0
   prefix: patches
 
@@ -94,7 +94,7 @@ patches:
   inner_fraction: 0.34
   max_no_data: 0.02
   max_inner_no_data: 0.0
-  max_cell_depth_ratio: null
+  max_cell_depth_ratio: 3.5
   max_variance_step: null
   min_visits: null
 

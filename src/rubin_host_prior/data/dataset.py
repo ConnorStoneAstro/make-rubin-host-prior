@@ -5,28 +5,18 @@ That ordering is not interchangeable and it is the physically correct one: the
 pre-noise scene averages linearly in flux, and averaging log-fluxes would
 compute a geometric mean, biasing every patch low wherever there is structure.
 
-Two modes:
-
-``native`` (default)
-    Serves from native-resolution stamps, so translation and scale jitter are
-    available.  Integer native-pixel translations are exact and give
-    sub-output-pixel positional augmentation for free.
-
-``pooled``
-    Serves from a cached, already-pooled-and-transformed array.  Faster and
-    smaller, but only the dihedral augmentations remain available, since the
-    crop is baked in.  Use it for validation batches and for quick experiments.
+Every batch is built from the native-resolution stamps, so translation and scale
+jitter are always available -- integer native-pixel translations are exact and
+give sub-output-pixel positional augmentation for free.  There was once a second
+path serving a pre-pooled, pre-transformed cache; it was faster and it baked the
+crop in, so it lost the translation augmentation and it was one more derived
+file to fall out of step with the shards.  The shards load fast enough.
 """
 
 from __future__ import annotations
 
-import hashlib
-import json
-from dataclasses import asdict
-from pathlib import Path
 from typing import Iterator
 
-import h5py
 import numpy as np
 
 from ..config import Config
@@ -37,18 +27,6 @@ from .shards import ShardSet
 from .transform import LogFluxTransform
 
 
-def cache_key(config: Config, transform: LogFluxTransform, shards: ShardSet) -> str:
-    """Hash of everything that affects the cached pooled array."""
-    payload = {
-        "patch": asdict(config.patch),
-        "transform": {"softening": transform.softening},
-        "shards": [p.name for p in shards.paths],
-        "counts": [int(c) for c in shards.counts],
-    }
-    blob = json.dumps(payload, sort_keys=True).encode()
-    return hashlib.sha1(blob).hexdigest()[:16]
-
-
 class PatchDataset:
     def __init__(
         self,
@@ -57,16 +35,14 @@ class PatchDataset:
         band_idx: np.ndarray,
         shards: ShardSet | None = None,
         native: np.ndarray | None = None,
-        pooled: np.ndarray | None = None,
     ):
-        if pooled is None and shards is None and native is None:
-            raise ValueError("need shards, native stamps, or a pooled array")
+        if shards is None and native is None:
+            raise ValueError("need shards or native stamps")
         self.config = config
         self.transform = transform
         self.band_idx = np.asarray(band_idx)
         self.shards = shards
         self._native = native
-        self._pooled = pooled
 
     # -- construction -----------------------------------------------------
 
@@ -99,31 +75,8 @@ class PatchDataset:
             native=native,
         )
 
-    @classmethod
-    def from_pooled_cache(
-        cls,
-        path: str | Path,
-        config: Config,
-        transform: LogFluxTransform,
-        expect_key: str | None = None,
-    ) -> "PatchDataset":
-        with h5py.File(path, "r") as f:
-            key = f.attrs.get("cache_key")
-            if expect_key is not None and key != expect_key:
-                raise ValueError(
-                    f"cache at {path} was built for key {key!r} but the current "
-                    f"config hashes to {expect_key!r}; rebuild it"
-                )
-            pooled = f["x"][:]
-            band_idx = f["band_idx"][:]
-        return cls(config=config, transform=transform, band_idx=band_idx, pooled=pooled)
-
-    @property
-    def mode(self) -> str:
-        return "pooled" if self._pooled is not None else "native"
-
     def __len__(self) -> int:
-        return len(self._pooled) if self._pooled is not None else len(self.band_idx)
+        return len(self.band_idx)
 
     # -- batch construction ----------------------------------------------
 
@@ -139,12 +92,18 @@ class PatchDataset:
         translate: bool,
         scale_jitter: float,
         out_size: int | None = None,
+        context: int = 0,
     ) -> np.ndarray:
-        """Pooled flux in nJy, before the log transform."""
+        """Pooled flux in nJy, before the log transform.
+
+        ``context`` is the border the loss will crop away again; 0 gives the
+        nominal crop alone, which is what the diagnostics want.
+        """
         p = self.config.patch
         out_size = p.out_size if out_size is None else out_size
         stamps = self._native_stamps(indices)
-        out = np.empty((len(indices), out_size, out_size), dtype=np.float32)
+        side = out_size + 2 * context
+        out = np.empty((len(indices), side, side), dtype=np.float32)
         for i in range(len(indices)):
             out[i] = pool_to_training_grid(
                 stamps[i],
@@ -154,6 +113,7 @@ class PatchDataset:
                 translate=translate,
                 scale_jitter=scale_jitter,
                 max_translate=p.max_translate_native,
+                context=context,
             )
         return out
 
@@ -164,8 +124,9 @@ class PatchDataset:
         translate: bool,
         scale_jitter: float,
         out_size: int | None = None,
+        context: int = 0,
     ) -> np.ndarray:
-        out = self._pool(indices, rng, translate, scale_jitter, out_size)
+        out = self._pool(indices, rng, translate, scale_jitter, out_size, context)
         # Pool in flux, THEN take the log.
         return self.transform.forward(out)
 
@@ -175,34 +136,28 @@ class PatchDataset:
         rng: np.random.Generator | None = None,
         augment: bool = True,
         out_size: int | None = None,
+        context: int | None = None,
     ) -> np.ndarray:
-        """``(B, 1, out_size, out_size)`` float32 in the log representation."""
+        """``(B, 1, S, S)`` float32 in the log representation, ``S = out_size +
+        2 * context``.
+
+        ``context`` defaults to the architecture's ``loss_margin``, so the loss
+        lands on exactly ``out_size`` -- the nominal crop, all of it real.  The
+        diagnostics pass 0, since a reflected border would put a mirror
+        correlation into a measurement of the correlation length.
+        """
         aug = self.config.augment
         out_size = self.config.patch.out_size if out_size is None else out_size
-        if self._pooled is not None:
-            x = self._pooled[indices]
-            cached = x.shape[-1]
-            if out_size > cached:
-                raise ValueError(
-                    f"pooled cache holds {cached}px images; cannot serve "
-                    f"{out_size}px. Rebuild the cache or use the native loader."
-                )
-            if out_size < cached:
-                # the cache serves every size at or below the one it was built at.
-                room = cached - out_size
-                if augment and aug.translate and rng is not None:
-                    y0, x0 = rng.integers(0, room + 1, size=2)
-                else:
-                    y0 = x0 = room // 2
-                x = x[:, y0 : y0 + out_size, x0 : x0 + out_size]
-        else:
-            x = self._pool_and_transform(
-                indices,
-                rng,
-                translate=augment and aug.translate,
-                scale_jitter=aug.scale_jitter if augment else 0.0,
-                out_size=out_size,
-            )
+        if context is None:
+            context = self.config.energy.loss_margin
+        x = self._pool_and_transform(
+            indices,
+            rng,
+            translate=augment and aug.translate,
+            scale_jitter=aug.scale_jitter if augment else 0.0,
+            out_size=out_size,
+            context=context,
+        )
         if augment and aug.dihedral:
             if rng is None:
                 raise ValueError("dihedral augmentation requires an rng")
@@ -245,29 +200,6 @@ class PatchDataset:
         idx = rng.choice(len(self), size=min(n, len(self)), replace=False)
         return self.make_batch(np.sort(idx), rng=rng, augment=False)
 
-    # -- cache ------------------------------------------------------------
-
-    def build_pooled_cache(self, path: str | Path, chunk: int = 512) -> Path:
-        """Write the nominal pooled + transformed array to ``path``."""
-        if self._pooled is not None:
-            raise ValueError("already serving from a pooled cache")
-        path = Path(path)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        key = cache_key(self.config, self.transform, self.shards)
-        p = self.config.patch
-        n = len(self)
-        with h5py.File(path, "w") as f:
-            f.attrs["cache_key"] = key
-            f.attrs["config"] = json.dumps(self.config.to_dict(), sort_keys=True)
-            dset = f.create_dataset("x", shape=(n, p.out_size, p.out_size), dtype="f4")
-            f.create_dataset("band_idx", data=self.band_idx)
-            for start in range(0, n, chunk):
-                idx = np.arange(start, min(start + chunk, n))
-                dset[start : start + len(idx)] = self._pool_and_transform(
-                    idx, rng=None, translate=False, scale_jitter=0.0
-                )
-        return path
-
     # -- diagnostics ------------------------------------------------------
 
     def correlation_length(self, n: int = 512, seed: int = 0) -> dict:
@@ -280,14 +212,14 @@ class PatchDataset:
         """
         rng = np.random.default_rng(seed)
         idx = np.sort(rng.choice(len(self), size=min(n, len(self)), replace=False))
-        x = self.make_batch(idx, rng=rng, augment=False)[:, 0]
+        x = self.make_batch(idx, rng=rng, augment=False, context=0)[:, 0]
         return correlation_length(x)
 
     def stats(self, n: int = 512, seed: int = 0) -> dict:
         """Summary of the log-space data. Read this before setting sigma_min/max."""
         rng = np.random.default_rng(seed)
         idx = np.sort(rng.choice(len(self), size=min(n, len(self)), replace=False))
-        x = self.make_batch(idx, rng=rng, augment=False)[:, 0]
+        x = self.make_batch(idx, rng=rng, augment=False, context=0)[:, 0]
         # Most pixels in a patch are sky, so the 16-84 half-width is the sky
         # scatter.  Taken across all the bands at once, which is meaningful
         # again now there is a single softening scale: every band's sky sits at
@@ -297,14 +229,13 @@ class PatchDataset:
         p16, p84 = np.percentile(x, [16, 84])
         sky_scatter = float(0.5 * (p84 - p16))
         deepest_sigma = np.nan
-        if self._pooled is None:
-            flux = self._pool(idx, rng=None, translate=False, scale_jitter=0.0)
-            sigma_pooled = (
-                np.asarray(self.shards.meta["sky_noise"])[idx] / self.config.patch.pool_factor
-            )
-            good = np.isfinite(sigma_pooled) & (sigma_pooled > 0)
-            if np.any(good):
-                deepest_sigma = float((flux[good].min(axis=(1, 2)) / sigma_pooled[good]).min())
+        flux = self._pool(idx, rng=None, translate=False, scale_jitter=0.0)
+        sigma_pooled = (
+            np.asarray(self.shards.meta["sky_noise"])[idx] / self.config.patch.pool_factor
+        )
+        good = np.isfinite(sigma_pooled) & (sigma_pooled > 0)
+        if np.any(good):
+            deepest_sigma = float((flux[good].min(axis=(1, 2)) / sigma_pooled[good]).min())
         return {
             "n": int(len(idx)),
             "mean": float(x.mean()),

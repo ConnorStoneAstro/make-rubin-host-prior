@@ -12,7 +12,6 @@ from rubin_host_prior.data import (
     ShardSet,
     area_resample,
     block_mean,
-    cache_key,
     dihedral,
     estimate_softening,
     log_softplus,
@@ -509,9 +508,12 @@ def _dataset(shard_dir, out_size=32):
 
 
 def test_dataset_batches_have_the_right_shape_and_dtype(shard_dir):
+    """The loader emits `out_size + 2 * loss_margin`: the nominal crop plus the
+    context the loss will crop away again, so the loss lands on all of it."""
     _, config, ds = _dataset(shard_dir)
     batch = next(ds.batches(8, seed=0))
-    assert batch.shape == (8, 1, 32, 32)
+    fed = config.patch.out_size + 2 * config.energy.loss_margin
+    assert batch.shape == (8, 1, fed, fed)
     assert batch.dtype == np.float32
     assert np.all(np.isfinite(batch))
 
@@ -520,33 +522,6 @@ def test_validation_batch_is_deterministic_and_unaugmented(shard_dir):
     a = ds.validation_batch(8)
     b = ds.validation_batch(8)
     np.testing.assert_array_equal(a, b)
-
-
-def test_pooled_cache_round_trips(shard_dir, tmp_path):
-    ss, config, ds = _dataset(shard_dir)
-    path = ds.build_pooled_cache(tmp_path / "cache.h5")
-    key = cache_key(config, ds.transform, ss)
-    cached = PatchDataset.from_pooled_cache(
-        path, config, ds.transform, expect_key=key
-    )
-    assert cached.mode == "pooled" and len(cached) == len(ds)
-    # The cache stores the nominal (un-augmented) pooling, so it must agree.
-    np.testing.assert_allclose(
-        cached.make_batch(np.arange(6), augment=False),
-        ds.make_batch(np.arange(6), rng=None, augment=False),
-        rtol=1e-6,
-    )
-
-
-def test_cache_key_changes_with_the_transform(shard_dir, tmp_path):
-    ss, config, ds = _dataset(shard_dir)
-    path = ds.build_pooled_cache(tmp_path / "cache.h5")
-    other = Config(patch=config.patch, transform=TransformConfig(
-        softening=999.0
-    ))
-    stale = cache_key(other, LogFluxTransform.from_config(other.transform), ss)
-    with pytest.raises(ValueError, match="rebuild it"):
-        PatchDataset.from_pooled_cache(path, other, ds.transform, expect_key=stale)
 
 
 def test_dataset_refuses_shards_smaller_than_the_config(shard_dir):
@@ -704,50 +679,104 @@ def _varsize_dataset(shard_dir, out_sizes):
 def test_batches_cycle_sizes_round_robin(shard_dir):
     _, _, ds = _varsize_dataset(shard_dir, (16, 24, 32))
     it = ds.batches(4, seed=0)
-    sizes = [next(it).shape[-1] for _ in range(9)]
+    m = 2 * ds.config.energy.loss_margin
+    sizes = [next(it).shape[-1] - m for _ in range(9)]
     assert sizes == [32, 16, 24] * 3, sizes
 
 
 def test_every_size_is_a_valid_pooled_image(shard_dir):
     _, _, ds = _varsize_dataset(shard_dir, (16, 24, 32))
+    m = ds.config.energy.loss_margin
     for s in (16, 24, 32):
         b = ds.make_batch(np.arange(4), rng=np.random.default_rng(0), out_size=s)
-        assert b.shape == (4, 1, s, s)
+        assert b.shape == (4, 1, s + 2 * m, s + 2 * m)
         assert np.all(np.isfinite(b))
 
 
 def test_validation_batch_stays_at_the_reference_size(shard_dir):
     """Otherwise validation losses are not comparable across runs or steps."""
     _, config, ds = _varsize_dataset(shard_dir, (16, 24, 32))
-    assert ds.validation_batch(4).shape[-1] == config.patch.out_size
+    assert (ds.validation_batch(4).shape[-1]
+            == config.patch.out_size + 2 * config.energy.loss_margin)
 
 
-def test_pooled_cache_serves_smaller_sizes_by_sub_cropping(shard_dir, tmp_path):
-    """A sub-crop of a pooled, transformed image equals the pooled transform of
-    the corresponding native sub-region -- pooling is local, the transform is
-    pointwise -- so the cache covers every size at or below its own."""
-    ss, config, ds = _varsize_dataset(shard_dir, (16, 24, 32))
-    cached = PatchDataset.from_pooled_cache(
-        ds.build_pooled_cache(tmp_path / "c.h5"), config, ds.transform
-    )
-    for s in (16, 24, 32):
-        assert cached.make_batch(np.arange(4), augment=False,
-                                 out_size=s).shape == (4, 1, s, s)
-    with pytest.raises(ValueError, match="cannot serve"):
-        cached.make_batch(np.arange(4), augment=False, out_size=48)
+# -- the context border ----------------------------------------------------
+#
+# The loss crops 2R from every side, so the loader carries 2R of context along
+# and the loss lands on the whole nominal crop.  The border is real sky wherever
+# the stamp has any and reflected beyond that.  What must stay true: the nominal
+# crop itself is untouched, and nothing synthetic reaches the diagnostics.
 
 
-def test_pooled_cache_sub_crop_matches_the_native_path(shard_dir, tmp_path):
-    ss, config, ds = _varsize_dataset(shard_dir, (16,))
-    cached = PatchDataset.from_pooled_cache(
-        ds.build_pooled_cache(tmp_path / "c2.h5"), config, ds.transform
-    )
+def test_the_context_leaves_the_nominal_crop_exactly_as_it_was(shard_dir):
+    """The whole scheme rests on this.  Whatever the border does, the pixels the
+    loss is computed on are the same pixels the loader produced before context
+    existed -- so turning it on does not change what is being learned, it only
+    surrounds it with enough input for the score to be untruncated."""
+    _, config, ds = _dataset(shard_dir)
     idx = np.arange(4)
-    from_cache = cached.make_batch(idx, augment=False, out_size=16)
-    full = ds.make_batch(idx, rng=None, augment=False, out_size=32)
-    o = (32 - 16) // 2
-    np.testing.assert_allclose(from_cache[:, 0], full[:, 0, o:o + 16, o:o + 16],
-                               rtol=1e-6)
+    m = config.energy.loss_margin
+    bare = ds.make_batch(idx, rng=None, augment=False, context=0)
+    padded = ds.make_batch(idx, rng=None, augment=False)
+
+    assert bare.shape[-1] == config.patch.out_size
+    assert padded.shape[-1] == config.patch.out_size + 2 * m
+    np.testing.assert_array_equal(padded[:, :, m:-m, m:-m], bare)
+
+
+def test_the_border_reflects_without_repeating_the_edge_pixel():
+    """`reflect`, not `symmetric`: the edge row appears once, so no column is
+    counted twice.  A ramp makes the mirror checkable by eye."""
+    a = np.arange(20)[:, None] * np.ones((1, 20))
+    out = pool_to_training_grid(a, out_size=10, pool_factor=1, context=6)
+
+    assert out.shape == (22, 22)
+    # The crop is rows 5..14; the 6 px border reaches one row past each end.
+    assert out[1, 6] == 0.0 and out[20, 6] == 19.0   # the stamp's own extremes
+    assert out[0, 6] == 1.0                          # mirrored about row 0
+    assert out[21, 6] == 18.0                         # mirrored about row 19
+
+
+def test_a_crop_that_fills_the_stamp_gets_a_wholly_synthetic_border():
+    """The extreme the design accepts: no real sky left over, so the context is
+    all reflection.  It still runs -- `reflect` handles a pad wider than the
+    array by reflecting again -- and `Config.check_sizes` is what says so."""
+    a = np.arange(10)[:, None] * np.ones((1, 10))
+    out = pool_to_training_grid(a, out_size=10, pool_factor=1, context=3)
+
+    assert out.shape == (16, 16)
+    np.testing.assert_array_equal(out[3:13, 5], a[:, 5])
+    assert out[2, 5] == 1.0 and out[13, 5] == 8.0
+
+
+def test_the_diagnostics_are_measured_on_real_pixels_only(shard_dir):
+    """`correlation_length` and `stats` pass context=0.
+
+    A reflected border would put a mirror correlation straight into xi -- the
+    number the reach of the model is judged against -- and double-count pixels
+    in the sky scatter that sets the sigma range.  Both must therefore be
+    independent of the architecture's reach, which is what this checks.
+    """
+    from rubin_host_prior.config import (COARSE_CHANNELS, COARSE_DILATIONS,
+                                         EnergyConfig)
+
+    _, config, short = _dataset(shard_dir)
+    assert config.energy.loss_margin == 16
+    long_cfg = Config(
+        energy=EnergyConfig(
+            channels=config.energy.channels + (COARSE_CHANNELS,),
+            dilations=config.energy.dilations + (COARSE_DILATIONS,)),
+        patch=config.patch,
+    )
+    long_cfg.transform = config.transform
+    assert long_cfg.energy.loss_margin == 64
+    long = PatchDataset.from_shards(short.shards, long_cfg, short.transform)
+
+    assert short.stats(16)["mean"] == pytest.approx(long.stats(16)["mean"])
+    assert short.stats(16)["sky_scatter"] == pytest.approx(
+        long.stats(16)["sky_scatter"])
+    assert short.correlation_length(16)["xi"] == pytest.approx(
+        long.correlation_length(16)["xi"])
 
 
 def test_small_crops_do_not_wander_off_the_host(shard_dir):

@@ -76,8 +76,17 @@ def test_training_batch_shows_what_the_loader_yields(dataset, tmp_path):
     assert path.exists()
     drawn = [ax for ax in fig.axes if ax.images]
     assert len(drawn) == 9
-    # at the reference size, and the title must name the other cycled sizes
-    assert drawn[0].images[0].get_array().shape[-1] == dataset.config.patch.out_size
+    # At the reference size *plus its context border*, because the figure shows
+    # what the network is fed; the title must name the other cycled sizes.
+    size = dataset.config.patch.out_size
+    margin = dataset.config.energy.loss_margin
+    assert drawn[0].images[0].get_array().shape[-1] == size + 2 * margin
+    # And the loss region is drawn on, or the border is indistinguishable from
+    # the data in a figure whose whole job is telling them apart.
+    box = drawn[0].patches[0]
+    assert box.get_width() == size and box.get_height() == size
+    assert box.get_xy() == (margin - 0.5, margin - 0.5)
+    assert box.get_edgecolor()[:3] == (1.0, 0.0, 0.0)
     assert "also cycles 24" in fig._suptitle.get_text()
     plt.close(fig)
 

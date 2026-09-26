@@ -230,21 +230,29 @@ def train(
     # it did rather than silently changing how much of each patch is trained on.
     margin = model.loss_margin
     sizes = config.patch.training_sizes
-    setup = geometry.report(sizes, model.config.dilations, model.config.kernel_size)
+    # The loader carries `margin` pixels of context on every side, so what the
+    # net is fed is larger than the size that is trained on and the loss lands
+    # on exactly the nominal crop.
+    fed = tuple(s + 2 * margin for s in sizes)
+    setup = geometry.report(fed, model.config.dilations, model.config.kernel_size)
     if verbose:
         print(setup)
+        for size in sizes:
+            real = config.real_context(size)
+            print(f"  out_size {size}: fed {size + 2 * margin}, context "
+                  f"{margin} px per side = {min(real, margin):.0f} real + "
+                  f"{max(margin - real, 0):.0f} reflected (centred crop)")
         if len(sizes) > 1:
             print(f"  {len(sizes)} training sizes -> {len(sizes)} jit compilations "
                   f"of the train step, cycled round-robin across batches")
         # Step cost scales with batch x H^2, so this is the number to watch when
         # a bigger patch size starts exhausting device memory.
-        biggest = max(sizes)
+        biggest = max(fed)
         print(f"  batch {cfg.batch_size} x {biggest}x{biggest} = "
               f"{cfg.batch_size * biggest ** 2:,} score pixels per step "
               f"(cost scales with this; halve the batch if memory is tight)")
         for warning in config.check_sizes():
             print(f"  WARNING: {warning}")
-    _validate_geometry(sizes, model)
     n_devices, replicated, over_batch = _shardings(
         n_devices, cfg.batch_size, verbose)
     optimizer = make_optimizer(cfg)
@@ -322,11 +330,16 @@ def train(
             "receptive_radius": model.receptive_radius,
             "loss_margin": margin,
             "training_sizes": list(sizes),
+            "fed_sizes": list(fed),
+            # What the loss is actually computed on.  With the loader carrying
+            # 2R of context this is the nominal crop itself; it is recorded
+            # rather than assumed so a log line still says so if that changes.
             "interior_sizes": [
                 geometry.interior_size(
-                    s, model.config.dilations, model.config.kernel_size)
-                for s in sizes
+                    f, model.config.dilations, model.config.kernel_size)
+                for f in fed
             ],
+            "real_context": [round(config.real_context(s), 2) for s in sizes],
             "sigma_min": sde.sigma_min,
             "sigma_max": sde.sigma_max,
             "start_step": start_step,
@@ -508,26 +521,6 @@ def _write_samples(ema_model, sde, config: Config, out: Path, step: int,
         return {"sample_error": repr(exc)}
 
 
-def _validate_geometry(sizes, model: ConvEnergyNet) -> None:
-    """Reject configured sizes that leave no interior, before any training.
-
-    Checked up front rather than on the first batch of each size, so a mixed-size
-    run does not fail thousands of steps in when the smallest size first comes
-    round.
-    """
-    need = 2 * model.loss_margin + 1
-    bad = [s for s in sizes if s < need]
-    if bad:
-        raise ValueError(
-            f"patch size(s) {bad} leave no interior for the loss: this "
-            f"architecture has R = {model.receptive_radius}, so it crops "
-            f"{model.loss_margin} px per side and needs more than 4R = "
-            f"{2 * model.loss_margin} px. Use larger patches, or shorten the "
-            f"longest branch -- reach is the sum of its dilations "
-            f"{[list(d) for d in model.config.dilations]}."
-        )
-
-
 def _check_batch(batch: jnp.ndarray, model: ConvEnergyNet) -> None:
     if batch.ndim != 4:
         raise ValueError(f"expected (B, C, H, W) batches, got shape {batch.shape}")
@@ -542,5 +535,8 @@ def _check_batch(batch: jnp.ndarray, model: ConvEnergyNet) -> None:
         raise ValueError(
             f"patches are {h}x{w} but a model with R = {model.receptive_radius} "
             f"needs more than 4R = {need - 1} pixels per side to leave any "
-            f"interior for the loss; use larger patches or less reach"
+            f"interior for the loss. The loader carries 2R = "
+            f"{model.loss_margin} px of context on every side for exactly this "
+            f"reason, so a batch this small means it was built with the wrong "
+            f"margin -- PatchDataset.make_batch takes it from config.energy."
         )

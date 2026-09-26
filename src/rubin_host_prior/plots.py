@@ -153,6 +153,17 @@ def plot_cutouts(shards, n: int = 100, seed: int = 0, out: Path | None = None):
 def plot_training_batch(dataset, n: int = 25, seed: int = 0, out: Path | None = None):
     """Grid of exactly what the network receives: pooled, log-space, augmented.
 
+    Exactly what it receives means the context border is in the picture too --
+    ``out_size + 2 * loss_margin`` per side, the outer part of it reflected.
+    That is deliberate: this is the figure to look at if the sample grids start
+    showing mirror-symmetric structure, because it is where the reflection is
+    visible before the model has had a chance to learn it.
+
+    The **red square is the loss region**: inside it is what the model is scored
+    on, outside it is context the crop throws away.  Mirror symmetry about the
+    red line is the reflection doing its job; mirror symmetry *inside* it is the
+    artefact to worry about.
+
     A shared colour scale across panels, so the spread between patches is
     visible rather than normalised away -- the prior has to cover that spread.
     """
@@ -163,6 +174,10 @@ def plot_training_batch(dataset, n: int = 25, seed: int = 0, out: Path | None = 
     x = dataset.make_batch(idx, rng=rng, augment=True)[:, 0]
     lo, hi = np.percentile(x, (0.5, 99.5))
 
+    fed = x.shape[-1]
+    size = dataset.config.patch.out_size
+    margin = (fed - size) // 2
+
     rows, cols = _grid(n)
     fig, axes = plt.subplots(rows, cols, figsize=(2.1 * cols, 2.2 * rows))
     im = None
@@ -170,6 +185,18 @@ def plot_training_batch(dataset, n: int = 25, seed: int = 0, out: Path | None = 
         ax.set_axis_off()
         if k < n:
             im = _show(ax, x[k], lo, hi, cmap="viridis")
+            if margin > 0:
+                # Inside the line is what the loss is computed on; outside it is
+                # the context the crop discards -- real sky as far as the stamp
+                # reached, reflection beyond that.  imshow puts pixel centres on
+                # integers, so the edge of pixel `margin` is at margin - 0.5.
+                # linewidth 1.0, not less: below about one output pixel the
+                # line is antialiased into the background and reads as grey on
+                # the dark parts of the panel, which is worse than no line.
+                ax.add_patch(plt.Rectangle(
+                    (margin - 0.5, margin - 0.5), size, size,
+                    fill=False, edgecolor="red", linewidth=1.0,
+                ))
     if im is not None:
         fig.colorbar(
             im,
@@ -178,13 +205,16 @@ def plot_training_batch(dataset, n: int = 25, seed: int = 0, out: Path | None = 
             pad=0.01,
             label="x (log space)",
         )
-    size = x.shape[-1]
     sizes = dataset.config.patch.training_sizes
+    # `make_batch` was not given a size, so `size` above is the reference one;
+    # the rest are cycled across batches and are not in this figure.
     also = (
-        f"; also cycles {', '.join(str(s) for s in sizes if s != size)}" if len(sizes) > 1 else ""
+        f"; also cycles {', '.join(str(s) for s in sizes[1:])}"
+        if len(sizes) > 1 else ""
     )
     fig.suptitle(
-        f"training batch as the loader yields it: {size}x{size}, pooled "
+        f"training batch as the loader yields it: {fed}x{fed} fed, loss on the "
+        f"middle {size}x{size} (red), pooled "
         f"{dataset.config.patch.pool_factor}x, log space, augmented{also}",
         fontsize=10,
     )

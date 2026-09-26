@@ -42,7 +42,10 @@ def _config(**train_kw):
     return c
 
 
-def _batches(rng, shape=(4, 1, 16, 16)):
+#: ``_config()`` is out_size 16 with R = 2, so the loader would hand the model
+#: 16 + 2*loss_margin = 24 px and the loss would land on all 16.  The fakes
+#: here mirror that, or they would be testing a geometry nothing produces.
+def _batches(rng, shape=(4, 1, 24, 24)):
     while True:
         yield rng.normal(size=shape).astype(np.float32) * 0.5
 
@@ -186,17 +189,23 @@ def test_eval_logs_a_loss_curve_against_sigma(tmp_path):
     assert evals[0]["sigma"][0] < evals[0]["sigma"][-1]
 
 
-def test_too_small_patches_fail_immediately_with_a_useful_message(tmp_path):
-    """A model with 8 layers needs > 4R pixels.  Caught from the config before
-    a single batch is drawn, not on step 1 and not 10 000 steps in."""
-    config = _config()
+def test_no_out_size_is_too_small_for_the_loss_any_more(tmp_path):
+    """Under the old contract a patch had to exceed 4R or the loss had no
+    interior, and this configuration -- 16 px patches, R = 8 -- was a hard
+    error raised before the first batch.
+
+    The loader now carries 2R of context on every side, so the loss lands on
+    the whole nominal crop whatever its size and there is nothing left to
+    reject.  What used to raise now trains.
+    """
+    config = _config(steps=2)
     config.energy = EnergyConfig(channels=((8,) * 8,), embed_dim=16, n_fourier=8)
+    assert config.patch.out_size < 4 * config.energy.receptive_radius
     model = ConvEnergyNet(config.energy, key=jax.random.key(0))
-    with pytest.raises(ValueError, match=r"leave no interior"):
-        train(
-            model, _batches(np.random.default_rng(3)), config,
-            out_dir=tmp_path / "run",
-        )
+    fed = config.patch.out_size + 2 * config.energy.loss_margin
+    train(model, _batches(np.random.default_rng(3), shape=(4, 1, fed, fed)),
+          config, out_dir=tmp_path / "run", verbose=False)
+    assert (tmp_path / "run" / "final" / "model.eqx").exists()
 
 
 def test_channel_mismatch_is_caught(tmp_path):
@@ -350,11 +359,16 @@ def test_setup_note_is_printed_and_reports_the_derived_crop(tmp_path, capsys):
     config = _config()
     config.energy = EnergyConfig(channels=((8,) * 3,), embed_dim=16, n_fourier=8)
     model = ConvEnergyNet(config.energy, key=jax.random.key(0))
-    train(model, _batches(np.random.default_rng(0)), config, out_dir=tmp_path / "r")
+    train(model, _batches(np.random.default_rng(0), shape=(4, 1, 28, 28)),
+          config, out_dir=tmp_path / "r")
     out = capsys.readouterr().out
     assert "branch 0: 3 x 3x3, dilations 1x1x1" in out
     assert "loss crop = 2R = 6 px from every side" in out
-    assert "loss on interior 4x4" in out  # 16 px patches, margin 6
+    # The report is given what the loader *feeds*, 16 + 2*6, so the interior it
+    # names is the nominal crop itself rather than something smaller.
+    assert "patch   28x28" in out
+    assert "loss on interior 16x16" in out
+    assert "out_size 16: fed 28, context 6 px per side" in out
     assert "N + 12 px" in out
 
 
@@ -377,13 +391,15 @@ def test_log_header_records_the_geometry(tmp_path):
     assert head["receptive_radius"] == 2
     assert head["n_layers"] == 2
     assert head["training_sizes"] == [16, 24]
-    assert head["interior_sizes"] == [8, 16]
+    # The loader feeds size + 2*margin, so the loss lands on the size itself.
+    assert head["interior_sizes"] == [16, 24]
 
 
-def _varsize_batches(rng, sizes, batch=4):
+def _varsize_batches(rng, sizes, batch=4, margin=4):
+    """``sizes`` are loss-region sizes; what is yielded carries the context."""
     k = 0
     while True:
-        s = sizes[k % len(sizes)]
+        s = sizes[k % len(sizes)] + 2 * margin
         k += 1
         yield rng.normal(size=(batch, 1, s, s)).astype(np.float32) * 0.5
 
@@ -398,55 +414,58 @@ def test_variable_sizes_train_without_recompilation_errors(tmp_path):
     assert n_parameters(ema) == n_parameters(model)
 
 
-def test_all_configured_sizes_are_validated_before_training_starts(tmp_path):
-    """A mixed-size run must not fail thousands of steps in, when the smallest
-    size first comes round."""
-    config = _config()
-    config.energy = EnergyConfig(channels=((8,) * 8,), embed_dim=16, n_fourier=8)
-    config.patch = dataclasses.replace(config.patch, out_sizes=(16, 40))
-    # 40 is fine for 8 layers (needs > 32); 16 is not.
-    model = ConvEnergyNet(config.energy, key=jax.random.key(0))
-    with pytest.raises(ValueError, match=r"leave no interior"):
-        train(model, _varsize_batches(np.random.default_rng(2), (40,)), config,
-              out_dir=tmp_path / "r", verbose=False)
-
-
-def test_usable_size_range_combines_both_halves_of_the_config():
-    """The lower bound comes from the architecture, the upper from the stamp.
-    Neither dataclass knows both, which is how a size can satisfy one and not
-    the other -- exactly the trap that motivates this helper."""
+def test_usable_size_range_no_longer_has_an_architectural_floor():
+    """The lower bound used to be 4R + 1 -- below that the loss had no interior.
+    The loader supplying the context removed that floor entirely; what is left
+    is the stamp, which still has to hold the nominal crop itself."""
     c = Config(energy=EnergyConfig(channels=((32,) * 8,)),
                patch=PatchConfig(native_size=224, nominal_crop=192, out_size=64,
                                  pool_factor=3))
-    assert c.usable_size_range() == (33, 74)  # 4R+1 = 33, 224//3 = 74
-    big = Config(energy=EnergyConfig(channels=((32,) * 8,)),
-                 patch=PatchConfig(native_size=384, nominal_crop=288, out_size=96,
-                                   pool_factor=3))
-    assert big.usable_size_range() == (33, 128)
-    shallow = Config(energy=EnergyConfig(channels=((32,) * 3,)),
-                     patch=PatchConfig(native_size=224, nominal_crop=192,
-                                       out_size=64, pool_factor=3))
-    assert shallow.usable_size_range() == (13, 74)  # 4R+1 with R=3
+    assert c.usable_size_range() == (1, 74)   # 224 // 3
+    deep = Config(energy=EnergyConfig(channels=((32,) * 20,)),
+                  patch=PatchConfig(native_size=224, nominal_crop=192,
+                                    out_size=64, pool_factor=3))
+    # R = 20 now, and it makes no difference to what sizes can be served.
+    assert deep.usable_size_range() == (1, 74)
 
 
-def test_check_sizes_flags_too_small_and_mostly_margin():
+def test_real_context_is_what_the_stamp_has_left_over():
+    """How much of the 2R border is genuine sky, and where it runs out."""
+    c = Config(energy=EnergyConfig(channels=((32,) * 8,)),      # R = 8, 2R = 16
+               patch=PatchConfig(native_size=384, nominal_crop=288, out_size=96,
+                                 pool_factor=3))
+    assert c.energy.loss_margin == 16
+    # 384/3 = 128 pooled in the stamp, 96 of it cropped -> 16 left each side.
+    assert c.real_context(96) == pytest.approx(16.0)
+    assert c.real_context(64) == pytest.approx(32.0)   # a smaller crop leaves more
+    assert c.real_context(128) == pytest.approx(0.0)   # the crop fills the stamp
+    assert c.real_context(160) < 0                     # it does not even fit
+
+
+def test_check_sizes_flags_a_border_that_is_all_reflection():
     c = Config(energy=EnergyConfig(channels=((32,) * 8,)),
-               patch=PatchConfig(native_size=224, nominal_crop=192, out_size=64,
+               patch=PatchConfig(native_size=384, nominal_crop=288, out_size=96,
                                  pool_factor=3))
-    assert c.check_sizes() == []
-    c.patch = dataclasses.replace(c.patch, out_sizes=(16, 40, 64))
-    warnings = c.check_sizes()
-    assert any("below the minimum 33" in w for w in warnings)
-    assert any("40" in w and "margin" in w for w in warnings)
-    assert not any("64" in w.split()[1] for w in warnings if w.split())
+    assert c.check_sizes() == []      # 16 real of a 16 px border: exactly enough
+
+    c.patch = dataclasses.replace(c.patch, out_sizes=(96, 128))
+    assert any("128 leaves no real context" in w for w in c.check_sizes())
+
+    # A size that does not fit the stamp never reaches check_sizes: PatchConfig
+    # refuses it outright, which is the better place for it.
+    with pytest.raises(ValueError, match="needs 192 native pixels"):
+        PatchConfig(native_size=96, nominal_crop=96, out_size=32,
+                    pool_factor=3, out_sizes=(32, 64))
 
 
-def test_check_sizes_reports_when_no_size_works_at_all():
-    c = Config(energy=EnergyConfig(channels=((32,) * 20,)),  # 4R+1 = 81
-               patch=PatchConfig(native_size=96, nominal_crop=96, out_size=32,
+def test_check_sizes_flags_a_crop_that_is_mostly_context():
+    """The efficiency warning now measures the fed patch against the loss
+    region, which is where the arithmetic actually goes."""
+    c = Config(energy=EnergyConfig(channels=((32,) * 20,)),   # R = 20, 2R = 40
+               patch=PatchConfig(native_size=1024, nominal_crop=48, out_size=16,
                                  pool_factor=3))
-    assert c.usable_size_range() == (81, 32)
-    assert any("no usable patch size" in w for w in c.check_sizes())
+    # fed 16 + 80 = 96 to train on 16: (16/96)^2 = 3%.
+    assert any("only 3% of the arithmetic" in w for w in c.check_sizes())
 
 
 def test_report_marks_patches_that_are_mostly_margin():
@@ -478,7 +497,9 @@ def test_no_warning_when_translation_is_switched_off():
     c = Config(patch=PatchConfig(native_size=384, nominal_crop=384, out_size=128,
                                  pool_factor=3),
                augment=AugmentConfig(translate=False))
-    assert c.check_sizes() == []
+    # A crop that fills its stamp also has no real context, which is a separate
+    # and legitimate warning -- this test is about the translation one.
+    assert not any("translation" in w for w in c.check_sizes())
 
 
 # -- checkpoints and the samples that go with them --------------------------
@@ -489,7 +510,7 @@ def test_checkpoints_are_spread_over_the_run_not_set_by_an_interval():
     and getting it wrong meant either one checkpoint or thousands."""
     from rubin_host_prior.config import TrainConfig
 
-    assert TrainConfig(steps=1000).checkpoint_steps() == [
+    assert TrainConfig(steps=1000, n_checkpoints=10).checkpoint_steps() == [
         100, 200, 300, 400, 500, 600, 700, 800, 900, 1000]
     # The last one always lands exactly on the final step.
     for steps, n in ((1000, 3), (99, 7), (200_000, 10)):

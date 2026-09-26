@@ -105,7 +105,6 @@ def parser() -> argparse.ArgumentParser:
                    help="patches to measure the statistics from. Not a config "
                         "field: it changes how well this script measures, not "
                         "what the model is")
-    p.add_argument("--pooled-cache", default=None, help="also build a pooled cache")
     return p
 
 
@@ -250,12 +249,21 @@ def main() -> None:
         )
 
     lo, hi = config.usable_size_range()
+    margin = config.energy.loss_margin
+    size = config.patch.out_size
+    real = config.real_context(size)
     print(
-        f"\nusable training sizes with R = {config.energy.receptive_radius} "
-        f"({config.energy.n_branches} branch(es), "
-        f"{config.energy.n_layers} layers) and "
-        f"{config.patch.native_size} px stamps: {lo} .. {hi}"
+        f"\nR = {config.energy.receptive_radius} "
+        f"({config.energy.n_branches} branch(es), {config.energy.n_layers} "
+        f"layers), loss crop 2R = {margin} px per side"
     )
+    print(f"  out_size {size} trains on all {size} px; the loader is fed "
+          f"{size + 2 * margin}")
+    print(f"  of the {margin} px context per side, {min(real, margin):.0f} is "
+          f"real sky and {max(margin - real, 0):.0f} is reflected "
+          f"(centred crop; translation moves it side to side)")
+    print(f"  sizes this stamp can serve: {lo} .. {hi}; context is wholly real "
+          f"at or below {max(hi - 2 * margin, 0)}")
     for w in config.check_sizes():
         print(f"  WARNING: {w}")
 
@@ -273,9 +281,6 @@ def main() -> None:
             "  WARNING: the patches never decorrelate within their own size, so "
             "xi is a lower bound. Extract larger patches to measure it."
         )
-    if args.pooled_cache:
-        path = dataset.build_pooled_cache(args.pooled_cache)
-        print(f"\npooled cache: {path}")
 
 
 if __name__ == "__main__":

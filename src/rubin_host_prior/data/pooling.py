@@ -90,8 +90,10 @@ def pool_to_training_grid(
     translate: bool = False,
     scale_jitter: float = 0.0,
     max_translate: int | None = None,
+    context: int = 0,
+    pad_mode: str = "reflect",
 ) -> np.ndarray:
-    """Native stamp(s) -> ``out_size`` training image(s).
+    """Native stamp(s) -> ``out_size + 2 * context`` training image(s).
 
     With ``scale_jitter == 0`` this is a crop plus exact average pooling.  With
     jitter the crop size becomes ``round(out_size * pool_factor * (1 + delta))``
@@ -102,6 +104,26 @@ def pool_to_training_grid(
     ``max_translate`` caps how far the crop may wander from the stamp centre,
     in native pixels per side.  Without it a small crop would roam over the whole
     stamp; with it every training size looks at the same neighbourhood.
+
+    **Context.**  The loss discards ``2R`` pixels from every side, so a patch of
+    ``out_size`` would train on ``out_size - 4R``.  ``context`` (in *output*
+    pixels, and ``2R`` is the only value that makes sense) carries that border
+    along so the loss lands on exactly the nominal crop instead.
+
+    It is taken from the rest of the stamp wherever there is any, and only the
+    shortfall is ``pad_mode``-filled.  So how much of the border is real depends
+    on where the crop landed: centred, it is half real; pushed to one edge, that
+    side is wholly synthetic and the opposite side wholly real.  Padding cannot
+    manufacture clean signal -- the loss pixels whose receptive field holds no
+    synthetic pixel are exactly the ones a bare ``out_size = native // pool``
+    crop would have given -- what it buys is training on the rest of the nominal
+    crop as well, at the cost of a seam somewhere in those pixels' receptive
+    fields.
+
+    ``reflect`` and not ``symmetric``: the border pixel is not duplicated, so no
+    column is counted twice.  Mirrored sky is valid sky -- the augmentation
+    already teaches dihedral invariance -- and the only thing reflection creates
+    that nature does not is the correlation across the seam itself.
     """
     h, w = native.shape[-2:]
     if h != w:
@@ -140,7 +162,27 @@ def pool_to_training_grid(
     y0 += centre_shift
     x0 += centre_shift
 
-    patch = crop(native, size, y0, x0)
+    # The border scales with the crop, so jitter changes the angular size of the
+    # context in step with the scene rather than leaving it fixed.  Unjittered
+    # this is exactly context * pool_factor.
+    pad = int(round(context * size / out_size)) if context else 0
+    if pad == 0:
+        patch = crop(native, size, y0, x0)
+    else:
+        want = (y0 - pad, y0 + size + pad, x0 - pad, x0 + size + pad)
+        ay0, ay1 = max(want[0], 0), min(want[1], h)
+        ax0, ax1 = max(want[2], 0), min(want[3], w)
+        patch = native[..., ay0:ay1, ax0:ax1]
+        widths = [(0, 0)] * (patch.ndim - 2) + [
+            (ay0 - want[0], want[1] - ay1),
+            (ax0 - want[2], want[3] - ax1),
+        ]
+        if any(before or after for before, after in widths[-2:]):
+            # `reflect` handles a pad wider than the array by reflecting again,
+            # so a crop at the very edge of a small stamp still works -- it just
+            # ends up with a mostly synthetic border, which the caller can see
+            # from `real_context`.
+            patch = np.pad(patch, widths, mode=pad_mode)
     if size == nominal:
         return block_mean(patch, pool_factor)
-    return area_resample(patch, out_size)
+    return area_resample(patch, out_size + 2 * context)
