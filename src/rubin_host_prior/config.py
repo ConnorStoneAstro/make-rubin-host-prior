@@ -290,7 +290,7 @@ class AugmentConfig:
 @dataclass
 class TrainConfig:
     batch_size: int = 128
-    steps: int = 2_000_000
+    steps: int = 200_000
     learning_rate: float = 1e-4
     warmup_steps: int = 2_000
     cosine_decay: bool = False
@@ -309,7 +309,7 @@ class TrainConfig:
     #: Checkpoints spread evenly over the run, rather than an interval that has
     #: to be recomputed every time ``steps`` changes.  The last one lands on the
     #: final step.  0 disables them.
-    n_checkpoints: int = 25
+    n_checkpoints: int = 50
     #: Samples drawn from the EMA model at each checkpoint and written as a
     #: square grid, so the run's progress is visible as pictures rather than only
     #: as a loss curve.  0 disables sampling.  64 is an 8x8 grid.
