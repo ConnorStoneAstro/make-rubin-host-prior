@@ -446,8 +446,20 @@ layers where 32 undilated layers would be needed.
 `EnergyConfig.channels` and `.dilations` hold **one tuple per branch**. Each
 branch is its own stack ending in a 1×1 head; their energy maps are centre-
 cropped to a common size and summed. A sum of energies is an energy, so the
-score stays an exact gradient however many branches there are. The default is a
-single branch and is byte-for-byte the model that existed before branches did.
+score stays an exact gradient however many branches there are.
+
+**The default is both branches** — `FINE_*` summed with `COARSE_*`, `R = 32`,
+`2R = 64`. That is not cosmetic: `prepare_config.py` starts from these defaults,
+so a config written without `--base-config` describes whatever they say. While
+the default was one branch, every freshly generated config quietly had `R = 8`
+and a 16 px loss crop, with the long-range branch absent and nothing in the file
+to show it had ever been there. One branch is still a fine configuration — pass
+a single tuple for each — it is just not one to arrive at by accident.
+
+**Dilations are never inferred.** Setting `channels` without `dilations` is an
+error, not a shorthand for all-ones. A branch's reach is `r · Σ dilations`, and
+the loss crop, the minimum patch size and how much context the loader carries
+all follow from it; it is not a number to leave unwritten.
 
 **Why a second branch rather than a deeper one.** Every layer of a single stack
 would have to be as wide as the widest, and that width is there for texture, not

@@ -25,7 +25,7 @@ from rubin_host_prior.training import (
 
 def _config(**train_kw):
     c = Config(
-        energy=EnergyConfig(channels=((8, 12),), embed_dim=16, n_fourier=8),
+        energy=EnergyConfig(channels=((8, 12),), dilations=((1, 1),), embed_dim=16, n_fourier=8),
         patch=PatchConfig(native_size=128, nominal_crop=48, out_size=16,
                           pool_factor=3),
     )
@@ -87,7 +87,7 @@ def test_optimizer_warms_up_then_holds():
     cfg = _config(learning_rate=1e-3, warmup_steps=10, cosine_decay=False).train
     opt = make_optimizer(cfg)
     model = ConvEnergyNet(
-        EnergyConfig(channels=((4,),), embed_dim=8, n_fourier=4), key=jax.random.key(0)
+        EnergyConfig(channels=((4,),), dilations=((1,),), embed_dim=8, n_fourier=4), key=jax.random.key(0)
     )
     params = eqx.filter(model, eqx.is_inexact_array)
     state = opt.init(params)
@@ -104,7 +104,7 @@ def test_cosine_schedule_decays():
     cfg = _config(learning_rate=1e-3, warmup_steps=2, cosine_decay=True, steps=50).train
     opt = make_optimizer(cfg)
     model = ConvEnergyNet(
-        EnergyConfig(channels=((4,),), embed_dim=8, n_fourier=4), key=jax.random.key(0)
+        EnergyConfig(channels=((4,),), dilations=((1,),), embed_dim=8, n_fourier=4), key=jax.random.key(0)
     )
     params = eqx.filter(model, eqx.is_inexact_array)
     state = opt.init(params)
@@ -199,7 +199,7 @@ def test_no_out_size_is_too_small_for_the_loss_any_more(tmp_path):
     reject.  What used to raise now trains.
     """
     config = _config(steps=2)
-    config.energy = EnergyConfig(channels=((8,) * 8,), embed_dim=16, n_fourier=8)
+    config.energy = EnergyConfig(channels=((8,) * 8,), dilations=((1,) * 8,), embed_dim=16, n_fourier=8)
     assert config.patch.out_size < 4 * config.energy.receptive_radius
     model = ConvEnergyNet(config.energy, key=jax.random.key(0))
     fed = config.patch.out_size + 2 * config.energy.loss_margin
@@ -336,7 +336,7 @@ def test_models_from_one_config_are_pytree_compatible():
     skeleton's basis in place, so a reloaded checkpoint would compute different
     scores from the same weights.
     """
-    cfg = EnergyConfig(channels=((6, 8),), embed_dim=16, n_fourier=8)
+    cfg = EnergyConfig(channels=((6, 8),), dilations=((1, 1),), embed_dim=16, n_fourier=8)
     a = ConvEnergyNet(cfg, key=jax.random.key(1))
     b = ConvEnergyNet(cfg, key=jax.random.key(2))
     assert a.embed.fourier.freqs == b.embed.fourier.freqs
@@ -344,7 +344,7 @@ def test_models_from_one_config_are_pytree_compatible():
     ema_update(a, b, jnp.asarray(0.5))  # must not raise
 
     other = ConvEnergyNet(
-        EnergyConfig(channels=((6, 8),), embed_dim=16, n_fourier=8, fourier_seed=7),
+        EnergyConfig(channels=((6, 8),), dilations=((1, 1),), embed_dim=16, n_fourier=8, fourier_seed=7),
         key=jax.random.key(1),
     )
     assert other.embed.fourier.freqs != a.embed.fourier.freqs
@@ -357,7 +357,7 @@ def test_setup_note_is_printed_and_reports_the_derived_crop(tmp_path, capsys):
     """Requested behaviour: training announces how much it is cropping, so that
     tinkering with n_layers or kernel_size is never silent."""
     config = _config()
-    config.energy = EnergyConfig(channels=((8,) * 3,), embed_dim=16, n_fourier=8)
+    config.energy = EnergyConfig(channels=((8,) * 3,), dilations=((1,) * 3,), embed_dim=16, n_fourier=8)
     model = ConvEnergyNet(config.energy, key=jax.random.key(0))
     train(model, _batches(np.random.default_rng(0), shape=(4, 1, 28, 28)),
           config, out_dir=tmp_path / "r")
@@ -418,20 +418,47 @@ def test_usable_size_range_no_longer_has_an_architectural_floor():
     """The lower bound used to be 4R + 1 -- below that the loss had no interior.
     The loader supplying the context removed that floor entirely; what is left
     is the stamp, which still has to hold the nominal crop itself."""
-    c = Config(energy=EnergyConfig(channels=((32,) * 8,)),
+    c = Config(energy=EnergyConfig(channels=((32,) * 8,), dilations=((1,) * 8,)),
                patch=PatchConfig(native_size=224, nominal_crop=192, out_size=64,
                                  pool_factor=3))
     assert c.usable_size_range() == (1, 74)   # 224 // 3
-    deep = Config(energy=EnergyConfig(channels=((32,) * 20,)),
+    deep = Config(energy=EnergyConfig(channels=((32,) * 20,), dilations=((1,) * 20,)),
                   patch=PatchConfig(native_size=224, nominal_crop=192,
                                     out_size=64, pool_factor=3))
     # R = 20 now, and it makes no difference to what sizes can be served.
     assert deep.usable_size_range() == (1, 74)
 
 
+def test_the_default_architecture_is_the_one_that_gets_trained():
+    """``prepare_config.py`` starts from these defaults, so a config written
+    without ``--base-config`` describes whatever they say.
+
+    They said one branch, which meant every freshly generated config quietly
+    had R = 8 and a 16 px loss crop -- the long-range branch simply absent, and
+    nothing in the file to show it had ever been there.
+    """
+    from rubin_host_prior.config import (COARSE_CHANNELS, COARSE_DILATIONS,
+                                         FINE_CHANNELS, FINE_DILATIONS)
+
+    c = Config()
+    assert c.energy.channels == (FINE_CHANNELS, COARSE_CHANNELS)
+    assert c.energy.dilations == (FINE_DILATIONS, COARSE_DILATIONS)
+    assert c.energy.receptive_radius == 32 and c.energy.loss_margin == 64
+    # and the loader will carry that much context for it
+    assert c.patch.out_size + 2 * c.energy.loss_margin == 256
+
+
+def test_dilations_are_never_inferred():
+    """Setting ``channels`` without ``dilations`` used to mean 'all ones'.  With
+    a two-branch default that convenience became ambiguous -- and it was hiding
+    the number the whole geometry hangs on."""
+    with pytest.raises(ValueError, match="never inferred"):
+        EnergyConfig(channels=((8, 12),))
+
+
 def test_real_context_is_what_the_stamp_has_left_over():
     """How much of the 2R border is genuine sky, and where it runs out."""
-    c = Config(energy=EnergyConfig(channels=((32,) * 8,)),      # R = 8, 2R = 16
+    c = Config(energy=EnergyConfig(channels=((32,) * 8,), dilations=((1,) * 8,)),      # R = 8, 2R = 16
                patch=PatchConfig(native_size=384, nominal_crop=288, out_size=96,
                                  pool_factor=3))
     assert c.energy.loss_margin == 16
@@ -443,7 +470,7 @@ def test_real_context_is_what_the_stamp_has_left_over():
 
 
 def test_check_sizes_flags_a_border_that_is_all_reflection():
-    c = Config(energy=EnergyConfig(channels=((32,) * 8,)),
+    c = Config(energy=EnergyConfig(channels=((32,) * 8,), dilations=((1,) * 8,)),
                patch=PatchConfig(native_size=384, nominal_crop=288, out_size=96,
                                  pool_factor=3))
     assert c.check_sizes() == []      # 16 real of a 16 px border: exactly enough
@@ -461,7 +488,7 @@ def test_check_sizes_flags_a_border_that_is_all_reflection():
 def test_check_sizes_flags_a_crop_that_is_mostly_context():
     """The efficiency warning now measures the fed patch against the loss
     region, which is where the arithmetic actually goes."""
-    c = Config(energy=EnergyConfig(channels=((32,) * 20,)),   # R = 20, 2R = 40
+    c = Config(energy=EnergyConfig(channels=((32,) * 20,), dilations=((1,) * 20,)),   # R = 20, 2R = 40
                patch=PatchConfig(native_size=1024, nominal_crop=48, out_size=16,
                                  pool_factor=3))
     # fed 16 + 80 = 96 to train on 16: (16/96)^2 = 3%.

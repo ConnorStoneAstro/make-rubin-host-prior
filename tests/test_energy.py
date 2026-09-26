@@ -83,7 +83,7 @@ def test_sigma_conditioning_is_spatially_constant():
     invariant) input is uniform.
     """
     model = ConvEnergyNet(
-        EnergyConfig(channels=((6, 8),), embed_dim=16, n_fourier=8, sigma_scaling="none"),
+        EnergyConfig(channels=((6, 8),), dilations=((1, 1),), embed_dim=16, n_fourier=8, sigma_scaling="none"),
         key=jax.random.key(5),
     )
     x = jnp.full((1, 24, 24), 0.2)
@@ -118,7 +118,7 @@ def test_inverse_sigma_scaling_flattens_the_loss_residual_across_sigma():
     spans = {}
     for mode in ("none", "inverse_sigma"):
         m = ConvEnergyNet(
-            EnergyConfig(channels=((6, 8),), embed_dim=16, n_fourier=8,
+            EnergyConfig(channels=((6, 8),), dilations=((1, 1),), embed_dim=16, n_fourier=8,
                          sigma_scaling=mode),
             key=jax.random.key(8),
         )
@@ -178,7 +178,7 @@ def test_all_parameters_receive_gradients_at_step_zero(tiny_model):
 
 def test_residual_blocks_preserve_valid_shapes():
     model = ConvEnergyNet(
-        EnergyConfig(channels=((8, 8, 8),), embed_dim=16, n_fourier=8, residual=True),
+        EnergyConfig(channels=((8, 8, 8),), dilations=((1, 1, 1),), embed_dim=16, n_fourier=8, residual=True),
         key=jax.random.key(12),
     )
     x = jax.random.normal(jax.random.key(13), (1, 20, 20))

@@ -72,8 +72,11 @@ def main() -> None:
         config.patch = dataclasses.replace(
             config.patch, out_sizes=tuple(args.out_sizes)
         )
+    # One plain branch: this is a wiring check on synthetic data, not the
+    # architecture the project trains.
     config.energy = EnergyConfig(
-        channels=(tuple([16, 24, 32, 32][min(i, 3)] for i in range(args.n_layers)),)
+        channels=(tuple([16, 24, 32, 32][min(i, 3)] for i in range(args.n_layers)),),
+        dilations=((1,) * args.n_layers,),
     )
     config.train.steps = args.steps
     config.train.batch_size = args.batch_size

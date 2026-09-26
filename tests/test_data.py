@@ -757,20 +757,17 @@ def test_the_diagnostics_are_measured_on_real_pixels_only(shard_dir):
     in the sky scatter that sets the sigma range.  Both must therefore be
     independent of the architecture's reach, which is what this checks.
     """
-    from rubin_host_prior.config import (COARSE_CHANNELS, COARSE_DILATIONS,
-                                         EnergyConfig)
+    from rubin_host_prior.config import FINE_CHANNELS, FINE_DILATIONS, EnergyConfig
 
-    _, config, short = _dataset(shard_dir)
-    assert config.energy.loss_margin == 16
-    long_cfg = Config(
-        energy=EnergyConfig(
-            channels=config.energy.channels + (COARSE_CHANNELS,),
-            dilations=config.energy.dilations + (COARSE_DILATIONS,)),
+    _, config, long = _dataset(shard_dir)
+    assert config.energy.loss_margin == 64            # both branches, the default
+    short_cfg = Config(
+        energy=EnergyConfig(channels=(FINE_CHANNELS,), dilations=(FINE_DILATIONS,)),
         patch=config.patch,
     )
-    long_cfg.transform = config.transform
-    assert long_cfg.energy.loss_margin == 64
-    long = PatchDataset.from_shards(short.shards, long_cfg, short.transform)
+    short_cfg.transform = config.transform
+    assert short_cfg.energy.loss_margin == 16         # the fine branch alone
+    short = PatchDataset.from_shards(long.shards, short_cfg, long.transform)
 
     assert short.stats(16)["mean"] == pytest.approx(long.stats(16)["mean"])
     assert short.stats(16)["sky_scatter"] == pytest.approx(

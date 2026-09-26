@@ -54,7 +54,7 @@ def test_min_input_size_is_the_smallest_that_works():
     n_layers = 3
     smallest = g.min_input_size(((1,) * n_layers,))
     model = ConvEnergyNet(
-        EnergyConfig(channels=((4,) * n_layers,), embed_dim=8, n_fourier=4),
+        EnergyConfig(channels=((4,) * n_layers,), dilations=((1,) * n_layers,), embed_dim=8, n_fourier=4),
         key=jax.random.key(0),
     )
     assert model.energy_map(

@@ -16,10 +16,16 @@ from typing import Any
 BANDS = ("u", "g", "r", "i", "z", "y")
 
 
-#: One long-range branch to sum with the default one: six layers at 32 channels
-#: reaching R = 32 (65 px across).  Append it to ``channels``/``dilations`` to
-#: give the model a scale it cannot otherwise represent -- and note that R = 32
-#: means a 64 px loss crop per side, so ``patch.out_size`` must clear 4R = 128.
+#: The texture branch: wide, undilated, R = 8 (17 px across).
+FINE_CHANNELS: tuple[int, ...] = (32, 64, 96, 128, 128, 128, 128, 128)
+FINE_DILATIONS: tuple[int, ...] = (1, 1, 1, 1, 1, 1, 1, 1)
+
+#: The long-range branch: narrow, dilated, R = 32 (65 px across) in six layers.
+#: Summed with the fine one, it is what lets the model represent a galaxy larger
+#: than the texture branch can see.  It costs about 6% of the fine branch's
+#: arithmetic and 9% more parameters; what it really costs is the loss crop,
+#: which goes from 16 px per side to 64 -- see ``data.pooling`` for how the
+#: loader supplies that much context.
 COARSE_CHANNELS: tuple[int, ...] = (32, 32, 32, 32, 32, 32)
 COARSE_DILATIONS: tuple[int, ...] = (1, 2, 4, 8, 16, 1)
 
@@ -33,8 +39,13 @@ class EnergyConfig:
     energy maps are centre-cropped to a common size and added.  A sum of energies
     is an energy, so the score stays an exact gradient however many there are.
 
-    The default is a single branch and is exactly the model that existed before
-    branches did.
+    **The default is both branches**, ``FINE_*`` and ``COARSE_*``, because that
+    is the model this project trains.  A config written without one would
+    describe a different architecture from the one that is going to be used,
+    and since ``prepare_config.py`` starts from these defaults, the difference
+    would be silent: the first sign of it is a training run with a 16 px loss
+    crop instead of 64.  One branch is still a perfectly good configuration --
+    pass a single tuple for each -- it is just not the one to get by accident.
 
     **Why more than one.**  Reach is ``r * sum(dilations)``, so a long-range
     branch needs few layers -- but every layer of a *single* stack would have to
@@ -59,14 +70,15 @@ class EnergyConfig:
     """
 
     in_channels: int = 1
-    #: One tuple per branch.  ``((32, 64, ...),)`` is one branch of eight layers.
-    channels: tuple[tuple[int, ...], ...] = ((32, 64, 96, 128, 128, 128, 128, 128),)
-    #: Per-layer dilation, same shape as ``channels``.  Left empty it is all
-    #: ones -- an ordinary stack -- filled in to match ``channels`` so that what
-    #: is stored, hashed and compared against a checkpoint is always explicit.
+    #: One tuple per branch.  ``((32, 64, ...),)`` would be one branch of eight.
+    channels: tuple[tuple[int, ...], ...] = (FINE_CHANNELS, COARSE_CHANNELS)
+    #: Per-layer dilation, same shape as ``channels``, and always stated: a
+    #: branch's reach is ``r * sum(dilations)``, so leaving it to be inferred
+    #: would mean the single most consequential number in the geometry -- the
+    #: loss crop follows from it -- was one nobody wrote down.
     #: ``(1, 2, 4, 8, 16, 1)`` reaches R = 32 in six layers, the trailing 1
     #: mixing neighbouring long-range features back together.
-    dilations: tuple[tuple[int, ...], ...] = ()
+    dilations: tuple[tuple[int, ...], ...] = (FINE_DILATIONS, COARSE_DILATIONS)
     kernel_size: int = 3
     activation: str = "silu"  # must be C^1; see nn.layers.ACTIVATIONS
     embed_dim: int = 128  # width of the log-sigma embedding MLP
@@ -88,13 +100,14 @@ class EnergyConfig:
             )
         if not self.channels:
             raise ValueError("an energy needs at least one branch")
-        if not self.dilations:
-            object.__setattr__(self, "dilations", tuple((1,) * len(c) for c in self.channels))
         if len(self.channels) != len(self.dilations):
             raise ValueError(
                 f"{len(self.channels)} channel tuples but "
                 f"{len(self.dilations)} dilation tuples; there must be one of "
-                f"each per branch"
+                f"each per branch. If you set channels and left dilations "
+                f"alone, state them too -- they are never inferred, because a "
+                f"branch's reach is r * sum(dilations) and the loss crop, the "
+                f"patch size and the loader's context all follow from it."
             )
         for i, (c, d) in enumerate(zip(self.channels, self.dilations)):
             if not c:
