@@ -31,7 +31,7 @@ catalogue:
 # native 512 and a 384 crop the host moves within +-64 native px, 12.8", which
 # is most of the way to the frame edge.
 stamps:
-  bands: [u, g, r, i, z, y]
+  bands: [g, r, i, z]
   native_size: 512
   patches_per_shard: 1024
 
@@ -41,7 +41,7 @@ stamps:
 # out, and the check happens between hosts, so it can overshoot by up to one
 # host's worth of bands.
 run:
-  n_stamps: 2048
+  n_stamps: 32768
   seed: 0
   prefix: patches
 
