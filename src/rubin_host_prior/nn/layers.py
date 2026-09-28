@@ -19,6 +19,10 @@ import jax
 import jax.numpy as jnp
 from jaxtyping import Array, Float, PRNGKeyArray
 
+#: Variance-preserving normalisation for a residual sum: two independent unit
+#: variances add to two, so the sum is divided by this to keep it at one.
+SQRT2 = jnp.sqrt(2.0)
+
 # Smooth activations only.  relu/leaky_relu are deliberately absent: they are C^0,
 # and d/dx of the resulting energy is discontinuous.
 ACTIVATIONS = {
@@ -182,7 +186,15 @@ class ConvBlock(eqx.Module):
         self.film = FiLM(embed_dim, out_channels, film_init_scale, key=kf)
         self.act = get_activation(activation)
         self.radius = (kernel_size - 1) // 2 * dilation
-        self.residual = residual and (in_channels == out_channels)
+        if residual and in_channels != out_channels:
+            raise ValueError(
+                f"a residual skip needs {in_channels} == {out_channels}: there "
+                f"is nothing to add a {in_channels}-channel input to a "
+                f"{out_channels}-channel output. This used to be silently "
+                f"switched off, which meant a config asking for skips could get "
+                f"none and never hear about it."
+            )
+        self.residual = residual
 
     def __call__(
         self, h: Float[Array, "c h w"], emb: Float[Array, " d"]
@@ -190,5 +202,13 @@ class ConvBlock(eqx.Module):
         out = self.act(self.film(self.conv(h), emb))
         if self.residual:
             r = self.radius
-            out = out + h[:, r:-r or None, r:-r or None]
+            # Divided by sqrt(2), so the block preserves variance instead of
+            # doubling it.  Without this a 10-layer stack arrives at the head
+            # with ~180x the signal a plain stack would, the small head no
+            # longer keeps the initial energy landscape flat, and training
+            # starts at a loss of 1.78 -- worse than predicting no score at all.
+            # Scaling the head down instead would work, but the factor would
+            # depend on the depth and would have to be retuned for every
+            # architecture; this does not.
+            out = (out + h[:, r:-r or None, r:-r or None]) / SQRT2
         return out

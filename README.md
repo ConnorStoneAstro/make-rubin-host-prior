@@ -461,11 +461,26 @@ error, not a shorthand for all-ones. A branch's reach is `r · Σ dilations`, an
 the loss crop, the minimum patch size and how much context the loader carries
 all follow from it; it is not a number to leave unwritten.
 
-**Why a second branch rather than a deeper one.** Every layer of a single stack
-would have to be as wide as the widest, and that width is there for texture, not
-for large-scale structure. A separate branch can run narrow: `COARSE_CHANNELS`
-/ `COARSE_DILATIONS` reach `R = 32` at 32 channels for about 5% of the fine
-branch's arithmetic and 9% more parameters.
+**Why one stack and not two branches.** It was two: a wide undilated stack of
+`R = 8` summed with a narrow dilated one of `R = 32`, on the reasoning that a
+long-range path need not be wide. That model trained, and every measurement of
+it came out right — the long-range branch carried 25–60% of the score, and the
+training crops plainly held galaxies wider than its reach — but its samples
+still contained no structure above ~16 px.
+
+What measurement could not rule out is that **a sum lets the branches compete**.
+`E = E_fine + E_coarse` gives the optimiser two ways to explain the same
+residual and nothing in the objective to say which should win; the branch with
+10× the parameters and 16× the arithmetic can answer for both, and a coarse
+branch that is *used* is not the same as one that is *needed*. A single stack at
+full width removes the choice: there is no cheap path to hide in.
+
+The dilations alternate the doubling series with ones — `1, 1, 2, 1, 4, 1, 8,
+1, 16, 1`, `R = 36` — so every long-range layer is followed by a local one that
+integrates what it gathered.
+
+It costs about 1.8× the previous step: 98 GMAC against 54, from 1.6× the
+arithmetic per pixel on a patch 1.13× larger.
 
 **Why dilation rather than pooling.** Pooling reaches as far for fewer FLOPs,
 but it downsamples, and a stack with total stride `j` is invariant only to
@@ -479,9 +494,36 @@ is what pins this down.
 
 A doubling series leaves no holes: after `n` layers the reach is `2ⁿ − 1`, and
 the next dilation `2ⁿ` is within `2R + 1` of what is already covered. Gridding
-comes from *repeating* a large dilation with no small ones beneath it. The
-trailing `1` in `1, 2, 4, 8, 16, 1` mixes neighbouring long-range features back
-together.
+comes from *repeating* a large dilation with no small ones beneath it.
+
+### Residual skips
+
+`EnergyConfig.residual` is **on by default**: a centre-cropped skip around every
+layer after the first. Two things about it are deliberate.
+
+**A skip that cannot be made is an error, not a silent omission.** It needs
+equal channel counts, so `residual=True` requires uniform widths within a
+branch and says so; a tapering stack raises rather than quietly training without
+the skips it was asked for. The one exception is structural and stated: the
+first layer maps `in_channels` to the branch width, so there is nothing to add
+to its output.
+
+**The sum is divided by √2.** Two independent unit variances add to two, so an
+unscaled skip doubles the variance per block — over nine blocks the stack
+arrives at the head with ~180× the signal a plain stack would, the deliberately
+small head no longer keeps the initial energy landscape flat, and training
+starts at a **loss of 1.78**: worse than predicting no score at all. Measured,
+with the alternatives:
+
+| | energy-map std | initial loss |
+|---|---|---|
+| no residual | 5.7e-4 | 0.996 |
+| residual, unscaled | 1.0e-1 | **1.775** |
+| residual, ÷√2 | 3.6e-3 | 1.007 |
+| residual, `head_init_scale` 1e-4 | 1.0e-3 | 0.996 |
+
+Shrinking the head works too, but by a factor that depends on the depth and
+would have to be retuned for every architecture. The √2 does not.
 
 **What it costs.** `R = 32` means a **64 px crop per side**. Under the old
 contract — patch in, `patch − 4R` trained on — a 512 px native stamp pooled to

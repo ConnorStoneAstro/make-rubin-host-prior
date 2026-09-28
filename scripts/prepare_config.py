@@ -125,12 +125,9 @@ def main() -> None:
     if args.softening_sigma is not None:
         config.transform.softening_sigma = args.softening_sigma
 
-    # Not a default but an invariant: PatchConfig requires these to agree, and
-    # checks it at construction only -- assigning to a field afterwards does not
-    # re-run __post_init__.  A no-op unless a flag above moved one of them.
-    config.patch.nominal_crop = config.patch.out_size * config.patch.pool_factor
     # Measured, like everything below it: the stamps are as big as the
-    # extraction made them.
+    # extraction made them.  nominal_crop follows from out_size and pool_factor
+    # on its own, so there is nothing to keep in step with them here.
     config.patch.native_size = shards.native_size
     if shards.native_size < config.patch.nominal_crop:
         raise SystemExit(
@@ -258,7 +255,7 @@ def main() -> None:
         f"layers), loss crop 2R = {margin} px per side"
     )
     print(f"  out_size {size} trains on all {size} px; the loader is fed "
-          f"{size + 2 * margin}")
+          f"{config.fed_size()}")
     print(f"  of the {margin} px context per side, {min(real, margin):.0f} is "
           f"real sky and {max(margin - real, 0):.0f} is reflected "
           f"(centred crop; translation moves it side to side)")

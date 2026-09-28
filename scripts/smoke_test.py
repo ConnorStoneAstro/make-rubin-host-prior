@@ -1,7 +1,15 @@
 #!/usr/bin/env python
-"""End-to-end dry run on synthetic data.  No LSST stack, no cluster, ~1 minute.
+"""End-to-end dry run on synthetic data.  No LSST stack, no cluster, ~3 minutes.
 
-    python scripts/smoke_test.py --steps 300
+    python scripts/smoke_test.py
+
+It was a minute when the model was eight plain layers and the loader handed over
+exactly ``out_size``.  A residual stack, dilations, and a patch carrying ``2R``
+of context on every side cost the rest -- at the old defaults this now takes
+**12 minutes**, measured, which is long enough that nobody runs it.  So the
+defaults came down (300 steps to 200, batch 16 to 8, out_size 32 to 24) rather
+than the promise being quietly restated: the loss still falls 0.989 -> 0.968
+over the run, so the PASS at the end still means something.
 
 Exercises the whole chain -- synthetic shards, offset estimation, the loader, the
 energy net, the loss, training, checkpointing, sampling -- so that porting to
@@ -20,7 +28,7 @@ from pathlib import Path
 import jax
 import numpy as np
 
-from rubin_host_prior.config import Config, EnergyConfig
+from rubin_host_prior.config import DEFAULT_DILATIONS, Config, EnergyConfig
 from rubin_host_prior.data import (
     LogFluxTransform,
     PatchDataset,
@@ -39,13 +47,13 @@ from rubin_host_prior.training import load_checkpoint, train
 
 def main() -> None:
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("--steps", type=int, default=300)
+    p.add_argument("--steps", type=int, default=200)
     p.add_argument("--n-patches", type=int, default=256)
-    p.add_argument("--out-size", type=int, default=32)
+    p.add_argument("--out-size", type=int, default=24)
     p.add_argument("--n-layers", type=int, default=4)
     p.add_argument("--out-sizes", type=int, nargs="+", default=None,
                    help="also train at these sizes, cycled round-robin")
-    p.add_argument("--batch-size", type=int, default=16)
+    p.add_argument("--batch-size", type=int, default=8)
     p.add_argument("--workdir", default=None)
     args = p.parse_args()
 
@@ -66,17 +74,19 @@ def main() -> None:
     config = Config()
     config.patch.out_size = args.out_size
     config.patch.pool_factor = 3
-    config.patch.nominal_crop = args.out_size * 3
     config.patch.native_size = shards.native_size
     if args.out_sizes:
         config.patch = dataclasses.replace(
             config.patch, out_sizes=tuple(args.out_sizes)
         )
-    # One plain branch: this is a wiring check on synthetic data, not the
-    # architecture the project trains.
+    # Uniform width so the residual skips are possible, and the head of the
+    # default dilation pattern so the run exercises dilation and residual
+    # together rather than a plain stack -- this is the rehearsal for NERSC, so
+    # the shapes it checks should be the shapes that go there.
+    n = args.n_layers
     config.energy = EnergyConfig(
-        channels=(tuple([16, 24, 32, 32][min(i, 3)] for i in range(args.n_layers)),),
-        dilations=((1,) * args.n_layers,),
+        channels=((32,) * n,),
+        dilations=((DEFAULT_DILATIONS + (1,) * n)[:n],),
     )
     config.train.steps = args.steps
     config.train.batch_size = args.batch_size

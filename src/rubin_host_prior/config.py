@@ -16,18 +16,27 @@ from typing import Any
 BANDS = ("u", "g", "r", "i", "z", "y")
 
 
-#: The texture branch: wide, undilated, R = 8 (17 px across).
-FINE_CHANNELS: tuple[int, ...] = (32, 64, 96, 128, 128, 128, 128, 128)
-FINE_DILATIONS: tuple[int, ...] = (1, 1, 1, 1, 1, 1, 1, 1)
+#: Ten layers at full width.  The dilations alternate a doubling series with
+#: ones, so every long-range layer has a local layer after it to integrate what
+#: it gathered, and the reach is ``sum = 36``.
+#:
+#: This replaced a two-branch model -- a wide undilated stack summed with a
+#: narrow dilated one.  That version worked in every way it could be measured:
+#: the long-range branch carried 25-60% of the score and the training crops
+#: plainly contained galaxies wider than its reach.  It still produced no
+#: large-scale structure in its samples.  A single stack removes the one
+#: explanation that measurement could not rule out -- that a sum lets the
+#: cheaper branch answer for both, and nothing in the objective says otherwise.
+DEFAULT_CHANNELS: tuple[int, ...] = (128,) * 10
+DEFAULT_DILATIONS: tuple[int, ...] = (1, 1, 2, 1, 4, 1, 8, 1, 16, 1)
 
-#: The long-range branch: narrow, dilated, R = 32 (65 px across) in six layers.
-#: Summed with the fine one, it is what lets the model represent a galaxy larger
-#: than the texture branch can see.  It costs about 6% of the fine branch's
-#: arithmetic and 9% more parameters; what it really costs is the loss crop,
-#: which goes from 16 px per side to 64 -- see ``data.pooling`` for how the
-#: loader supplies that much context.
-COARSE_CHANNELS: tuple[int, ...] = (32, 32, 32, 32, 32, 32)
-COARSE_DILATIONS: tuple[int, ...] = (1, 2, 4, 8, 16, 1)
+#: Said whenever `channels` and `dilations` disagree, because by far the most
+#: likely reason is that only one of them was given.
+_NOT_INFERRED = (
+    "If you set channels and left dilations alone, state them too -- they are "
+    "never inferred, because a branch's reach is r * sum(dilations) and the "
+    "loss crop, the patch size and the loader's context all follow from it."
+)
 
 
 @dataclass(frozen=True)  # hashable: stored as a static field on the module
@@ -39,20 +48,15 @@ class EnergyConfig:
     energy maps are centre-cropped to a common size and added.  A sum of energies
     is an energy, so the score stays an exact gradient however many there are.
 
-    **The default is both branches**, ``FINE_*`` and ``COARSE_*``, because that
-    is the model this project trains.  A config written without one would
-    describe a different architecture from the one that is going to be used,
-    and since ``prepare_config.py`` starts from these defaults, the difference
-    would be silent: the first sign of it is a training run with a 16 px loss
-    crop instead of 64.  One branch is still a perfectly good configuration --
-    pass a single tuple for each -- it is just not the one to get by accident.
+    **The default is one branch**, ``DEFAULT_*``: ten layers at 128 channels
+    with alternating dilations, R = 36.  Several branches still work and are
+    tested -- the sum of any number of energies is an energy -- but the default
+    is one, because a sum lets the branches compete to explain the same residual
+    and nothing in the objective decides which should win.
 
-    **Why more than one.**  Reach is ``r * sum(dilations)``, so a long-range
-    branch needs few layers -- but every layer of a *single* stack would have to
-    be as wide as the widest, and that width is there for texture, not for
-    large-scale structure.  Two branches let the long-range path run narrow: the
-    suggested ``COARSE_*`` pair reaches R = 32 for about 5% of the fine branch's
-    arithmetic.
+    ``prepare_config.py`` starts from these defaults, so whatever they say is
+    what a freshly written config describes.  That is why the architecture lives
+    here rather than in the script.
 
     **Why dilation and not pooling.**  Pooling reaches the same distance more
     cheaply, but it downsamples, and a stack with total stride ``j`` is invariant
@@ -71,14 +75,14 @@ class EnergyConfig:
 
     in_channels: int = 1
     #: One tuple per branch.  ``((32, 64, ...),)`` would be one branch of eight.
-    channels: tuple[tuple[int, ...], ...] = (FINE_CHANNELS, COARSE_CHANNELS)
+    channels: tuple[tuple[int, ...], ...] = (DEFAULT_CHANNELS,)
     #: Per-layer dilation, same shape as ``channels``, and always stated: a
     #: branch's reach is ``r * sum(dilations)``, so leaving it to be inferred
     #: would mean the single most consequential number in the geometry -- the
     #: loss crop follows from it -- was one nobody wrote down.
     #: ``(1, 2, 4, 8, 16, 1)`` reaches R = 32 in six layers, the trailing 1
     #: mixing neighbouring long-range features back together.
-    dilations: tuple[tuple[int, ...], ...] = (FINE_DILATIONS, COARSE_DILATIONS)
+    dilations: tuple[tuple[int, ...], ...] = (DEFAULT_DILATIONS,)
     kernel_size: int = 3
     activation: str = "silu"  # must be C^1; see nn.layers.ACTIVATIONS
     embed_dim: int = 128  # width of the log-sigma embedding MLP
@@ -87,7 +91,12 @@ class EnergyConfig:
     fourier_seed: int = 0  # fixes the frozen basis; see nn.layers
     head_init_scale: float = 0.01  # small, not zero -- see nn.energy
     film_init_scale: float = 0.01  # small, not zero -- see nn.layers.FiLM
-    residual: bool = False  # center-cropped skip where channel counts match
+    #: Centre-cropped skip around every layer after the first.  Requires uniform
+    #: widths within a branch, and says so rather than quietly dropping the
+    #: skips it cannot make.  The first layer is the one structural exception:
+    #: it changes the channel count from ``in_channels``, so there is nothing to
+    #: add to its output.
+    residual: bool = True
     sigma_scaling: str = "inverse_sigma"  # "inverse_sigma" | "none"
 
     def __post_init__(self) -> None:
@@ -104,10 +113,7 @@ class EnergyConfig:
             raise ValueError(
                 f"{len(self.channels)} channel tuples but "
                 f"{len(self.dilations)} dilation tuples; there must be one of "
-                f"each per branch. If you set channels and left dilations "
-                f"alone, state them too -- they are never inferred, because a "
-                f"branch's reach is r * sum(dilations) and the loss crop, the "
-                f"patch size and the loader's context all follow from it."
+                f"each per branch. {_NOT_INFERRED}"
             )
         for i, (c, d) in enumerate(zip(self.channels, self.dilations)):
             if not c:
@@ -115,10 +121,17 @@ class EnergyConfig:
             if len(c) != len(d):
                 raise ValueError(
                     f"branch {i} has {len(c)} layers but {len(d)} dilations; "
-                    f"every layer needs one"
+                    f"every layer needs one. {_NOT_INFERRED}"
                 )
             if any(x < 1 for x in d):
                 raise ValueError(f"branch {i} has a dilation below 1: {tuple(d)}")
+            if self.residual and len(set(c)) > 1:
+                raise ValueError(
+                    f"residual=True needs uniform widths within a branch so "
+                    f"there is something to add the skip to, but branch {i} is "
+                    f"{tuple(c)}. Use one width, or set residual=False -- the "
+                    f"skips are not quietly dropped where they do not fit."
+                )
 
     @property
     def n_branches(self) -> int:
@@ -212,22 +225,21 @@ class TransformConfig:
 class PatchConfig:
     """Native cutout geometry and the pooling that produces a training image.
 
-    ``native_size`` is deliberately larger than ``nominal_crop`` so that scale
-    jitter can go in both directions and so that integer translations in native
-    pixels (which are exact -- no interpolation) give sub-pooled-pixel jitter.
+    Three numbers, not four: ``nominal_crop`` is ``out_size * pool_factor`` and
+    is a property rather than a field.  It used to be stored and checked against
+    that product, which made it a second statement of something the other two
+    already fix, and one that had to be edited in step with them by hand.
 
-    The defaults target 128 px training patches, where 56% of each patch clears
-    the ``2R`` loss crop (against 25% at 64 px).  ``native_size`` is 416 rather
-    than the 384 that 128 px strictly needs: 384 would be exactly 3 x 128,
-    leaving no room at all to translate the crop and silently disabling an
-    augmentation that is otherwise free and exact.  32 native pixels of slack is
-    +/- 5.3 pooled pixels, far more than the +/- 1 pooled pixel needed to cover
-    every sub-pixel phase.
+    ``native_size`` is deliberately larger than the crop.  The slack is what the
+    loader translates within -- integer native-pixel shifts are exact, no
+    interpolation, so they give sub-pooled-pixel positional augmentation for
+    free -- and it is also the only real sky available for the context border
+    the loss crop needs (see ``Config.real_context``).  At the defaults it is
+    512 - 384 = 128 native px, 42.7 pooled, split between the two sides.
     """
 
     native_size: int = 512  # pixels cut from the coadd
-    nominal_crop: int = 384  # native pixels feeding one training image
-    out_size: int = 128  # nominal_crop / pool_factor; the reference size
+    out_size: int = 128  # the reference training size, in pooled pixels
     pool_factor: int = 3
     #: Extra training sizes.  Each batch is drawn at one size (a batch must be
     #: shape-homogeneous), cycling over ``training_sizes``.  Larger patches
@@ -239,19 +251,22 @@ class PatchConfig:
     out_sizes: tuple[int, ...] = ()
 
     def __post_init__(self) -> None:
-        if self.nominal_crop != self.out_size * self.pool_factor:
-            raise ValueError(
-                f"nominal_crop ({self.nominal_crop}) must equal out_size * "
-                f"pool_factor ({self.out_size} * {self.pool_factor})"
-            )
         if self.native_size < self.nominal_crop:
-            raise ValueError("native_size must be >= nominal_crop")
+            raise ValueError(
+                f"native_size ({self.native_size}) must be >= nominal_crop "
+                f"({self.out_size} * {self.pool_factor} = {self.nominal_crop})"
+            )
         for s in self.out_sizes:
             if s * self.pool_factor > self.native_size:
                 raise ValueError(
                     f"out_size {s} needs {s * self.pool_factor} native pixels "
                     f"but native_size is {self.native_size}"
                 )
+
+    @property
+    def nominal_crop(self) -> int:
+        """Native pixels feeding one training image: ``out_size * pool_factor``."""
+        return self.out_size * self.pool_factor
 
     @property
     def training_sizes(self) -> tuple[int, ...]:
@@ -352,6 +367,22 @@ class Config:
     augment: AugmentConfig = field(default_factory=AugmentConfig)
     train: TrainConfig = field(default_factory=TrainConfig)
 
+    def fed_size(self, out_size: int | None = None) -> int:
+        """What the loader hands the model: ``out_size + 2 * loss_margin``.
+
+        The loss crops ``2R`` from every side, so this is the size that leaves
+        exactly ``out_size`` behind.  One place rather than the four it was
+        spelled out in -- the trainer's report, its sampling canvas, the config
+        summary and ``check_sizes`` -- and the arithmetic itself still lives in
+        ``geometry``, which is the module that exists for it.
+        """
+        from . import geometry
+
+        out_size = self.patch.out_size if out_size is None else out_size
+        return geometry.min_input_for_region(
+            out_size, self.energy.dilations, self.energy.kernel_size
+        )
+
     def real_context(self, out_size: int | None = None) -> float:
         """Pooled px of genuine sky either side of a centred nominal crop.
 
@@ -394,10 +425,10 @@ class Config:
                     f"outside the nominal crop is new information. Extract "
                     f"larger stamps, or reduce out_size below {hi}."
                 )
-            frac = (s / (s + 2 * margin)) ** 2
+            frac = (s / self.fed_size(s)) ** 2
             if frac < 0.10:
                 out.append(
-                    f"size {s} is fed {s + 2 * margin} px to train on {s} -- "
+                    f"size {s} is fed {self.fed_size(s)} px to train on {s} -- "
                     f"only {100 * frac:.0f}% of the arithmetic reaches the "
                     f"loss. Use a larger out_size, or less reach."
                 )

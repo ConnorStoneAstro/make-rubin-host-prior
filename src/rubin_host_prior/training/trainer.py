@@ -233,13 +233,13 @@ def train(
     # The loader carries `margin` pixels of context on every side, so what the
     # net is fed is larger than the size that is trained on and the loss lands
     # on exactly the nominal crop.
-    fed = tuple(s + 2 * margin for s in sizes)
+    fed = tuple(config.fed_size(s) for s in sizes)
     setup = geometry.report(fed, model.config.dilations, model.config.kernel_size)
     if verbose:
         print(setup)
         for size in sizes:
             real = config.real_context(size)
-            print(f"  out_size {size}: fed {size + 2 * margin}, context "
+            print(f"  out_size {size}: fed {config.fed_size(size)}, context "
                   f"{margin} px per side = {min(real, margin):.0f} real + "
                   f"{max(margin - real, 0):.0f} reflected (centred crop)")
         if len(sizes) > 1:
@@ -308,7 +308,10 @@ def train(
         if cfg.n_samples:
             # Said up front, because it is easy to ask for far more than
             # intended and the first checkpoint is a long way into the run.
-            canvas = config.patch.out_size + 2 * margin
+            # The same relation as the training patch: 2R of valid context on
+            # every side.  The loader supplies it from the stamp, the sampler
+            # generates it and throws it away.
+            canvas = config.fed_size()
             print(f"  each draws {cfg.n_samples} samples on a {canvas}x{canvas} "
                   f"canvas ({config.patch.out_size} + 4R) in "
                   f"{2 * cfg.sample_steps} batched backward passes; "

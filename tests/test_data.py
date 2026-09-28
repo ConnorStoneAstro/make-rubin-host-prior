@@ -25,6 +25,8 @@ from rubin_host_prior.data import (
 from rubin_host_prior.data.augment import N_DIHEDRAL
 from rubin_host_prior.data.synthetic import write_synthetic_shards
 
+from conftest import TINY_ENERGY
+
 
 # -- transform -------------------------------------------------------------
 #
@@ -399,8 +401,8 @@ def test_prepare_config_measures_without_deciding(tmp_path, shard_dir, monkeypat
     import importlib.util
     import sys
 
-    base = Config()
-    base.patch = PatchConfig(native_size=112, nominal_crop=96, out_size=32,
+    base = Config(energy=TINY_ENERGY)
+    base.patch = PatchConfig(native_size=112, out_size=32,
                              pool_factor=3)
     base.transform.softening_sigma = 2.5
     base.save(tmp_path / "base.json")
@@ -440,8 +442,8 @@ def test_prepare_config_keeps_a_value_you_set_yourself(tmp_path, shard_dir,
     import importlib.util
     import sys
 
-    base = Config()
-    base.patch = PatchConfig(native_size=112, nominal_crop=96, out_size=32,
+    base = Config(energy=TINY_ENERGY)
+    base.patch = PatchConfig(native_size=112, out_size=32,
                              pool_factor=3)
     base.sde.sigma_max = 7.5  # chosen; sigma_min and data_mean left to measure
     base.save(tmp_path / "base.json")
@@ -491,9 +493,9 @@ def test_shard_metadata_is_preserved(shard_dir):
 def _dataset(shard_dir, out_size=32):
     ss = ShardSet.from_dir(shard_dir)
     config = Config(
+        energy=TINY_ENERGY,
         patch=PatchConfig(
             native_size=ss.native_size,
-            nominal_crop=out_size * 3,
             out_size=out_size,
             pool_factor=3,
         )
@@ -526,8 +528,7 @@ def test_validation_batch_is_deterministic_and_unaugmented(shard_dir):
 
 def test_dataset_refuses_shards_smaller_than_the_config(shard_dir):
     ss = ShardSet.from_dir(shard_dir)
-    config = Config(patch=PatchConfig(native_size=512, nominal_crop=192,
-                                      out_size=64, pool_factor=3))
+    config = Config(patch=PatchConfig(native_size=512, out_size=64, pool_factor=3))
     config.transform.softening = 20.0
     with pytest.raises(ValueError, match="shards hold"):
         PatchDataset.from_shards(
@@ -651,21 +652,20 @@ def test_dataset_reports_correlation_length_in_pooled_pixels(shard_dir):
 
 
 def test_training_sizes_are_deduplicated_with_the_reference_first():
-    pc = PatchConfig(native_size=224, nominal_crop=192, out_size=64, pool_factor=3,
+    pc = PatchConfig(native_size=224, out_size=64, pool_factor=3,
                      out_sizes=(48, 64, 32, 48))
     assert pc.training_sizes == (64, 32, 48)
 
 
 def test_config_rejects_sizes_the_stamp_cannot_supply():
     with pytest.raises(ValueError, match="needs 288 native pixels"):
-        PatchConfig(native_size=224, nominal_crop=192, out_size=64, pool_factor=3,
+        PatchConfig(native_size=224, out_size=64, pool_factor=3,
                     out_sizes=(96,))
 
 
 def _varsize_dataset(shard_dir, out_sizes):
     ss = ShardSet.from_dir(shard_dir)
-    config = Config(patch=PatchConfig(native_size=ss.native_size, nominal_crop=96,
-                                      out_size=32, pool_factor=3,
+    config = Config(energy=TINY_ENERGY, patch=PatchConfig(native_size=ss.native_size, out_size=32, pool_factor=3,
                                       out_sizes=out_sizes))
     pooled, pooled_bands = pool_shards(ss, config)
     config.transform.softening = estimate_softening(
@@ -757,17 +757,17 @@ def test_the_diagnostics_are_measured_on_real_pixels_only(shard_dir):
     in the sky scatter that sets the sigma range.  Both must therefore be
     independent of the architecture's reach, which is what this checks.
     """
-    from rubin_host_prior.config import FINE_CHANNELS, FINE_DILATIONS, EnergyConfig
+    from rubin_host_prior.config import EnergyConfig
 
-    _, config, long = _dataset(shard_dir)
-    assert config.energy.loss_margin == 64            # both branches, the default
-    short_cfg = Config(
-        energy=EnergyConfig(channels=(FINE_CHANNELS,), dilations=(FINE_DILATIONS,)),
+    _, config, short = _dataset(shard_dir)
+    assert config.energy.loss_margin == 4             # TINY_ENERGY, R = 2
+    long_cfg = Config(
+        energy=EnergyConfig(channels=((8,) * 5,), dilations=((1, 2, 4, 8, 1),)),
         patch=config.patch,
     )
-    short_cfg.transform = config.transform
-    assert short_cfg.energy.loss_margin == 16         # the fine branch alone
-    short = PatchDataset.from_shards(long.shards, short_cfg, long.transform)
+    long_cfg.transform = config.transform
+    assert long_cfg.energy.loss_margin == 32          # four times the reach
+    long = PatchDataset.from_shards(short.shards, long_cfg, short.transform)
 
     assert short.stats(16)["mean"] == pytest.approx(long.stats(16)["mean"])
     assert short.stats(16)["sky_scatter"] == pytest.approx(
@@ -807,8 +807,8 @@ def test_sky_scatter_matches_the_prediction(shard_dir):
 
     for ss_val in (1.0, 4.0):
         ss = ShardSet.from_dir(shard_dir)
-        config = Config(patch=PatchConfig(native_size=ss.native_size,
-                                          nominal_crop=96, out_size=32,
+        config = Config(energy=TINY_ENERGY, patch=PatchConfig(native_size=ss.native_size,
+                                          out_size=32,
                                           pool_factor=3))
         config.transform.softening_sigma = ss_val
         pooled, pooled_bands = pool_shards(ss, config)

@@ -54,7 +54,12 @@ class EnergyBranch(eqx.Module):
                 config.kernel_size,
                 config.embed_dim,
                 config.activation,
-                config.residual,
+                # Never on the first layer: it maps in_channels to the branch
+                # width, so its input and output have different channel counts
+                # and there is nothing to add.  EnergyConfig states this rule
+                # and rejects any *other* width change, so a skip is only absent
+                # where it is structurally impossible.
+                config.residual and i > 0,
                 config.film_init_scale,
                 dilations[i],
                 key=keys[i],

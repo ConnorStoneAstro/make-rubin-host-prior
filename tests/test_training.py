@@ -25,8 +25,8 @@ from rubin_host_prior.training import (
 
 def _config(**train_kw):
     c = Config(
-        energy=EnergyConfig(channels=((8, 12),), dilations=((1, 1),), embed_dim=16, n_fourier=8),
-        patch=PatchConfig(native_size=128, nominal_crop=48, out_size=16,
+        energy=EnergyConfig(channels=((12, 12),), dilations=((1, 1),), embed_dim=16, n_fourier=8),
+        patch=PatchConfig(native_size=128, out_size=16,
                           pool_factor=3),
     )
     # The measured fields, which a real config gets from prepare_config.py and
@@ -320,11 +320,16 @@ def test_the_config_builder_still_knows_where_to_read_and_write():
     assert p.get_default("shards").startswith(ExtractionConfig.out)
 
 
-def test_patch_config_validates_its_own_arithmetic():
-    with pytest.raises(ValueError, match="nominal_crop"):
-        PatchConfig(native_size=224, nominal_crop=100, out_size=64, pool_factor=3)
-    with pytest.raises(ValueError, match="native_size must be"):
-        PatchConfig(native_size=100, nominal_crop=192, out_size=64, pool_factor=3)
+def test_nominal_crop_is_derived_rather_than_stated():
+    """It is exactly ``out_size * pool_factor``, so it was a second statement of
+    a number the other two already fix -- and one that had to be edited in step
+    with them by hand."""
+    p = PatchConfig(native_size=224, out_size=64, pool_factor=3)
+    assert p.nominal_crop == 192
+    assert p.max_translate_native == 224 - 192
+    assert "nominal_crop" not in {f.name for f in dataclasses.fields(PatchConfig)}
+    with pytest.raises(ValueError, match="native_size .* must be >="):
+        PatchConfig(native_size=100, out_size=64, pool_factor=3)
 
 
 def test_models_from_one_config_are_pytree_compatible():
@@ -336,7 +341,7 @@ def test_models_from_one_config_are_pytree_compatible():
     skeleton's basis in place, so a reloaded checkpoint would compute different
     scores from the same weights.
     """
-    cfg = EnergyConfig(channels=((6, 8),), dilations=((1, 1),), embed_dim=16, n_fourier=8)
+    cfg = EnergyConfig(channels=((8, 8),), dilations=((1, 1),), embed_dim=16, n_fourier=8)
     a = ConvEnergyNet(cfg, key=jax.random.key(1))
     b = ConvEnergyNet(cfg, key=jax.random.key(2))
     assert a.embed.fourier.freqs == b.embed.fourier.freqs
@@ -344,7 +349,7 @@ def test_models_from_one_config_are_pytree_compatible():
     ema_update(a, b, jnp.asarray(0.5))  # must not raise
 
     other = ConvEnergyNet(
-        EnergyConfig(channels=((6, 8),), dilations=((1, 1),), embed_dim=16, n_fourier=8, fourier_seed=7),
+        EnergyConfig(channels=((8, 8),), dilations=((1, 1),), embed_dim=16, n_fourier=8, fourier_seed=7),
         key=jax.random.key(1),
     )
     assert other.embed.fourier.freqs != a.embed.fourier.freqs
@@ -419,33 +424,64 @@ def test_usable_size_range_no_longer_has_an_architectural_floor():
     The loader supplying the context removed that floor entirely; what is left
     is the stamp, which still has to hold the nominal crop itself."""
     c = Config(energy=EnergyConfig(channels=((32,) * 8,), dilations=((1,) * 8,)),
-               patch=PatchConfig(native_size=224, nominal_crop=192, out_size=64,
+               patch=PatchConfig(native_size=224, out_size=64,
                                  pool_factor=3))
     assert c.usable_size_range() == (1, 74)   # 224 // 3
     deep = Config(energy=EnergyConfig(channels=((32,) * 20,), dilations=((1,) * 20,)),
-                  patch=PatchConfig(native_size=224, nominal_crop=192,
-                                    out_size=64, pool_factor=3))
+                  patch=PatchConfig(native_size=224, out_size=64, pool_factor=3))
     # R = 20 now, and it makes no difference to what sizes can be served.
     assert deep.usable_size_range() == (1, 74)
 
 
 def test_the_default_architecture_is_the_one_that_gets_trained():
     """``prepare_config.py`` starts from these defaults, so a config written
-    without ``--base-config`` describes whatever they say.
-
-    They said one branch, which meant every freshly generated config quietly
-    had R = 8 and a 16 px loss crop -- the long-range branch simply absent, and
-    nothing in the file to show it had ever been there.
-    """
-    from rubin_host_prior.config import (COARSE_CHANNELS, COARSE_DILATIONS,
-                                         FINE_CHANNELS, FINE_DILATIONS)
+    without ``--base-config`` describes whatever they say -- which is why the
+    architecture lives in ``config.py`` and not in the script."""
+    from rubin_host_prior.config import DEFAULT_CHANNELS, DEFAULT_DILATIONS
 
     c = Config()
-    assert c.energy.channels == (FINE_CHANNELS, COARSE_CHANNELS)
-    assert c.energy.dilations == (FINE_DILATIONS, COARSE_DILATIONS)
-    assert c.energy.receptive_radius == 32 and c.energy.loss_margin == 64
+    assert c.energy.channels == (DEFAULT_CHANNELS,)
+    assert c.energy.dilations == (DEFAULT_DILATIONS,)
+    assert c.energy.n_branches == 1 and c.energy.residual
+    assert c.energy.receptive_radius == 36 and c.energy.loss_margin == 72
     # and the loader will carry that much context for it
-    assert c.patch.out_size + 2 * c.energy.loss_margin == 256
+    assert c.patch.out_size + 2 * c.energy.loss_margin == 272
+
+
+def test_the_dilations_alternate_local_layers_with_the_doubling_series():
+    """Each long-range layer is followed by a d=1 layer that integrates what it
+    gathered.  Without those the reachable offsets still have no holes, but
+    nothing local ever mixes them."""
+    from rubin_host_prior.config import DEFAULT_DILATIONS
+
+    assert DEFAULT_DILATIONS == (1, 1, 2, 1, 4, 1, 8, 1, 16, 1)
+    assert sum(DEFAULT_DILATIONS) == 36
+    doubling = [d for d in DEFAULT_DILATIONS if d > 1]
+    assert doubling == [2, 4, 8, 16]                       # no repeats
+    for big in doubling:                                   # each followed by a 1
+        assert DEFAULT_DILATIONS[DEFAULT_DILATIONS.index(big) + 1] == 1
+
+
+def test_residuals_are_refused_rather_than_silently_dropped():
+    """A skip needs equal channel counts, so a tapering stack cannot have one.
+    That used to be discovered by the block and quietly switched off, which
+    meant a config asking for skips could get none and never hear about it."""
+    with pytest.raises(ValueError, match="uniform widths"):
+        EnergyConfig(channels=((32, 64, 96),), dilations=((1, 1, 1),),
+                     residual=True)
+    # The block refuses too, for anything that reaches it directly.
+    from rubin_host_prior.nn.layers import ConvBlock
+
+    with pytest.raises(ValueError, match="nothing to add"):
+        ConvBlock(4, 8, 3, 8, "silu", residual=True, key=jax.random.key(0))
+    # And the first layer of a branch is the one place a skip is impossible for
+    # a structural reason, so it is left off without complaint.
+    model = ConvEnergyNet(
+        EnergyConfig(channels=((8, 8),), dilations=((1, 1),), residual=True,
+                     embed_dim=8, n_fourier=4),
+        key=jax.random.key(0))
+    assert not model.branches[0].blocks[0].residual   # 1 -> 8 channels
+    assert model.branches[0].blocks[1].residual       # 8 -> 8
 
 
 def test_dilations_are_never_inferred():
@@ -453,13 +489,13 @@ def test_dilations_are_never_inferred():
     a two-branch default that convenience became ambiguous -- and it was hiding
     the number the whole geometry hangs on."""
     with pytest.raises(ValueError, match="never inferred"):
-        EnergyConfig(channels=((8, 12),))
+        EnergyConfig(channels=((12, 12),))
 
 
 def test_real_context_is_what_the_stamp_has_left_over():
     """How much of the 2R border is genuine sky, and where it runs out."""
     c = Config(energy=EnergyConfig(channels=((32,) * 8,), dilations=((1,) * 8,)),      # R = 8, 2R = 16
-               patch=PatchConfig(native_size=384, nominal_crop=288, out_size=96,
+               patch=PatchConfig(native_size=384, out_size=96,
                                  pool_factor=3))
     assert c.energy.loss_margin == 16
     # 384/3 = 128 pooled in the stamp, 96 of it cropped -> 16 left each side.
@@ -471,7 +507,7 @@ def test_real_context_is_what_the_stamp_has_left_over():
 
 def test_check_sizes_flags_a_border_that_is_all_reflection():
     c = Config(energy=EnergyConfig(channels=((32,) * 8,), dilations=((1,) * 8,)),
-               patch=PatchConfig(native_size=384, nominal_crop=288, out_size=96,
+               patch=PatchConfig(native_size=384, out_size=96,
                                  pool_factor=3))
     assert c.check_sizes() == []      # 16 real of a 16 px border: exactly enough
 
@@ -481,7 +517,7 @@ def test_check_sizes_flags_a_border_that_is_all_reflection():
     # A size that does not fit the stamp never reaches check_sizes: PatchConfig
     # refuses it outright, which is the better place for it.
     with pytest.raises(ValueError, match="needs 192 native pixels"):
-        PatchConfig(native_size=96, nominal_crop=96, out_size=32,
+        PatchConfig(native_size=96, out_size=32,
                     pool_factor=3, out_sizes=(32, 64))
 
 
@@ -489,7 +525,7 @@ def test_check_sizes_flags_a_crop_that_is_mostly_context():
     """The efficiency warning now measures the fed patch against the loss
     region, which is where the arithmetic actually goes."""
     c = Config(energy=EnergyConfig(channels=((32,) * 20,), dilations=((1,) * 20,)),   # R = 20, 2R = 40
-               patch=PatchConfig(native_size=1024, nominal_crop=48, out_size=16,
+               patch=PatchConfig(native_size=1024, out_size=16,
                                  pool_factor=3))
     # fed 16 + 80 = 96 to train on 16: (16/96)^2 = 3%.
     assert any("only 3% of the arithmetic" in w for w in c.check_sizes())
@@ -514,14 +550,14 @@ def test_defaults_leave_room_for_translation():
 
 
 def test_zero_translation_room_is_reported():
-    c = Config(patch=PatchConfig(native_size=384, nominal_crop=384, out_size=128,
+    c = Config(patch=PatchConfig(native_size=384, out_size=128,
                                  pool_factor=3))
     assert c.patch.max_translate_native == 0
     assert any("no room" in w for w in c.check_sizes())
 
 
 def test_no_warning_when_translation_is_switched_off():
-    c = Config(patch=PatchConfig(native_size=384, nominal_crop=384, out_size=128,
+    c = Config(patch=PatchConfig(native_size=384, out_size=128,
                                  pool_factor=3),
                augment=AugmentConfig(translate=False))
     # A crop that fills its stamp also has no real context, which is a separate

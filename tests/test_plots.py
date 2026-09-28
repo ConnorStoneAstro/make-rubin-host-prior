@@ -25,6 +25,8 @@ from rubin_host_prior.data import (
 )
 from rubin_host_prior.data.synthetic import write_synthetic_shards
 
+from conftest import TINY_ENERGY
+
 
 @pytest.fixture(scope="module")
 def extracted(tmp_path_factory):
@@ -41,8 +43,8 @@ def shards(extracted):
 
 @pytest.fixture(scope="module")
 def dataset(shards):
-    config = Config(patch=PatchConfig(native_size=shards.native_size,
-                                      nominal_crop=96, out_size=32,
+    config = Config(energy=TINY_ENERGY, patch=PatchConfig(native_size=shards.native_size,
+                                      out_size=32,
                                       pool_factor=3, out_sizes=(24, 32)))
     pooled, bands = pool_shards(shards, config)
     config.transform.softening = estimate_softening(
