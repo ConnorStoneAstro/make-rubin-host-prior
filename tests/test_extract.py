@@ -12,6 +12,7 @@ reaches the ADQL.  Everything else leans on the error messages, which name the
 cause and what to do about it.
 """
 
+import json
 from pathlib import Path
 
 import numpy as np
@@ -87,11 +88,11 @@ def _catalogue(tract, ra0, dec0, n=40, seed=1, patches=(0,)):
 TRACTS = {5063: (53.13, -28.10), 5064: (55.00, -28.10)}
 
 
-def _make(monkeypatch, patches=(0,), **butler_kw):
+def _make(monkeypatch, patches=(0,), n=40, **butler_kw):
     """A fake butler and a TAP service that agree about where the hosts are."""
     from astropy.table import vstack
 
-    objects = {t: _catalogue(t, *c, seed=t, patches=patches)
+    objects = {t: _catalogue(t, *c, seed=t, patches=patches, n=n)
                for t, c in TRACTS.items()}
     fakes.install(monkeypatch, ex)
     butler = fakes.FakeButler(TRACTS, objects, **butler_kw)
@@ -108,8 +109,9 @@ def butler(monkeypatch):
 def _run(butler, tmp_path, **kw):
     kw.setdefault("bands", ("r", "i"))
     kw.setdefault("n_stamps", 12)
+    kw.setdefault("native_size", 416)
     return extract_patches(butler, tmp_path, tap_service=butler.tap,
-                           native_size=416, seed=0, **kw)
+                           seed=0, **kw)
 
 
 # -- the walk ---------------------------------------------------------------
@@ -672,3 +674,118 @@ def test_no_data_is_gated_once_not_twice():
     cuts = PatchCuts()
     assert "NO_DATA" not in cuts.zero_tolerance_planes
     assert cuts.gate_kwargs()["max_no_data"] > 0
+
+
+# -- splitting a campaign across jobs ---------------------------------------
+#
+# Downscaled deliberately.  Which part a host lands in is a property of the
+# patch order and cares nothing for the stamp size or how many hosts there are,
+# so these run at 64 px on a quarter of the catalogue: 11.3 s of walking becomes
+# 1.1 s and not one of the assertions changes.
+
+#: A campaign small enough to walk end to end, several times, in a unit test.
+_SPLIT_HOSTS = dict(patches=(0, 1, 2, 3), n=12)
+#: `n_stamps=None` so every part walks its whole share -- a target would stop
+#: the walk early and the union could not be compared with a single run.
+_SPLIT_RUN = dict(native_size=64, bands=("r",), n_stamps=None)
+
+
+def _campaign(monkeypatch, out, part=None, **kw):
+    made = _make(monkeypatch, **_SPLIT_HOSTS)
+    made[0].tap = made[1]
+    return _run(made[0], out, part=part, **{**_SPLIT_RUN, **kw})
+
+
+def test_parts_split_whole_patches_and_together_cover_everything(
+        monkeypatch, tmp_path):
+    """Whole patches, because a patch's components cost the same for one host as
+    for forty and the walk only amortises them by visiting a patch once.  Slice
+    the host *list* instead and every part touches nearly every patch."""
+    import pandas as pd
+
+    n_parts = 3
+    frames = []
+    for k in range(n_parts):
+        _campaign(monkeypatch, tmp_path / str(k), part=(k, n_parts))
+        frames.append(pd.read_parquet(tmp_path / str(k) / "manifest.parquet"))
+
+    seen = [set(zip(f["tract"], f["patch"])) for f in frames]
+    for i, a in enumerate(seen):
+        assert a, f"part {i} got no patches"
+        for b in seen[i + 1:]:
+            assert not (a & b), "a patch was visited by two parts"
+
+    _campaign(monkeypatch, tmp_path / "all")
+    everything = pd.read_parquet(tmp_path / "all" / "manifest.parquet")
+    assert set().union(*seen) == set(zip(everything["tract"], everything["patch"]))
+    # and every host, not merely every patch
+    assert sum(len(f) for f in frames) == len(everything)
+
+
+def test_a_part_takes_its_share_of_the_campaign_target(monkeypatch, tmp_path):
+    """``n_stamps`` is the campaign total, the way ``train.steps`` is the length
+    of a whole chunked run rather than of one chunk."""
+    summary = _campaign(monkeypatch, tmp_path / "p", part=(0, 4), n_stamps=40)
+    assert summary["counts"]["stamps_requested"] == 10
+    assert summary["counts"]["part"] == [0, 4]
+
+
+def test_more_parts_than_patches_is_refused(monkeypatch, tmp_path):
+    """Silently doing nothing would look like a part that found no hosts, which
+    is a thing that can also happen for real reasons."""
+    made = _make(monkeypatch, patches=(0,), n=12)
+    made[0].tap = made[1]
+    with pytest.raises(RuntimeError, match="got no hosts"):
+        _run(made[0], tmp_path / "p", part=(3, 4), **_SPLIT_RUN)
+
+
+def _merge_parts_module():
+    import importlib.util
+
+    root = Path(__file__).resolve().parent.parent
+    spec = importlib.util.spec_from_file_location(
+        "merge_parts", root / "scripts" / "merge_parts.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_merging_parts_looks_exactly_like_one_run(monkeypatch, tmp_path):
+    """The point of the merge: downstream needs no knowledge that the campaign
+    was split.  `<out>/shards`, `<out>/manifest.parquet` and
+    `<out>/hosts.parquet` are where a single job would have left them."""
+    import pandas as pd
+
+    out = tmp_path / "campaign"
+    for k in range(2):
+        _campaign(monkeypatch, out / "parts" / str(k), part=(k, 2))
+
+    merged = _merge_parts_module().merge(out)
+
+    shards = sorted((out / "shards").glob("*.h5"))
+    assert shards, "no shards were assembled"
+    assert len(shards) == len(merged["shards"])
+    # Hard-linked, not copied: a campaign is tens of GB and the parts are
+    # already on the filesystem the merged set lives on.
+    originals = {p.stat().st_ino for p in (out / "parts").glob("*/shards/*.h5")}
+    assert {p.stat().st_ino for p in shards} == originals
+    # Two parts both wrote patches-00000.h5; the names must not have collided.
+    assert len({p.name for p in shards}) == len(shards)
+
+    manifest = pd.read_parquet(out / "manifest.parquet")
+    per_part = [pd.read_parquet(p)
+                for p in sorted((out / "parts").glob("*/manifest.parquet"))]
+    assert len(manifest) == sum(len(f) for f in per_part)
+    assert (out / "hosts.parquet").exists()
+
+    summary = json.loads((out / "summary.json").read_text())
+    assert len(summary["parts"]) == 2
+    assert summary["counts"]["stamps_accepted"] == sum(
+        p["counts"]["stamps_accepted"] for p in summary["parts"])
+    # A per-job label that means nothing for the whole.
+    assert "part" not in summary["counts"]
+
+
+def test_merging_with_no_parts_says_so(tmp_path):
+    with pytest.raises(SystemExit, match="no parts under"):
+        _merge_parts_module().merge(tmp_path / "nothing")

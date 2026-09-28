@@ -891,6 +891,7 @@ def extract_patches(
     n_stamps: int | None = None,
     seed: int = 0,
     prefix: str = "patches",
+    part: tuple[int, int] | None = None,
     selection=None,  # ExtractionConfig or Selection: anything with
     # .hosts and .patches
 ) -> dict:
@@ -915,6 +916,26 @@ def extract_patches(
     continues until it has them or the catalogue runs out.  The check happens
     between hosts, so a run can overshoot by up to one host's worth of bands
     rather than leaving the last host with an arbitrary subset of them.
+
+    **Splitting a campaign across jobs.**  ``part=(k, n)`` keeps only the hosts
+    in patches ``k, k+n, k+2n, ...`` of the catalogue's patch order, and takes
+    ``n_stamps / n`` as its share of the target -- ``n_stamps`` being the
+    campaign total, the way ``train.steps`` is the length of a whole chunked
+    run rather than of one chunk.
+
+    Whole *patches* go to a part, never whole hosts, and that is the point.  A
+    patch's components -- one ref query and three reads -- cost the same whether
+    one host or forty come out of it, and the walk only amortises them because
+    it is patch-ordered: ordering plus caching took component reads from 303 s
+    of a 398 s run down to 122 s, and the ref query alone from 68.1 s to 8.1 s.
+    Slicing the *host list* instead would leave nearly every patch touched by
+    nearly every part, so a campaign would pay all of that ``n`` times over for
+    the same stamps.
+
+    Every part reads one shared ``host_cache``, which matters for more than the
+    query: ``dedupe_hosts`` runs before that file is written, so the cross-tract
+    duplicates are already gone and no part can rediscover one the others
+    cannot see.
 
     Every attempt is recorded in the manifest, rejections included, with the
     reason and the diagnostics.  Those statistics *are* the selection function,
@@ -964,6 +985,37 @@ def extract_patches(
         order, key=lambda k: seen_patches[(int(catalogue["tract"][k]), int(catalogue["patch"][k]))]
     )
     order = np.asarray(order)
+    if part is not None:
+        # Whole patches to a part, never whole hosts.  A patch's components --
+        # the ref query and the three reads -- cost the same whether one host
+        # or forty come out of it, and the cache below only amortises them
+        # because consecutive hosts share a patch.  Slice the host list instead
+        # and every part touches nearly every patch, so the campaign pays that
+        # cost `n_parts` times over for the same stamps.
+        index, n_parts = part
+        mine = np.array(
+            [seen_patches[(int(catalogue["tract"][k]),
+                           int(catalogue["patch"][k]))] % n_parts == index
+             for k in order],
+            dtype=bool,
+        )
+        log.info(
+            "part %d of %d: %d of %d patches, %d of %d hosts",
+            index, n_parts,
+            sum(1 for v in seen_patches.values() if v % n_parts == index),
+            len(seen_patches), int(mine.sum()), len(order),
+        )
+        order = order[mine]
+        if not len(order):
+            raise RuntimeError(
+                f"part {index} of {n_parts} got no hosts: there are only "
+                f"{len(seen_patches)} patches in the catalogue, so asking for "
+                f"more parts than that leaves some with nothing to do."
+            )
+        if n_stamps is not None:
+            # n_stamps is the campaign target, like train.steps is the length of
+            # a whole chunked run: a part takes its share.
+            n_stamps = -(-n_stamps // n_parts)
     host_id = np.asarray(catalogue["objectId"], dtype=np.int64)[order]
     host_ra = np.asarray(catalogue["coord_ra"], dtype=float)[order]
     host_dec = np.asarray(catalogue["coord_dec"], dtype=float)[order]
@@ -1289,6 +1341,7 @@ def extract_patches(
             "stamps_accepted": n_accepted,
             "stamps_rejected": summary.pop("n_rejected"),
             "stamps_requested": n_stamps,
+            "part": list(part) if part else None,
             "shards_written": len(paths),
         },
         seconds=clock.summary(),

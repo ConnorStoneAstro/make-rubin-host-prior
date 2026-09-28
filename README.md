@@ -48,6 +48,44 @@ and **walked host by host**, and each host is turned into up to one stamp per
 band, centred on it, read as a bbox out of its own patch. The artefact gate runs
 on each, and what survives is written as sharded HDF5 plus a manifest.
 
+#### Splitting a campaign across jobs
+
+```bash
+for k in $(seq 0 7); do
+    sbatch --export=K=$k run_extract.sh      # --part $K --of 8
+done
+python scripts/merge_parts.py                # once they are all done
+```
+
+**Whole patches go to a part, never whole hosts**, and that is the whole design.
+A patch's components — one ref query and three reads — cost the same whether one
+host or forty come out of it, and the walk only amortises them because it is
+patch-ordered: ordering plus caching took component reads from 303 s of a 398 s
+run down to 122 s, and the ref query alone from 68.1 s to 8.1 s. Slice the
+*host list* instead and nearly every patch is touched by nearly every part, so
+the campaign pays all of that `n` times over for the same stamps. Splitting by
+patch, the total butler work is identical to one job's — just divided.
+
+Part `k` takes the patches at positions `k, k+n, k+2n, …` of the catalogue's
+patch order, which is deterministic from `run.seed`. `n_stamps` is the
+**campaign** total and a part takes its share, the way `train.steps` is the
+length of a whole chunked run rather than of one chunk.
+
+Every part reads the one shared `catalogue.cache`. That matters for more than
+avoiding eight copies of a fragile TAP query: `dedupe_hosts` runs before that
+file is written, so cross-tract duplicates are already gone and no part can
+rediscover one the others cannot see.
+
+`merge_parts.py` assembles `<out>/parts/*/` into `<out>/` — concatenating the
+manifests and host tables, summing the counts, and **hard-linking** the shards
+under names that cannot collide. A link costs an inode, so nothing is copied.
+Afterwards `<out>` is indistinguishable from a single-job run and
+`prepare_config.py`, `diagnose.py` and `train.py` need to know nothing about the
+split. The correlation length and the visits-per-cell distribution are
+deliberately *not* merged — they are percentiles and an accumulator, and
+averaging them would produce a number that looks authoritative and means
+nothing; each part's own summary is kept under `parts`.
+
 Everything the run does comes from `extraction.yaml`, which is checked in. The
 script has no defaults of its own, so there is no way for a command-line flag and
 a config key to disagree; `--repo` and `--collection` name the butler, and that

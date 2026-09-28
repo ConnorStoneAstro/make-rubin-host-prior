@@ -304,14 +304,14 @@ class AugmentConfig:
 
 @dataclass
 class TrainConfig:
-    batch_size: int = 128
+    batch_size: int = 64
     steps: int = 200_000
     learning_rate: float = 1e-4
     warmup_steps: int = 2_000
     cosine_decay: bool = False
     weight_decay: float = 0.0
     grad_clip: float = 1.0
-    ema_decay: float = 0.999
+    ema_decay: float = 0.998
     log_every: int = 1000
     seed: int = 0
     #: Validation cadence and size.  Here rather than as a default on

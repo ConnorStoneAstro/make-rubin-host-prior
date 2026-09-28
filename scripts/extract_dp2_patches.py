@@ -39,6 +39,17 @@ def main() -> None:
                    help=f"run description (default: {DEFAULT_CONFIG})")
     p.add_argument("--repo", default="dp2", help="butler repo alias or path")
     p.add_argument("--collection", default="dp2")
+    p.add_argument("--part", type=int, default=None, metavar="K",
+                   help="run only part K of a campaign split across --of jobs. "
+                        "Whole patches go to a part, so each patch's butler "
+                        "reads happen once across the whole campaign; results "
+                        "land in <out>/parts/K and scripts/merge_parts.py "
+                        "assembles them")
+    p.add_argument("--of", type=int, default=None, metavar="N",
+                   help="how many parts the campaign is split into. n_stamps in "
+                        "the config is the campaign total; a part takes its "
+                        "share, as train.steps is the length of a whole "
+                        "chunked run rather than one chunk")
     p.add_argument("--no-plots", action="store_true",
                    help="skip the diagnostic figures written to <out>/diagnostics")
     p.add_argument("--verbose", "-v", action="count", default=0,
@@ -52,14 +63,29 @@ def main() -> None:
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
 
+    # Which slice of a campaign this job runs is a property of the job, not of
+    # the run -- like --devices on train.py -- so it is a flag and not a config
+    # key.  Putting it in extraction.yaml would mean N files differing in one
+    # number, which is exactly the thing that file exists to avoid.
+    if (args.part is None) != (args.of is None):
+        p.error("--part and --of go together")
+    part = None if args.part is None else (args.part, args.of)
+    if part is not None and not 0 <= args.part < args.of:
+        p.error(f"--part must be in [0, {args.of}), got {args.part}")
+
     config = ExtractionConfig.load(args.config)
     print(f"config: {args.config}")
     print(config.describe())
 
+    out_dir = config.out if part is None else f"{config.out}/parts/{args.part}"
+    if part is not None:
+        print(f"part {args.part} of {args.of} -> {out_dir}")
+
     butler = open_butler(args.repo, args.collection)
     summary = extract_patches(
         butler,
-        out_dir=config.out,
+        out_dir=out_dir,
+        part=part,
         ra=config.sky.ra,
         dec=config.sky.dec,
         radius_deg=config.sky.radius_deg,
