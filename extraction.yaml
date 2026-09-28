@@ -59,13 +59,12 @@ run:
 # size, one cut on it.
 hosts:
   band: r
-  max_mag: 19.0          # faint limit
-  min_mag: 11.5          # nominal; the saturated-core flag is the real one
-  min_reff_arcsec: 1.5
-  max_reff_arcsec: 30.0
-  max_mu_e: 25.5         # mag/arcsec^2; sky is about 27
-  max_sersic_index: 6.0
-  min_extendedness: 0.5
+  max_mag: 18.0          # faint limit
+  min_mag: 10.0          # nominal; the saturated-core flag is the real one
+  min_reff_arcsec: 2.0
+  max_reff_arcsec: 50.0
+  max_mu_e: 22.0         # mag/arcsec^2; sky is about 27
+  max_sersic_index: 5.5
   max_blendedness: null
   reject_saturated_centre: true
   reject_interpolated_centre: false
