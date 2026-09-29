@@ -142,10 +142,20 @@ class FiLM(eqx.Module):
 
 
 class ConvBlock(eqx.Module):
-    """valid conv -> FiLM -> activation, with an optional centre-cropped skip.
+    """same conv -> FiLM -> activation, with an optional skip.
 
-    ``radius`` is the per-side shrinkage, ``(k - 1) // 2 * dilation``, which is
-    also what the skip connection has to crop by.
+    ``radius`` is the per-side reach, ``(k - 1) // 2 * dilation``.  It no longer
+    shrinks anything: the convolution is same-mode, so the grid comes out the
+    size it went in and the skip is a plain sum.  The radius is still what sets
+    how far the block sees, so it is kept for the geometry report.
+
+    **Zero padding.**  ``padding_mode`` is left at the equinox default, which
+    pads with zeros rather than reflecting.  Reflection was tried on the *data*
+    border and is the leading explanation for a run that learned no structure
+    above ~16 px: a mirrored border is symmetric at every scale, and the large
+    scales are almost all border.  Zeros invent no structure; what they invent
+    is an edge, which a size-locked model can learn once and for all.  See
+    ``ConvEnergyNet.input_offset`` for why the *input* is centred first.
     """
 
     conv: eqx.nn.Conv2d
@@ -169,10 +179,11 @@ class ConvBlock(eqx.Module):
     ):
         kc, kf = jax.random.split(key)
         # Dilation spreads the same k*k taps over d times the span: identical
-        # parameters and identical arithmetic, reaching d times as far.  The
-        # valid-mode shrinkage scales with it, 2*r*d per layer.
+        # parameters and identical arithmetic, reaching d times as far.  Under
+        # same-mode padding it costs no shape either -- what it costs is a wider
+        # band of pixels whose taps land in the padding, r*d per side.
         conv = eqx.nn.Conv2d(
-            in_channels, out_channels, kernel_size, padding=0,
+            in_channels, out_channels, kernel_size, padding="SAME",
             dilation=dilation, key=kc
         )
         # He-style init for a smooth, roughly half-rectifying activation: the
@@ -201,14 +212,14 @@ class ConvBlock(eqx.Module):
     ) -> Float[Array, "c2 h2 w2"]:
         out = self.act(self.film(self.conv(h), emb))
         if self.residual:
-            r = self.radius
-            # Divided by sqrt(2), so the block preserves variance instead of
-            # doubling it.  Without this a 10-layer stack arrives at the head
-            # with ~180x the signal a plain stack would, the small head no
-            # longer keeps the initial energy landscape flat, and training
+            # No crop: same-mode convolution leaves the skip the same shape as
+            # the output.  Divided by sqrt(2), so the block preserves variance
+            # instead of doubling it.  Without this a 10-layer stack arrives at
+            # the head with ~180x the signal a plain stack would, the small head
+            # no longer keeps the initial energy landscape flat, and training
             # starts at a loss of 1.78 -- worse than predicting no score at all.
             # Scaling the head down instead would work, but the factor would
             # depend on the depth and would have to be retuned for every
             # architecture; this does not.
-            out = (out + h[:, r:-r or None, r:-r or None]) / SQRT2
+            out = (out + h) / SQRT2
         return out

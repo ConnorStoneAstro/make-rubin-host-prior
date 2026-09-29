@@ -152,20 +152,27 @@ def correlation_length(
     }
 
 
-def context_advice(xi: float, loss_margin: int) -> str:
-    """One line on whether the architecture's 2R margin covers this field."""
+def reach_advice(xi: float, reach: int) -> str:
+    """One line on whether the architecture's score reach covers this field.
+
+    It used to compare ``xi`` against the *loss crop*, because under valid
+    convolutions the crop and the reach were the same number (``2R``) and the
+    crop was the one that cost patches.  With same-mode convolutions the crop is
+    0 and the reach is still ``2R``, so the question is the honest one: can a
+    pixel's score see as far as the data is correlated?
+    """
     if not np.isfinite(xi) or xi <= 0:
         return "correlation length unavailable"
-    ratio = loss_margin / xi
+    ratio = reach / xi
     if ratio >= 2.0:
         verdict = "comfortable"
     elif ratio >= 1.2:
         verdict = "adequate"
     elif ratio >= 0.8:
-        verdict = "marginal -- consider more layers or a larger analysis margin"
+        verdict = "marginal -- consider more reach"
     else:
-        verdict = "TOO SMALL -- the middle of a patch this size is not trustworthy"
+        verdict = "TOO SMALL -- the score cannot see as far as the data correlates"
     return (
-        f"xi = {xi:.1f} px, loss crop 2R = {loss_margin} px, "
+        f"xi = {xi:.1f} px, score reach 2R = {reach} px, "
         f"2R/xi = {ratio:.1f}  ->  {verdict}"
     )

@@ -90,9 +90,8 @@ def pool_to_training_grid(
     translate: bool = False,
     scale_jitter: float = 0.0,
     max_translate: int | None = None,
-    context: int = 0,
 ) -> np.ndarray:
-    """Native stamp(s) -> ``out_size + 2 * context`` training image(s).
+    """Native stamp(s) -> ``out_size`` training image(s).
 
     With ``scale_jitter == 0`` this is a crop plus exact average pooling.  With
     jitter the crop size becomes ``round(out_size * pool_factor * (1 + delta))``
@@ -104,27 +103,13 @@ def pool_to_training_grid(
     in native pixels per side.  Without it a small crop would roam over the whole
     stamp; with it every training size looks at the same neighbourhood.
 
-    **Context.**  The loss discards ``2R`` pixels from every side, so a patch of
-    ``out_size`` would train on ``out_size - 4R``.  ``context`` (in *output*
-    pixels, and ``2R`` is the only value that makes sense) carries that border
-    along so the loss lands on exactly the nominal crop instead.
-
-    **The context is real sky or it is an error.**  This used to reflect the
-    shortfall, and the trade looked cheap: the loss pixels whose receptive field
-    held no synthetic pixel were exactly the ones a bare crop would have given,
-    so reflection appeared to buy the rest of the nominal crop for free.  What
-    that reasoning missed is *which* pixels it buys them with.  A reflected
-    border is mirror-symmetric about the seam at every scale, and it is the
-    large scales that are almost all border -- at R = 36 on a 512 px stamp only
-    4% of a 128 px loss region had a receptive field free of it.  So the coarse
-    part of the score was fit almost entirely to a symmetry nature does not
-    have, which is the leading explanation for three architectures in a row
-    whose samples had no structure above ~16 px.
-
-    Reach is therefore bounded by the stamp: ``out_size + 4R`` pooled pixels
-    must come out of ``native_size``, and ``max_translate`` has to keep the
-    whole window inside it.  ``Config.usable_size_range`` and
-    ``Config.max_translate_native`` compute both; this is where it is enforced.
+    **There is no context border.**  There used to be: valid convolutions gave
+    a correct score only ``2R`` pixels inside the input, so the loader carried
+    ``2R`` of extra sky on every side for the loss to crop away again.  Where
+    the stamp could not supply it the shortfall was reflected, and that put a
+    mirror symmetry into exactly the large scales the model was failing to
+    learn.  Same-mode convolutions score every pixel, so the crop is now just a
+    crop: ``out_size * pool_factor`` native pixels, pooled, and nothing else.
     """
     h, w = native.shape[-2:]
     if h != w:
@@ -163,28 +148,7 @@ def pool_to_training_grid(
     y0 += centre_shift
     x0 += centre_shift
 
-    # The border scales with the crop, so jitter changes the angular size of the
-    # context in step with the scene rather than leaving it fixed.  Unjittered
-    # this is exactly context * pool_factor.
-    pad = int(round(context * size / out_size)) if context else 0
-    if pad == 0:
-        patch = crop(native, size, y0, x0)
-    else:
-        side = size + 2 * pad
-        if y0 < pad or x0 < pad or y0 + size + pad > h or x0 + size + pad > w:
-            raise ValueError(
-                f"a {out_size} px crop with {context} px of context needs "
-                f"{side} native px on a side and has to sit inside the "
-                f"{h} px stamp, but the crop landed at ({y0}, {x0}). Either the "
-                f"stamp is too small for out_size + 2 * context "
-                f"({out_size} + 2 * {context} = {out_size + 2 * context} pooled "
-                f"px, {(out_size + 2 * context) * pool_factor} native), or "
-                f"max_translate let it wander off the edge -- pass "
-                f"Config.max_translate_native(), which is sized for exactly "
-                f"this. The shortfall is not reflected: the border is real sky "
-                f"or there is no batch."
-            )
-        patch = native[..., y0 - pad : y0 + size + pad, x0 - pad : x0 + size + pad]
+    patch = crop(native, size, y0, x0)
     if size == nominal:
         return block_mean(patch, pool_factor)
-    return area_resample(patch, out_size + 2 * context)
+    return area_resample(patch, out_size)

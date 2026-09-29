@@ -1,5 +1,5 @@
-"""The valid-convolution shape arithmetic, and a numerical check of the claim
-that motivates the loss crop."""
+"""Same-mode reach arithmetic, and numerical checks of the two claims it rests
+on: the grid never changes size, and the score still reaches exactly ``2R``."""
 
 import jax
 import jax.numpy as jnp
@@ -11,19 +11,21 @@ from rubin_host_prior.config import EnergyConfig
 from rubin_host_prior.nn import ConvEnergyNet, score
 
 
-def test_shrinkage_matches_a_real_forward_pass(tiny_model):
-    for size in (16, 25, 40):
+def test_the_grid_comes_out_the_size_it_went_in(tiny_model):
+    """The point of same-mode padding.  Under valid convolutions this was
+    ``size - 2R`` and every caller had to know the architecture to predict it."""
+    for size in (8, 16, 25, 40):
         emap = tiny_model.energy_map(jnp.zeros((1, size, size)), jnp.asarray(1.0))
-        assert emap.shape[-1] == g.energy_size(size, tiny_model.config.dilations)
+        assert emap.shape[-1] == size
 
 
-def test_margin_is_twice_the_receptive_radius():
-    for n_layers in (1, 3, 8):
-        plain = ((1,) * n_layers,)
-        r = g.receptive_radius(plain)
-        assert r == n_layers
-        assert g.loss_margin(plain) == 2 * r
-        assert g.interior_size(64, plain) == 64 - 4 * r
+def test_a_scene_smaller_than_the_reach_still_runs(tiny_model):
+    """Valid convolutions refused anything below ``2R + 1``, because the energy
+    map would have been empty and the score identically zero.  Same-mode
+    padding has no such floor -- a 1x1 scene is all padding but it is a scene."""
+    assert tiny_model.energy_map(
+        jnp.zeros((1, 1, 1)), jnp.asarray(1.0)
+    ).shape[-1] == 1
 
 
 def test_reach_is_the_sum_of_the_dilations():
@@ -32,40 +34,16 @@ def test_reach_is_the_sum_of_the_dilations():
     assert g.branch_radius((1, 2, 4, 8, 16, 1)) == 32
     assert g.branch_radius((1,) * 32) == 32  # the same reach, 32 layers deep
     assert g.branch_radius((1, 2, 4, 8, 16), kernel_size=5) == 62
+    assert g.branch_radius((1, 2, 4, 8, 16, 32, 8, 4, 2, 1)) == 78  # the default
 
 
-def test_several_branches_take_the_longest_margin():
-    """Shorter branches are centre-cropped onto the longest one's grid, so their
-    cells sit on the same input centres and never bind the margin."""
+def test_several_branches_take_the_longest_reach():
+    """Their maps are all the size of the scene now, so they simply add -- but
+    the summed energy still reaches as far as its longest branch."""
     fine, coarse = (1,) * 8, (1, 2, 4, 8, 16, 1)
     assert g.receptive_radius((fine,)) == 8
     assert g.receptive_radius((coarse,)) == 32
     assert g.receptive_radius((fine, coarse)) == 32
-    assert g.loss_margin((fine, coarse)) == 64
-    # 2R + 1 produces a 1x1 energy map; 4R + 1 is the first size with any loss
-    # interior at all.  Two different thresholds, and it is the second that
-    # decides what has to come out of the extraction.
-    assert g.min_input_size((fine, coarse)) == 65
-    assert g.interior_size(129, (fine, coarse)) == 1
-    assert g.interior_size(128, (fine, coarse)) == 0
-
-
-def test_min_input_size_is_the_smallest_that_works():
-    n_layers = 3
-    smallest = g.min_input_size(((1,) * n_layers,))
-    model = ConvEnergyNet(
-        EnergyConfig(channels=((4,) * n_layers,), dilations=((1,) * n_layers,), embed_dim=8, n_fourier=4),
-        key=jax.random.key(0),
-    )
-    assert model.energy_map(
-        jnp.zeros((1, smallest, smallest)), jnp.asarray(1.0)
-    ).shape[-1] == 1
-    # One pixel smaller must raise, not silently return a zero-size energy map
-    # (which would make the energy 0 and the score identically zero).
-    with pytest.raises(ValueError, match="at least"):
-        model.energy_map(jnp.zeros((1, smallest - 1, smallest - 1)), jnp.asarray(1.0))
-    with pytest.raises(ValueError, match="at least"):
-        score(model, jnp.zeros((1, smallest - 1, smallest - 1)), jnp.asarray(1.0))
 
 
 def test_even_kernel_rejected():
@@ -73,64 +51,31 @@ def test_even_kernel_rejected():
         g.layer_radius(4)
 
 
-def test_score_on_a_constant_scene_depends_only_on_edge_truncation(tiny_model):
-    """The exact statement of the claim the loss crop rests on.
+def test_padding_fraction_counts_what_the_convolutions_invent():
+    """A pixel sees ``[p-R, p+R]``; whatever of that is off the grid is zeros."""
+    # R = 0 reaches nothing off-grid, whatever the size.
+    assert g.real_fraction(10, 0) == pytest.approx(1.0)
+    # R = 1 on a 3 px grid: the middle pixel is whole, the two ends lose a third
+    # each, so the 1-D mean is (2/3 + 1 + 2/3)/3 and the 2-D value is its square.
+    assert g.real_fraction(3, 1) == pytest.approx(((2 / 3 + 1 + 2 / 3) / 3) ** 2)
+    # It falls as the reach grows against a fixed grid, and never reaches 1.
+    fracs = [g.real_fraction(64, r) for r in (4, 16, 64)]
+    assert fracs[0] > fracs[1] > fracs[2]
+    assert all(f < 1.0 for f in fracs)
+    # The default architecture on the default grid: a bit over half is padding.
+    default = (1, 2, 4, 8, 16, 32, 8, 4, 2, 1)
+    assert g.padding_fraction(128, (default,)) == pytest.approx(0.52, abs=0.01)
 
-    For a constant input, ``dE/dx_i`` sums the kernel-offset contributions of
-    every energy cell that sees pixel ``i``.  Which offsets are present depends
-    only on how the window ``[i-2R, i]`` is truncated by the ends of the energy
-    map -- that is, only on ``min(i, 2R)`` and ``min(H-1-i, 2R)``.  So the score
-    must be *exactly* constant within each such truncation class, and interior
-    pixels (untruncated on both sides, in both axes) form one class.
 
-    Stated this way the test cannot be fooled by coincidence.  Asserting instead
-    that every border pixel differs from the interior by some margin does not
-    hold: a partial sum over a subset of kernel offsets can land arbitrarily
-    close to the full sum for a particular weight draw, and does.
+def test_the_score_still_reaches_exactly_2r(tiny_model):
+    """Padding changes what is at the edges, not how far a pixel can see.
 
-    If this fails, the margin in ``geometry`` is wrong and the training loss is
-    being computed on pixels the network structurally cannot get right.
+    ``dE/dx_i`` depends on input pixels only within ``2R`` -- the Hessian of the
+    energy is banded -- and that is a statement about the kernels, so same-mode
+    padding leaves it exactly as valid convolutions had it.
     """
-    from collections import defaultdict
-
-    size = 24
-    r2 = tiny_model.loss_margin  # == 2R
-    s = np.asarray(
-        score(tiny_model, jnp.full((1, size, size), 0.3), jnp.asarray(1.0))
-    )[0]
-
-    def truncation(i):
-        return (min(i, r2), min(size - 1 - i, r2))
-
-    groups = defaultdict(list)
-    for i in range(size):
-        for j in range(size):
-            groups[(truncation(i), truncation(j))].append(s[i, j])
-
-    # Exactly constant within each class, to float32 precision.
-    for key, values in groups.items():
-        spread = np.ptp(values) / max(abs(np.mean(values)), 1e-12)
-        assert spread < 1e-5, f"class {key} spread {spread:.2e}"
-
-    # The interior is one class, and it is the whole H - 4R window.
-    interior_key = ((r2, r2), (r2, r2))
-    assert len(groups[interior_key]) == (size - 2 * r2) ** 2
-    interior = s[r2 : size - r2, r2 : size - r2]
-    assert np.allclose(interior, interior.flat[0], rtol=1e-5)
-
-    # Truncation genuinely changes the value: the border as a whole is nowhere
-    # near the interior, even if individual pixels can coincide.
-    border = np.ones((size, size), dtype=bool)
-    border[r2 : size - r2, r2 : size - r2] = False
-    deviation = np.abs(s[border] - interior.flat[0]) / abs(interior.flat[0])
-    assert np.median(deviation) > 0.1, np.median(deviation)
-
-
-def test_energy_hessian_bandwidth_is_2r(tiny_model):
-    """``dE/dx_i`` depends on input pixels only within ``2R`` -- the Hessian of the
-    energy is banded, which is the same fact stated as a derivative."""
     size = 21
-    r2 = tiny_model.loss_margin  # == 2R
+    r2 = 2 * tiny_model.receptive_radius
     x = jnp.zeros((1, size, size))
 
     def score_at_centre(xx):
@@ -143,20 +88,49 @@ def test_energy_hessian_bandwidth_is_2r(tiny_model):
     assert np.any(np.abs(grad[~far]) > 0)
 
 
-def test_report_states_the_crop_and_its_consequences():
-    """The crop is derived from the architecture, never configured, so the
-    report is the only thing that tells you what changing n_layers did."""
+def test_on_a_constant_scene_the_padding_free_interior_is_uniform(tiny_model):
+    """What is left of the old loss-crop claim, and why the margin is now free.
+
+    For a constant input the score at pixel ``i`` is decided by which taps land
+    in the padding, so pixels whose whole ``2R`` reach is on the grid must all
+    agree exactly, and pixels near the border must not.  Under valid
+    convolutions that was the argument for cropping ``2R``: outside the interior
+    a pixel's score was a *different linear functional of the weights* that no
+    training could fix.  Here the border pixels are merely different, not
+    unreachable -- the same grid and the same padding at training and at
+    inference -- which is why the loss is taken on all of them.
+    """
+    size = 24
+    r2 = 2 * tiny_model.receptive_radius
+    s = np.asarray(
+        score(tiny_model, jnp.full((1, size, size), 0.3), jnp.asarray(1.0))
+    )[0]
+
+    interior = s[r2 : size - r2, r2 : size - r2]
+    assert interior.size > 0
+    assert np.allclose(interior, interior.flat[0], rtol=1e-5)
+
+    border = np.ones((size, size), dtype=bool)
+    border[r2 : size - r2, r2 : size - r2] = False
+    deviation = np.abs(s[border] - interior.flat[0]) / abs(interior.flat[0])
+    assert np.median(deviation) > 0.1, np.median(deviation)
+
+
+def test_report_states_the_reach_and_what_it_costs():
     text = g.report((48, 64, 96), ((1,) * 8,), kernel_size=3)
-    assert "2R = 16 px from every side" in text
-    assert "smallest usable patch = 4R + 1 = 33 px" in text
-    assert "N + 32 px" in text  # inference needs region + 4R
-    for size, interior, pct in ((48, 16, 11), (64, 32, 25), (96, 64, 44)):
-        assert f"loss on interior {interior}x{interior}" in text
-        assert f"({pct}% of pixels)" in text
+    assert "same-convolution geometry" in text
+    assert "score reach = 2R = 16 px" in text
+    assert "energy map 48x48" in text and "energy map 96x96" in text
+    # A smaller grid wastes more of its reach on padding than a larger one.
+    small = float(text.split("grid   48x48")[1].split("%")[0].split()[-1])
+    big = float(text.split("grid   96x96")[1].split("%")[0].split()[-1])
+    assert small > big
+    assert "loss on every pixel" in text
+    assert "loss crop" in g.report(64, ((1,) * 8,), loss_margin=4)
 
 
 def test_report_tracks_the_hyperparameters():
-    """Changing layers, dilations or kernel size must change the reported crop."""
+    """Changing layers, dilations or kernel size must change the reported reach."""
     assert "2R = 6 px" in g.report(64, ((1,) * 3,), kernel_size=3)
     assert "2R = 16 px" in g.report(64, ((1,) * 8,), kernel_size=3)
     assert "2R = 32 px" in g.report(64, ((1,) * 8,), kernel_size=5)
@@ -167,7 +141,21 @@ def test_report_tracks_the_hyperparameters():
     assert "dilations 1x2x4x8x16x1" in two
 
 
-def test_report_flags_a_size_that_is_too_small():
-    text = g.report((24, 64), ((1,) * 8,))
-    assert "TOO SMALL" in text
-    assert "loss on interior 32x32" in text  # the workable one still reported
+def test_report_flags_a_grid_the_reach_has_outgrown():
+    """Past ``2R >= H`` every pixel already sees every other one, so more reach
+    is more padding and nothing else -- the default is deliberately here."""
+    text = g.report((64, 300), ((1, 2, 4, 8, 16, 1),))   # 2R = 64
+    assert "reach exceeds the grid" in text
+    assert text.count("reach exceeds the grid") == 1     # not the 300 px grid
+
+
+def test_a_model_built_from_the_defaults_scores_its_own_grid():
+    from rubin_host_prior.config import Config
+
+    c = Config()
+    m = ConvEnergyNet(EnergyConfig(
+        channels=((4,) * 10,), dilations=c.energy.dilations,
+        embed_dim=8, n_fourier=4), key=jax.random.key(0))
+    n = c.patch.out_size
+    s = score(m, jnp.zeros((1, n, n)), jnp.asarray(1.0))
+    assert s.shape == (1, n, n)

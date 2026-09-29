@@ -13,7 +13,7 @@ from rubin_host_prior.diffusion import (
     dsm_loss_by_sigma,
     pflow_sample,
     reverse_sde_sample,
-    sample_interior,
+    sample_scene,
 )
 
 
@@ -192,9 +192,9 @@ def test_pflow_heun_beats_euler_at_equal_steps():
     assert errs[True] < errs[False]
 
 
-def test_sample_interior_returns_the_padded_middle(tiny_model):
+def test_sample_scene_returns_the_padded_middle(tiny_model):
     """Sampling must discard the border, where the score is not correct."""
-    out = sample_interior(
+    out = sample_scene(
         tiny_model, jax.random.key(10), out_size=12, n_samples=2,
         sde=VESDE(), sampler="pflow", n_steps=4,
     )
@@ -229,10 +229,10 @@ def test_sampling_will_not_invent_a_schedule(tiny_model):
     """``sde`` used to default to ``VESDE()``, a schedule no trained model has.
     Sampling ran, produced plausible noise, and reported nothing wrong."""
     with pytest.raises(TypeError):
-        sample_interior(tiny_model, jax.random.key(0), out_size=12, n_samples=1)
+        sample_scene(tiny_model, jax.random.key(0), out_size=12, n_samples=1)
 
 
 def test_unknown_sampler_rejected(tiny_model):
     with pytest.raises(ValueError, match="unknown sampler"):
-        sample_interior(tiny_model, jax.random.key(11), 12, VESDE(),
+        sample_scene(tiny_model, jax.random.key(11), 12, VESDE(),
                         sampler="nope")

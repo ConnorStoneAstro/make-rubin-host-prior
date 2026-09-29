@@ -165,7 +165,7 @@ def test_training_writes_a_log_and_a_final_checkpoint(tmp_path):
         for l in (tmp_path / "run" / "log.jsonl").read_text().splitlines()
     ]
     assert lines[0]["event"] == "start"
-    assert lines[0]["loss_margin"] == 4
+    assert lines[0]["loss_margin"] == 0
     assert lines[0]["n_parameters"] == n_parameters(model)
     assert (tmp_path / "run" / "final" / "ema.eqx").exists()
     assert (tmp_path / "run" / "config.json").exists()
@@ -248,7 +248,10 @@ def test_reloaded_model_gives_identical_scores(tmp_path):
     from rubin_host_prior.nn import score
 
     config = _config()
-    model = ConvEnergyNet(config.energy, key=jax.random.key(9))
+    # Built through the config, which is the only thing that knows the input
+    # offset: a hand-built ConvEnergyNet gets 0 while the reload rebuilds the
+    # skeleton from the saved config, and the scores would then differ.
+    model = config.build_model(jax.random.key(9))
     save_checkpoint(tmp_path / "ck", 1, config, model, model)
     back, _, _ = load_checkpoint(tmp_path / "ck")
     x = jax.random.normal(jax.random.key(10), (1, 20, 20))
@@ -327,14 +330,11 @@ def test_nominal_crop_is_derived_rather_than_stated():
     p = PatchConfig(native_size=224, out_size=64, pool_factor=3)
     assert p.nominal_crop == 192
     assert "nominal_crop" not in {f.name for f in dataclasses.fields(PatchConfig)}
-    # Translation room is not PatchConfig's to know: the window the crop has to
-    # keep inside the stamp includes 2R of context per side, and R is the
-    # energy's.  R = 2 here, so the window is (64 + 2*4) * 3 = 216 native.
-    assert not hasattr(p, "max_translate_native")
-    c = Config(energy=EnergyConfig(channels=((8,) * 2,), dilations=((1,) * 2,)),
-               patch=p)
-    assert c.fed_native() == 216
-    assert c.max_translate_native() == (224 - 216) // 2
+    # Translation room is PatchConfig's again.  It briefly moved to Config,
+    # when valid convolutions meant the window the crop had to keep inside the
+    # stamp included 2R of context per side; same-mode convolutions need no
+    # context, so it depends on the patch alone.
+    assert p.max_translate_native == 224 - 192
     with pytest.raises(ValueError, match="native_size .* must be >="):
         PatchConfig(native_size=100, out_size=64, pool_factor=3)
 
@@ -375,13 +375,13 @@ def test_setup_note_is_printed_and_reports_the_derived_crop(tmp_path, capsys):
           config, out_dir=tmp_path / "r")
     out = capsys.readouterr().out
     assert "branch 0: 3 x 3x3, dilations 1x1x1" in out
-    assert "loss crop = 2R = 6 px from every side" in out
-    # The report is given what the loader *feeds*, 16 + 2*6, so the interior it
-    # names is the nominal crop itself rather than something smaller.
-    assert "patch   28x28" in out
-    assert "loss on interior 16x16" in out
-    assert "out_size 16: fed 28 (84 native), context 6 px per side, all real sky" in out
-    assert "N + 12 px" in out
+    assert "score reach = 2R = 6 px" in out
+    # The report is given the grid itself: same-mode, so nothing is fed around
+    # it and nothing is cropped off it.
+    assert "grid   16x16" in out
+    assert "energy map 16x16" in out
+    assert "loss on every pixel" in out
+    assert "grid 16 (48 native), loss on 16" in out
 
 
 def test_setup_note_can_be_silenced(tmp_path, capsys):
@@ -399,19 +399,24 @@ def test_log_header_records_the_geometry(tmp_path):
     train(model, _varsize_batches(np.random.default_rng(0), (16, 24)), config,
           out_dir=tmp_path / "r", verbose=False)
     head = json.loads((tmp_path / "r" / "log.jsonl").read_text().splitlines()[0])
-    assert head["loss_margin"] == 4
+    assert head["loss_margin"] == 0
     assert head["receptive_radius"] == 2
     assert head["n_layers"] == 2
     assert head["training_sizes"] == [16, 24]
-    # The loader feeds size + 2*margin, so the loss lands on the size itself.
-    assert head["interior_sizes"] == [16, 24]
+    # No context and no crop, so the loss lands on the whole grid.
+    assert head["loss_sizes"] == [16, 24]
+    # And what the border costs: R = 2 reaches off a 16 px grid more often than
+    # off a 24 px one, so the padding's share falls as the grid grows.
+    a, b = head["padding_fraction"]
+    assert 0 < b < a < 1
+    assert head["input_offset"] == 0.0
 
 
-def _varsize_batches(rng, sizes, batch=4, margin=4):
-    """``sizes`` are loss-region sizes; what is yielded carries the context."""
+def _varsize_batches(rng, sizes, batch=4):
+    """``sizes`` are grid sizes; same-mode convolutions carry no context."""
     k = 0
     while True:
-        s = sizes[k % len(sizes)] + 2 * margin
+        s = sizes[k % len(sizes)]
         k += 1
         yield rng.normal(size=(batch, 1, s, s)).astype(np.float32) * 0.5
 
@@ -426,24 +431,23 @@ def test_variable_sizes_train_without_recompilation_errors(tmp_path):
     assert n_parameters(ema) == n_parameters(model)
 
 
-def test_usable_size_range_is_bounded_by_the_stamp_minus_the_context():
-    """The ceiling is ``native // pool - 4R``, not ``native // pool``.
+def test_usable_size_range_is_the_stamp_and_only_the_stamp():
+    """``native // pool``, with the reach nowhere in it.
 
-    It used to be the latter, on the reasoning that the loader could reflect
-    whatever context the stamp could not supply.  That is gone: the context is
-    real sky or it is an error, so R comes straight off the largest size a stamp
-    can serve -- four pixels of ceiling for every pixel of reach.
+    Under valid convolutions it was ``native // pool - 4R``, because every loss
+    pixel needed ``2R`` of real sky on each side; that capped a 512 px stamp at
+    R = 34 and is the reason the reach could not go past it.  Same-mode padding
+    removed the term entirely, which is what buys R = 78.
     """
     c = Config(energy=EnergyConfig(channels=((32,) * 8,), dilations=((1,) * 8,)),
                patch=PatchConfig(native_size=224, out_size=64,
                                  pool_factor=3))
     assert c.energy.receptive_radius == 8
-    assert c.usable_size_range() == (1, 74 - 32)   # 224 // 3, less 4R
+    assert c.usable_size_range() == (1, 74)   # 224 // 3
     deep = Config(energy=EnergyConfig(channels=((32,) * 20,), dilations=((1,) * 20,)),
                   patch=PatchConfig(native_size=224, out_size=64, pool_factor=3))
-    # R = 20 wants 80 px of context out of 74, so this stamp serves no size at
-    # all -- which is the honest answer, and used to read as "up to 74".
-    assert deep.usable_size_range() == (1, 0)
+    # R = 20 now, and it makes no difference to what sizes can be served.
+    assert deep.usable_size_range() == (1, 74)
 
 
 def test_the_default_architecture_is_the_one_that_gets_trained():
@@ -456,12 +460,11 @@ def test_the_default_architecture_is_the_one_that_gets_trained():
     assert c.energy.channels == (DEFAULT_CHANNELS,)
     assert c.energy.dilations == (DEFAULT_DILATIONS,)
     assert c.energy.n_branches == 1 and c.energy.residual
-    assert c.energy.receptive_radius == 30 and c.energy.loss_margin == 60
-    # and the loader will carry that much context for it, all of it real sky:
-    # 152 pooled px is 456 native, inside the 512 px stamp with room to translate.
-    assert c.patch.out_size + 2 * c.energy.loss_margin == 152
-    assert c.fed_native() == 456 <= c.patch.native_size
-    assert c.max_translate_native() == 28
+    assert c.energy.receptive_radius == 78
+    # Same-mode, so nothing is carried around the grid and nothing is cropped
+    # off it: the loader feeds 128 and the loss lands on all 128.
+    assert c.energy.loss_margin == 0
+    assert c.patch.out_size * c.patch.pool_factor == 256 <= c.patch.native_size
 
 
 def test_the_dilations_rise_through_a_doubling_series_and_come_back_down():
@@ -471,12 +474,15 @@ def test_the_dilations_rise_through_a_doubling_series_and_come_back_down():
     dilations after it are what mix those lattices back together."""
     from rubin_host_prior.config import DEFAULT_DILATIONS
 
-    assert DEFAULT_DILATIONS == (1, 2, 4, 8, 8, 4, 2, 1)
-    assert sum(DEFAULT_DILATIONS) == 30
+    assert DEFAULT_DILATIONS == (1, 2, 4, 8, 16, 32, 8, 4, 2, 1)
+    assert sum(DEFAULT_DILATIONS) == 78
     peak = DEFAULT_DILATIONS.index(max(DEFAULT_DILATIONS))
     up, down = DEFAULT_DILATIONS[: peak + 1], DEFAULT_DILATIONS[peak + 1 :]
-    assert up == (1, 2, 4, 8) and len(set(up)) == len(up)   # doubling, no repeats
-    assert down == tuple(reversed(up))                      # and back down again
+    assert up == (1, 2, 4, 8, 16, 32) and len(set(up)) == len(up)  # no repeats
+    # The tail halves back down, resuming below the peak rather than mirroring
+    # it: (32, 16) are not repeated, so the descent is reversed(up) from 8 on.
+    assert down == tuple(reversed(up))[2:]
+    assert all(b * 2 == a for a, b in zip(down, down[1:]))
     # Gap-free: after n layers of the ascent the reach is sum(up[:n]), and the
     # next dilation never exceeds 2 * reach + 1, so nothing is skipped over.
     reach = 0
@@ -515,55 +521,43 @@ def test_dilations_are_never_inferred():
         EnergyConfig(channels=((12, 12),))
 
 
-def test_real_context_is_what_the_stamp_has_left_over():
-    """How much of the 2R border is genuine sky, and where it runs out."""
-    c = Config(energy=EnergyConfig(channels=((32,) * 8,), dilations=((1,) * 8,)),      # R = 8, 2R = 16
-               patch=PatchConfig(native_size=384, out_size=96,
-                                 pool_factor=3))
-    assert c.energy.loss_margin == 16
-    # 384/3 = 128 pooled in the stamp, 96 of it cropped -> 16 left each side.
-    assert c.real_context(96) == pytest.approx(16.0)
-    assert c.real_context(64) == pytest.approx(32.0)   # a smaller crop leaves more
-    assert c.real_context(128) == pytest.approx(0.0)   # the crop fills the stamp
-    assert c.real_context(160) < 0                     # it does not even fit
-
-
 def test_check_sizes_flags_a_size_the_stamp_cannot_feed():
-    """The warning used to be that the border would be all reflection.  Now
-    there is no reflection to have, so it is that the loader will refuse the
-    batch -- said at config time rather than at the first step."""
+    """The size a stamp can serve is now just the crop, so the only way to fail
+    is to ask for more pixels than the stamp has -- which PatchConfig catches at
+    construction, and this pins that it is still the thing that catches it."""
     c = Config(energy=EnergyConfig(channels=((32,) * 8,), dilations=((1,) * 8,)),
                patch=PatchConfig(native_size=416, out_size=96,
                                  pool_factor=3))
-    assert c.fed_native() == 384 <= 416      # R = 8, so 96 + 32 pooled px
+    assert c.usable_size_range() == (1, 138)
     assert c.check_sizes() == []
 
-    c.patch = dataclasses.replace(c.patch, out_sizes=(96, 128))
-    assert any("size 128 needs 480 native px" in w for w in c.check_sizes())
-
-    # A size that does not fit the stamp never reaches check_sizes: PatchConfig
-    # refuses it outright, which is the better place for it.
-    with pytest.raises(ValueError, match="needs 192 native pixels"):
-        PatchConfig(native_size=96, out_size=32,
-                    pool_factor=3, out_sizes=(32, 64))
+    with pytest.raises(ValueError, match="native_size .* must be >="):
+        PatchConfig(native_size=200, out_size=96, pool_factor=3)
 
 
-def test_check_sizes_flags_a_crop_that_is_mostly_context():
-    """The efficiency warning now measures the fed patch against the loss
-    region, which is where the arithmetic actually goes."""
+def test_check_sizes_flags_a_grid_the_reach_has_outgrown():
+    """Past ``2R >= H`` every pixel already sees every other one, so more reach
+    adds no sky -- only padding.  The default architecture is deliberately
+    there, so this has to be a warning and not an error.
+    """
     c = Config(energy=EnergyConfig(channels=((32,) * 20,), dilations=((1,) * 20,)),   # R = 20, 2R = 40
                patch=PatchConfig(native_size=1024, out_size=16,
                                  pool_factor=3))
-    # fed 16 + 80 = 96 to train on 16: (16/96)^2 = 3%.
-    assert any("only 3% of the arithmetic" in w for w in c.check_sizes())
+    warnings = c.check_sizes()
+    assert any("reach past R = 8 adds no sky" in w for w in warnings)
+    assert any("% of the mean receptive field is zeros" in w for w in warnings)
+    # A grid wider than the reach says nothing.
+    big = Config(energy=c.energy,
+                 patch=PatchConfig(native_size=1024, out_size=128, pool_factor=3))
+    assert big.check_sizes() == []
 
 
-def test_report_marks_patches_that_are_mostly_margin():
+def test_report_marks_a_grid_the_reach_has_outgrown():
     from rubin_host_prior import geometry as geo
 
-    text = geo.report((40, 64), ((1,) * 8,))
-    assert "mostly margin" in text.split("patch   40")[1].split("\n")[0]
-    assert "mostly margin" not in text.split("patch   64")[1].split("\n")[0]
+    text = geo.report((16, 64), ((1,) * 8,))          # 2R = 16
+    assert "reach exceeds the grid" in text.split("grid   16")[1].split("\n")[0]
+    assert "reach exceeds the grid" not in text.split("grid   64")[1].split("\n")[0]
 
 
 def test_defaults_leave_room_for_translation():
@@ -571,17 +565,18 @@ def test_defaults_leave_room_for_translation():
     128 px patch) silently disables the translation augmentation, because the
     crop then fills the whole stamp.  The defaults must not be in that state."""
     c = Config()
-    assert c.patch.out_size == 32
-    assert c.max_translate_native() > 0
-    # An all-real context costs efficiency and check_sizes says so; what must
-    # not be there is the translation warning.
+    assert c.patch.out_size == 128 and c.patch.pool_factor == 2
+    # 512 - 128*2 = 256 native px, +/-25.6 arcsec.  It matters more than it used
+    # to: zero padding lets the network read its distance from the border, so
+    # moving the host is what stops it learning position instead of shape.
+    assert c.patch.max_translate_native == 256
     assert not any("translation" in w for w in c.check_sizes())
 
 
 def test_zero_translation_room_is_reported():
     c = Config(patch=PatchConfig(native_size=384, out_size=128,
                                  pool_factor=3))
-    assert c.max_translate_native() == 0
+    assert c.patch.max_translate_native == 0
     assert any("no room" in w for w in c.check_sizes())
 
 
@@ -657,7 +652,7 @@ def test_sampling_never_costs_a_run(tmp_path, monkeypatch):
     def boom(*a, **kw):
         raise RuntimeError("RESOURCE_EXHAUSTED: out of memory")
 
-    monkeypatch.setattr(sampler, "sample_interior", boom)
+    monkeypatch.setattr(sampler, "sample_scene", boom)
     config = _config(steps=2, n_checkpoints=1, n_samples=4, sample_steps=2)
     model = ConvEnergyNet(config.energy, key=jax.random.key(0))
     train(model, _batches(np.random.default_rng(0)), config,

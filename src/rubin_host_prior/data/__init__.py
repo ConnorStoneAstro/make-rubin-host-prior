@@ -1,6 +1,6 @@
 from .augment import N_DIHEDRAL, dihedral, random_dihedral
 from .dataset import PatchDataset, pool_shards, suggest_sigma_range
-from .diagnostics import autocorrelation, context_advice, correlation_length
+from .diagnostics import autocorrelation, reach_advice, correlation_length
 from .pooling import area_resample, block_mean, center_crop, pool_to_training_grid
 from .shards import META_DTYPES, ShardSet, ShardWriter
 from .transform import (LogFluxTransform, estimate_softening,
@@ -18,7 +18,7 @@ __all__ = [
     "autocorrelation",
     "block_mean",
     "center_crop",
-    "context_advice",
+    "reach_advice",
     "correlation_length",
     "dihedral",
     "log_softplus",

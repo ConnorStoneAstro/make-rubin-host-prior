@@ -78,19 +78,35 @@ def test_training_batch_shows_what_the_loader_yields(dataset, tmp_path):
     assert path.exists()
     drawn = [ax for ax in fig.axes if ax.images]
     assert len(drawn) == 9
-    # At the reference size *plus its context border*, because the figure shows
-    # what the network is fed; the title must name the other cycled sizes.
+    # The panel is the grid: no context border, so no red square and nothing
+    # discarded.  The title must still name the other cycled sizes.
     size = dataset.config.patch.out_size
-    margin = dataset.config.energy.loss_margin
-    assert drawn[0].images[0].get_array().shape[-1] == size + 2 * margin
-    # And the loss region is drawn on, or the border is indistinguishable from
-    # the data in a figure whose whole job is telling them apart.
-    box = drawn[0].patches[0]
-    assert box.get_width() == size and box.get_height() == size
-    assert box.get_xy() == (margin - 0.5, margin - 0.5)
-    assert box.get_edgecolor()[:3] == (1.0, 0.0, 0.0)
+    assert dataset.config.energy.loss_margin == 0
+    assert drawn[0].images[0].get_array().shape[-1] == size
+    assert len(drawn[0].patches) == 0
     assert "also cycles 16" in fig._suptitle.get_text()
     plt.close(fig)
+
+
+def test_training_batch_marks_a_loss_margin_when_there_is_one(dataset, tmp_path):
+    """The red square is not gone, it is conditional: raise the margin and the
+    figure says which pixels stopped counting."""
+    import dataclasses
+
+    original = dataset.config.energy
+    dataset.config.energy = dataclasses.replace(original, loss_margin=4)
+    try:
+        fig, _ = plots.plot_training_batch(dataset, n=4, out=tmp_path)
+        drawn = [ax for ax in fig.axes if ax.images]
+        box = drawn[0].patches[0]
+        size = dataset.config.patch.out_size - 8
+        assert box.get_width() == size and box.get_height() == size
+        assert box.get_xy() == (3.5, 3.5)
+        assert box.get_edgecolor()[:3] == (1.0, 0.0, 0.0)
+        assert "loss on the middle" in fig._suptitle.get_text()
+        plt.close(fig)
+    finally:
+        dataset.config.energy = original
 
 
 def test_transform_figure_marks_the_predicted_sky_position(dataset, tmp_path):

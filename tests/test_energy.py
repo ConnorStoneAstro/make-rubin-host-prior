@@ -44,13 +44,17 @@ def test_score_is_conservative(tiny_model):
     assert asym < 1e-4 * max(np.abs(jac).max(), 1e-8), f"asymmetry {asym}"
 
 
-def test_score_is_translation_equivariant_on_the_interior(tiny_model):
+def test_score_is_translation_equivariant_away_from_the_padding(tiny_model):
     """Rolling the scene rolls the score, away from the border.
 
-    Valid convolutions and a summed energy give exact translation equivariance;
-    only the finite border breaks it, which is why the loss is cropped.
+    Equivariance is now a *local* property, not a global one.  Valid
+    convolutions had it everywhere and only the finite border broke it; with
+    same-mode zero padding the border is filled with a constant that does not
+    move when the scene does, so a pixel is equivariant exactly when its ``2R``
+    reach holds no padding.  That is the price paid for scoring every pixel, and
+    it is why the model is size-locked.
     """
-    size, margin, shift = 30, tiny_model.loss_margin, 3
+    size, margin, shift = 30, 2 * tiny_model.receptive_radius, 3
     x = jax.random.normal(jax.random.key(3), (1, size, size))
     s0 = np.asarray(score(tiny_model, x, jnp.asarray(1.0)))
     s1 = np.asarray(score(tiny_model, jnp.roll(x, shift, axis=-1), jnp.asarray(1.0)))
@@ -89,7 +93,11 @@ def test_sigma_conditioning_is_spatially_constant():
     x = jnp.full((1, 24, 24), 0.2)
     a = np.asarray(model.energy_map(x, jnp.asarray(0.1)))[0]
     b = np.asarray(model.energy_map(x, jnp.asarray(3.0)))[0]
-    diff = b - a
+    # Away from the padding, where the input really is uniform: a cell within R
+    # of the border sees zeros the scene does not contain, so it is entitled to
+    # differ.  FiLM's spatial constancy is the claim, and it is made here.
+    r = model.receptive_radius
+    diff = (b - a)[r:-r, r:-r]
     assert np.allclose(diff, diff.flat[0], rtol=1e-4)
     assert abs(diff.flat[0]) > 0, "sigma has no effect at all"
 
@@ -176,13 +184,14 @@ def test_all_parameters_receive_gradients_at_step_zero(tiny_model):
     assert dead == [], f"leaves {dead} of {len(leaves)} got no gradient"
 
 
-def test_residual_blocks_preserve_valid_shapes():
+def test_residual_blocks_preserve_the_grid():
     model = ConvEnergyNet(
         EnergyConfig(channels=((8, 8, 8),), dilations=((1, 1, 1),), embed_dim=16, n_fourier=8, residual=True),
         key=jax.random.key(12),
     )
     x = jax.random.normal(jax.random.key(13), (1, 20, 20))
-    assert model.energy_map(x, jnp.asarray(1.0)).shape == (1, 14, 14)
+    # Same-mode, so the skip needs no crop and the grid is unchanged.
+    assert model.energy_map(x, jnp.asarray(1.0)).shape == (1, 20, 20)
     assert n_parameters(model) > 0
 
 
@@ -235,14 +244,20 @@ def test_a_sum_of_branches_is_still_one_energy():
     assert s_both == pytest.approx(s0 + s1, rel=1e-4, abs=1e-7)
 
 
-def test_the_short_branch_is_cropped_onto_the_long_one():
-    """Both branches contribute a map of the same size, so R is the longest
-    branch's and not the sum of anything."""
+def test_branches_of_different_reach_add_cell_for_cell():
+    """Same-mode padding leaves every branch's map the size of the scene, so a
+    short branch and a long one already agree cell for cell and simply add.
+
+    Under valid convolutions the short branch produced a *larger* map and had to
+    be centre-cropped onto the long one's grid; that crop is gone.  R is still
+    the longest branch's reach, and still not the sum of anything.
+    """
     model = _branched()
     assert model.receptive_radius == 8  # 1+2+4+1
     assert model.branches[0].radius == 2 and model.branches[1].radius == 8
-    emap = model.energy_map(jnp.zeros((1, 40, 40)), jnp.asarray(1.0))
-    assert emap.shape == (1, 40 - 16, 40 - 16)
+    for size in (40, 41):
+        emap = model.energy_map(jnp.zeros((1, size, size)), jnp.asarray(1.0))
+        assert emap.shape == (1, size, size)
 
 
 def test_the_long_branch_actually_reaches_further():
@@ -287,8 +302,8 @@ def test_dilation_keeps_the_score_translation_equivariant():
 
     for shift in (1, 2, 3, 5):
         moved = np.asarray(score(model, jnp.roll(scene, shift, axis=-1), sigma))
-        # Compare where neither crop nor the roll's wraparound interferes.
-        m = model.loss_margin
+        # Compare where neither the padding nor the roll's wraparound reaches.
+        m = 2 * model.receptive_radius
         a = base[0, m:-m, m : -m - shift]
         b = moved[0, m:-m, m + shift : -m]
         assert a == pytest.approx(b, rel=2e-4, abs=1e-6), f"shift {shift}"

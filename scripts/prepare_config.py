@@ -39,7 +39,7 @@ from rubin_host_prior.data import (
     estimate_softening,
     expected_sky_scatter,
     pool_shards,
-    context_advice,
+    reach_advice,
     suggest_sigma_range,
 )
 
@@ -245,22 +245,26 @@ def main() -> None:
             "softening scale is probably wrong."
         )
 
+    from rubin_host_prior import geometry
+
     lo, hi = config.usable_size_range()
     margin = config.energy.loss_margin
     size = config.patch.out_size
-    real = config.real_context(size)
+    R = config.energy.receptive_radius
+    pad = geometry.padding_fraction(size, config.energy.dilations,
+                                    config.energy.kernel_size)
     print(
-        f"\nR = {config.energy.receptive_radius} "
-        f"({config.energy.n_branches} branch(es), {config.energy.n_layers} "
-        f"layers), loss crop 2R = {margin} px per side"
+        f"\nR = {R} ({config.energy.n_branches} branch(es), "
+        f"{config.energy.n_layers} layers), score reach 2R = {2 * R} px"
     )
-    print(f"  out_size {size} trains on all {size} px; the loader is fed "
-          f"{config.fed_size()} ({config.fed_native()} of {config.patch.native_size} "
-          f"native px)")
-    print(f"  the {margin} px context per side is real sky -- {real:.0f} px is "
-          f"available, and the loader refuses a batch rather than reflect")
+    print(f"  grid {size} ({size * config.patch.pool_factor} of "
+          f"{config.patch.native_size} native px), loss on "
+          f"{size - 2 * margin} px")
+    print(f"  same-mode zero padding: {100 * pad:.0f}% of the mean receptive "
+          f"field is padding, and the input is centred on "
+          f"{config.input_offset:.2f} so those zeros sit at the sky")
     print(f"  sizes this stamp can serve: {lo} .. {hi}; translation room "
-          f"+/-{config.max_translate_native()} native px")
+          f"+/-{config.patch.max_translate_native // 2} native px")
     for w in config.check_sizes():
         print(f"  WARNING: {w}")
 
@@ -272,7 +276,7 @@ def main() -> None:
         f"  {cl['noise_fraction']:.0%} of the variance is the zero-lag noise "
         f"delta (excluded from xi)"
     )
-    print(f"  {context_advice(cl['xi'], margin)}")
+    print(f"  {reach_advice(cl['xi'], 2 * config.energy.receptive_radius)}")
     if cl["truncated"]:
         print(
             "  WARNING: the patches never decorrelate within their own size, so "

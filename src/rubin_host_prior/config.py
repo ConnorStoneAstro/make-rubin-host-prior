@@ -13,31 +13,35 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from . import geometry
+
 BANDS = ("u", "g", "r", "i", "z", "y")
 
 
-#: Eight layers at 64 channels, dilations up a doubling series and back down
-#: again, reach ``sum = 30``.  The descending tail is the standard de-gridding
-#: construction: a layer at dilation ``d`` samples a lattice of spacing ``d``,
-#: and the smaller dilations after it mix the lattices back together.
+#: Ten layers at 32 channels, dilations up a doubling series to 32 and back
+#: down, reach ``sum = 78``.  The ascent reaches, the descent de-grids: a layer
+#: at dilation ``d`` samples a lattice of spacing ``d``, and the smaller
+#: dilations after it mix the lattices back together.
 #:
-#: **R is chosen by the stamp, not by the architecture.**  A loss pixel's score
-#: depends on ``2R`` around it, so training it on real sky needs
-#: ``out_size + 4R`` pooled pixels of real sky, and a 512 native stamp at
-#: ``pool_factor`` 3 has 170.  At ``out_size`` 32 that caps R at 34.  Reach
-#: beyond that is not free and not neutral: it is bought with reflected sky, so
-#: the large-scale part of the score gets trained on a mirror symmetry that
-#: nature does not have -- which is the leading explanation for samples that
-#: contain only small structure.  ``Config`` raises rather than pad, so a
-#: config asking for more reach than the stamp can feed says so.
+#: **R is no longer bounded by the stamp**, because the convolutions are
+#: same-mode.  Under valid convolutions a loss pixel needed ``2R`` of real sky
+#: on every side, which capped R at 34 for a 512 px stamp; R = 78 was measured
+#: to leave a usable window of 16x16 on a 256 grid, i.e. nothing.  The cap is
+#: gone and the cost moved: at 128 px, 52% of the mean receptive field is now
+#: zero padding, and past ``2R = 128`` further reach buys only more of it.
 #:
-#: Two earlier architectures produced no large-scale structure: a wide undilated
-#: stack summed with a narrow dilated one (the long-range branch carried 25-60%
-#: of the score, so it was not being ignored), and a single 128-wide stack at
-#: R=36.  Both were fed a majority-reflected border, which neither diagnostic
-#: was looking at.
-DEFAULT_CHANNELS: tuple[int, ...] = (64,) * 8
-DEFAULT_DILATIONS: tuple[int, ...] = (1, 2, 4, 8, 8, 4, 2, 1)
+#: This is a demonstrator width.  32 channels is 191k parameters, half of the
+#: 64-channel run before it and a ninth of the 128-channel one; raise it for a
+#: production run, remembering that arithmetic goes as the square of the width.
+#:
+#: The sequence of failures behind this: a two-branch model (the long branch
+#: carried 25-60% of the score, so it was not being ignored), then a single
+#: 128-wide stack at R=36, both fed a majority-reflected border and both
+#: producing nothing above ~16 px.  Removing the reflection, at R=30 on all-real
+#: sky, finally gave faint elongated structure past 16 px -- the first positive
+#: signal -- which is what this trades resolution of the border for reach.
+DEFAULT_CHANNELS: tuple[int, ...] = (32,) * 10
+DEFAULT_DILATIONS: tuple[int, ...] = (1, 2, 4, 8, 16, 32, 8, 4, 2, 1)
 
 #: Said whenever `channels` and `dilations` disagree, because by far the most
 #: likely reason is that only one of them was given.
@@ -57,8 +61,8 @@ class EnergyConfig:
     energy maps are centre-cropped to a common size and added.  A sum of energies
     is an energy, so the score stays an exact gradient however many there are.
 
-    **The default is one branch**, ``DEFAULT_*``: eight layers at 64 channels
-    with a rise-and-fall dilation series, R = 30.  Several branches still work and are
+    **The default is one branch**, ``DEFAULT_*``: ten layers at 32 channels
+    with a rise-and-fall dilation series, R = 78.  Several branches still work and are
     tested -- the sum of any number of energies is an energy -- but the default
     is one, because a sum lets the branches compete to explain the same residual
     and nothing in the objective decides which should win.
@@ -89,7 +93,7 @@ class EnergyConfig:
     #: branch's reach is ``r * sum(dilations)``, so leaving it to be inferred
     #: would mean the single most consequential number in the geometry -- the
     #: loss crop follows from it -- was one nobody wrote down.
-    #: ``(1, 2, 4, 8, 8, 4, 2, 1)`` reaches R = 30 in eight layers, the
+    #: ``(1, 2, 4, 8, 16, 32, 8, 4, 2, 1)`` reaches R = 78 in ten layers, the
     #: descending tail mixing the coarse lattices back together.
     dilations: tuple[tuple[int, ...], ...] = (DEFAULT_DILATIONS,)
     kernel_size: int = 3
@@ -107,6 +111,17 @@ class EnergyConfig:
     #: add to its output.
     residual: bool = True
     sigma_scaling: str = "inverse_sigma"  # "inverse_sigma" | "none"
+    #: Pixels discarded from every side before the loss.  **Configured, not
+    #: derived.**  Under valid convolutions this was forced to ``2R``, because
+    #: outside that window a pixel's score was a different linear functional of
+    #: the weights and no amount of training could fix it.  Same-mode padding
+    #: gives every pixel a score, so the margin became a choice -- and the right
+    #: choice is 0: the model is size-locked, training and inference use the
+    #: same grid and the same zero padding, so the border is a fixed part of the
+    #: operator rather than an artefact. Cropping it would leave those pixels
+    #: untrained and their samples undefined.  Raise it only to test whether the
+    #: border is hurting the interior.
+    loss_margin: int = 0
 
     def __post_init__(self) -> None:
         flat = [c for c in self.channels if isinstance(c, int)]
@@ -158,10 +173,6 @@ class EnergyConfig:
         from . import geometry
 
         return geometry.receptive_radius(self.dilations, self.kernel_size)
-
-    @property
-    def loss_margin(self) -> int:
-        return 2 * self.receptive_radius
 
 
 @dataclass
@@ -242,14 +253,21 @@ class PatchConfig:
     ``native_size`` is deliberately larger than the crop.  The slack is what the
     loader translates within -- integer native-pixel shifts are exact, no
     interpolation, so they give sub-pooled-pixel positional augmentation for
-    free -- and it is also the only real sky available for the context border
-    the loss crop needs (see ``Config.real_context``).  At the defaults it is
-    512 - 384 = 128 native px, 42.7 pooled, split between the two sides.
+    free.  At the defaults it is 512 - 256 = 256 native px, +/-25.6 arcsec, and
+    it now matters more than it used to: same-mode padding lets the network read
+    its distance from the border, every stamp is centred on its host, and
+    without translation the two together let a model score well by learning
+    "bright blob in the middle" instead of anything about galaxies.  Moving the
+    host around the frame is the defence.
+
+    The context border is gone.  It existed because valid convolutions needed
+    ``2R`` of real sky on every side of the loss region; same-mode convolutions
+    give every pixel a score, so the loader feeds exactly ``out_size``.
     """
 
     native_size: int = 512  # pixels cut from the coadd
-    out_size: int = 32  # the reference training size, in pooled pixels
-    pool_factor: int = 3
+    out_size: int = 128  # the training grid, in pooled pixels
+    pool_factor: int = 2
     #: Extra training sizes.  Each batch is drawn at one size (a batch must be
     #: shape-homogeneous), cycling over ``training_sizes``.  Larger patches
     #: spend proportionally less of themselves on the cropped border, so mixing
@@ -276,6 +294,20 @@ class PatchConfig:
     def nominal_crop(self) -> int:
         """Native pixels feeding one training image: ``out_size * pool_factor``."""
         return self.out_size * self.pool_factor
+
+    @property
+    def max_translate_native(self) -> int:
+        """Native-pixel translation room, fixed at the *reference* size.
+
+        Back on ``PatchConfig``, where it belongs: with no context border there
+        is nothing outside the crop to keep on the stamp, so this depends on the
+        patch alone and not on the energy's reach.  Smaller training crops leave
+        more room, but letting them wander that far would change the data
+        distribution with size -- small patches would mostly land on blank sky
+        away from the host -- so the offset is capped at the reference size's
+        room and every size looks at the same neighbourhood.
+        """
+        return max(self.native_size - self.nominal_crop, 0)
 
     @property
     def training_sizes(self) -> tuple[int, ...]:
@@ -364,122 +396,80 @@ class Config:
     augment: AugmentConfig = field(default_factory=AugmentConfig)
     train: TrainConfig = field(default_factory=TrainConfig)
 
-    def fed_size(self, out_size: int | None = None) -> int:
-        """What the loader hands the model: ``out_size + 2 * loss_margin``.
+    @property
+    def input_offset(self) -> float:
+        """The sky level in ``x``: ``log(softening * log 2)``.
 
-        The loss crops ``2R`` from every side, so this is the size that leaves
-        exactly ``out_size`` behind.  One place rather than the four it was
-        spelled out in -- the trainer's report, its sampling canvas, the config
-        summary and ``check_sizes`` -- and the arithmetic itself still lives in
-        ``geometry``, which is the module that exists for it.
+        Subtracted from the scene before the first layer so the zeros the
+        convolutions pad with sit at the sky rather than 5-10 sigma below it.
+        Computed from the softening the config already stores rather than being
+        a field of its own, so there is no second number to drift.  Zero when
+        the softening has not been measured yet, which is the honest answer:
+        there is no sky level until there is a transform.
         """
-        from . import geometry
+        from math import log
 
-        out_size = self.patch.out_size if out_size is None else out_size
-        return geometry.min_input_for_region(
-            out_size, self.energy.dilations, self.energy.kernel_size
-        )
+        s = self.transform.softening
+        return log(s * log(2.0)) if s else 0.0
 
-    def fed_native(self, out_size: int | None = None) -> int:
-        """Native pixels the loader must read to serve one training image.
+    def build_model(self, key):
+        """The sanctioned way to construct the energy from a config.
 
-        ``fed_size * pool_factor``: the loss region plus the ``2R`` of context
-        on every side that the loss will crop away again.  **Every one of them
-        has to be real sky** -- see ``data.pooling.pool_to_training_grid``, which
-        raises rather than invent the shortfall.
+        ``ConvEnergyNet`` needs ``input_offset``, which is the transform's sky
+        level and therefore belongs to no single sub-config.  Building the model
+        by hand with ``ConvEnergyNet(config.energy, key=...)`` silently gets an
+        offset of 0, and since a checkpoint's skeleton is rebuilt from the saved
+        config, the reloaded model would then compute different scores from the
+        same weights.  Going through here is what makes those two agree.
         """
-        return self.fed_size(out_size) * self.patch.pool_factor
+        from .nn.energy import ConvEnergyNet
 
-    def max_translate_native(self) -> int:
-        """Native px the crop may wander, keeping the fed window on real sky.
-
-        This cannot live on ``PatchConfig``: the window includes ``2R`` of
-        context per side and ``R`` is the energy's.  Taken at the *largest*
-        training size, which serves both purposes at once -- it is the size with
-        the least room, so no size can walk its context off the stamp, and every
-        size then looks at the same neighbourhood rather than small crops roaming
-        out onto blank sky.
-        """
-        largest = max(self.patch.training_sizes)
-        return max((self.patch.native_size - self.fed_native(largest)) // 2, 0)
-
-    def sample_size(self) -> int:
-        """Pooled px of scene a checkpoint sample grid should show: ``4R``.
-
-        **Not ``out_size``.**  That is the loss region, and the stamp caps it --
-        at the defaults it is 32 px while the score reaches ``2R = 60``, so a
-        sample the size of the loss region could not display the largest
-        structure the model is even able to represent, and "no large-scale
-        structure in the samples" would be a statement about the figure.  At
-        inference the canvas costs nothing but compute, since nothing has to
-        come off the sky, so it is set by the architecture instead: twice the
-        reach, which shows a feature at the reach with room either side of it.
-        """
-        return max(self.patch.out_size, 2 * self.energy.loss_margin)
-
-    def real_context(self, out_size: int | None = None) -> float:
-        """Pooled px of genuine sky either side of a centred nominal crop.
-
-        The loss discards ``2R`` from every side, so the loader carries that
-        much context along, and all of it must be real: anything less is an
-        error, not a reflected border.  So this is ``>= loss_margin`` for any
-        config that can serve ``out_size`` at all, and the excess is the room
-        translation wanders in.  Note that a crop is not always centred:
-        translation moves real context from one side to the other, it does not
-        create more.
-        """
-        p = self.patch
-        out_size = p.out_size if out_size is None else out_size
-        return (p.native_size / p.pool_factor - out_size) / 2
+        return ConvEnergyNet(self.energy, input_offset=self.input_offset, key=key)
 
     def usable_size_range(self) -> tuple[int, int]:
-        """``(smallest, largest)`` training size this config can actually serve.
+        """``(smallest, largest)`` training size this config can serve.
 
-        The loader carries ``2R`` of context on every side and none of it may be
-        invented, so the whole fed window -- ``out_size + 4R`` pooled pixels --
-        has to come out of the stamp.  That is the binding constraint, and it is
-        much tighter than the nominal crop alone: at R = 30 a 512 px stamp at
-        pool 3 serves 170 pooled px, of which 120 are context.
+        Just the stamp now: the crop is ``out_size * pool_factor`` native pixels
+        and it has to come out of ``native_size``.  Under valid convolutions
+        this also had to hold ``4R`` of context, which capped a 512 px stamp at
+        34 px of reach; same-mode padding removed that, which is the whole
+        reason the reach could go to 78.
         """
         p = self.patch
-        return 1, max(p.native_size // p.pool_factor - 4 * self.energy.receptive_radius, 0)
+        return 1, p.native_size // p.pool_factor
 
     def check_sizes(self) -> list[str]:
         """Warnings about the configured training sizes; empty means fine."""
         _, hi = self.usable_size_range()
         margin = self.energy.loss_margin
+        R = self.energy.receptive_radius
         out = []
-        # PatchConfig rejects a *nominal crop* bigger than the stamp at
-        # construction; what it cannot see is the context, which is four times
-        # R again and is where the room actually goes.
+        # A size that does not fit the stamp cannot get here: PatchConfig
+        # rejects it at construction, and dataclasses.replace re-runs that.
         for s in self.patch.training_sizes:
-            if self.fed_native(s) > self.patch.native_size:
+            if 2 * R >= s:
                 out.append(
-                    f"size {s} needs {self.fed_native(s)} native px -- {s} for "
-                    f"the loss and {margin} pooled px of context on every side "
-                    f"-- but the stamp is {self.patch.native_size}. The loader "
-                    f"will refuse it rather than reflect the shortfall. Reduce "
-                    f"out_size to {hi} or below, cut R (now "
-                    f"{self.energy.receptive_radius}), or extract larger stamps."
+                    f"size {s} is smaller than the score's reach 2R = {2 * R}: "
+                    f"every pixel already sees every other one, so reach past "
+                    f"R = {s // 2} adds no sky, only padding -- "
+                    f"{100 * geometry.padding_fraction(s, self.energy.dilations, self.energy.kernel_size):.0f}% "
+                    f"of the mean receptive field is zeros. Deliberate if you "
+                    f"are over-providing reach; otherwise cut R or train on a "
+                    f"larger grid (this stamp serves {hi})."
                 )
-            frac = (s / self.fed_size(s)) ** 2
-            if frac < 0.10:
+            if margin and 2 * margin >= s:
                 out.append(
-                    f"size {s} is fed {self.fed_size(s)} px to train on {s} -- "
-                    f"only {100 * frac:.0f}% of the arithmetic reaches the "
-                    f"loss. This is the price of an all-real context and it "
-                    f"cannot be tuned away here: the stamp caps out_size at "
-                    f"{hi}, so this config's ceiling is "
-                    f"{100 * (hi / self.fed_size(hi)) ** 2:.0f}%. To do better, "
-                    f"extract larger stamps or cut R."
+                    f"size {s} has no loss region left after cropping {margin} "
+                    f"px from every side. Reduce energy.loss_margin."
                 )
-        if self.augment.translate and self.max_translate_native() == 0:
+        if self.augment.translate and self.patch.max_translate_native == 0:
             out.append(
-                f"translation augmentation has no room: the fed window "
-                f"({self.fed_native()} native px) fills the stamp "
-                f"({self.patch.native_size}). Enlarge native_size, or reduce "
-                f"out_size or R -- translation is exact and free, so losing it "
-                f"silently is a waste."
+                f"translation augmentation has no room: native_size "
+                f"({self.patch.native_size}) equals out_size * pool_factor. "
+                f"Enlarge native_size or reduce out_size -- translation is exact "
+                f"and free, and with zero-padded convolutions it is also what "
+                f"stops the model learning the host's position instead of its "
+                f"shape."
             )
         return out
 

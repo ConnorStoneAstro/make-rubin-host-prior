@@ -1,10 +1,15 @@
 """Samplers for the reverse process.
 
-A warning specific to this architecture: the score is only correct on the
-interior (see ``geometry``).  Sampling a canvas of size ``H`` therefore yields a
-scene whose outer ``2R`` pixels are not drawn from the prior.  **Generate a
-canvas larger than you need and keep the middle.**  ``sample_interior`` does this
-for you.
+A warning specific to this architecture: the model is **size-locked**.  Its
+convolutions are same-mode and zero-padded, so it will happily run on any grid,
+but the padding it learned to expect belongs to the grid it was trained on.
+Sample at ``PatchConfig.out_size`` and nothing else; a different size is not a
+different view of the same prior, it is a different operator.
+
+This used to say the opposite -- generate a canvas larger than you need and keep
+the middle -- which was right for valid convolutions, where the outer ``2R``
+pixels had a truncated score.  Same-mode padding scores every pixel, so there is
+nothing to throw away and nothing to enlarge.
 """
 
 from __future__ import annotations
@@ -127,7 +132,7 @@ def reverse_sde_sample(
     return x
 
 
-def sample_interior(
+def sample_scene(
     model: ConvEnergyNet,
     key: PRNGKeyArray,
     out_size: int,
@@ -136,22 +141,22 @@ def sample_interior(
     sampler: str = "pflow",
     **kwargs,
 ) -> Float[Array, "b c h w"]:
-    """Sample an ``out_size`` scene correctly, by generating a padded canvas.
+    """Sample an ``out_size`` scene.  Pass the grid the model was trained on.
 
-    The canvas is ``out_size + 4R`` on a side and only the centre is returned,
-    so every returned pixel had a fully supported score throughout sampling.
+    No canvas and no crop: same-mode convolutions score every pixel, so the
+    scene that comes out is the scene that was asked for.  The predecessor,
+    ``sample_interior``, generated ``out_size + 4R`` and kept the middle, which
+    is what valid convolutions needed and would now be actively wrong -- the
+    padding is part of the operator, so a larger canvas puts it somewhere the
+    model has never seen it.
 
     ``sde`` is required.  It used to default to ``VESDE()``, whose own field
     defaults are a schedule no trained model has: sampling would run, produce
     plausible-looking noise, and report nothing wrong.
     """
-    margin = model.loss_margin
-    canvas = out_size + 2 * margin
-    shape = (n_samples, model.config.in_channels, canvas, canvas)
+    shape = (n_samples, model.config.in_channels, out_size, out_size)
     if sampler == "pflow":
-        x = pflow_sample(model, key, shape, sde, **kwargs)
-    elif sampler == "sde":
-        x = reverse_sde_sample(model, key, shape, sde, **kwargs)
-    else:
-        raise ValueError(f"unknown sampler {sampler!r}; use 'pflow' or 'sde'")
-    return x[..., margin:-margin, margin:-margin]
+        return pflow_sample(model, key, shape, sde, **kwargs)
+    if sampler == "sde":
+        return reverse_sde_sample(model, key, shape, sde, **kwargs)
+    raise ValueError(f"unknown sampler {sampler!r}; use 'pflow' or 'sde'")

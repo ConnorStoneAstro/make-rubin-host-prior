@@ -225,28 +225,25 @@ def train(
     out.mkdir(parents=True, exist_ok=True)
     config.save(out / "config.json")
 
-    # The crop is a function of the architecture, never a configured number.
-    # Print it, so that changing the dilations or the kernel size announces what
-    # it did rather than silently changing how much of each patch is trained on.
+    # Reach is a function of the architecture and the loss margin is not, so the
+    # report takes both.  Print it, so that changing the dilations, the kernel
+    # size or the margin announces what it did.
     margin = model.loss_margin
     sizes = config.patch.training_sizes
-    # The loader carries `margin` pixels of context on every side, so what the
-    # net is fed is larger than the size that is trained on and the loss lands
-    # on exactly the nominal crop.
-    fed = tuple(config.fed_size(s) for s in sizes)
-    setup = geometry.report(fed, model.config.dilations, model.config.kernel_size)
+    setup = geometry.report(sizes, model.config.dilations,
+                            model.config.kernel_size, margin)
     if verbose:
         print(setup)
         for size in sizes:
-            print(f"  out_size {size}: fed {config.fed_size(size)} "
-                  f"({config.fed_native(size)} native), context {margin} px per "
-                  f"side, all real sky")
+            print(f"  grid {size} ({size * config.patch.pool_factor} native), "
+                  f"loss on {size - 2 * margin}, host free to move "
+                  f"+/-{config.patch.max_translate_native // 2} native px")
         if len(sizes) > 1:
             print(f"  {len(sizes)} training sizes -> {len(sizes)} jit compilations "
                   f"of the train step, cycled round-robin across batches")
         # Step cost scales with batch x H^2, so this is the number to watch when
         # a bigger patch size starts exhausting device memory.
-        biggest = max(fed)
+        biggest = max(sizes)
         print(f"  batch {cfg.batch_size} x {biggest}x{biggest} = "
               f"{cfg.batch_size * biggest ** 2:,} score pixels per step "
               f"(cost scales with this; halve the batch if memory is tight)")
@@ -307,14 +304,12 @@ def train(
         if cfg.n_samples:
             # Said up front, because it is easy to ask for far more than
             # intended and the first checkpoint is a long way into the run.
-            # The same relation as the training patch: 2R of valid context on
-            # every side.  The loader supplies it from the stamp, the sampler
-            # generates it and throws it away.
-            canvas = config.fed_size(config.sample_size())
-            print(f"  each draws {cfg.n_samples} samples on a {canvas}x{canvas} "
-                  f"canvas ({config.sample_size()} + 4R) in "
-                  f"{2 * cfg.sample_steps} batched backward passes; "
-                  f"--n-samples 0 to skip")
+            # The grid is the training grid and cannot be anything else: the
+            # model is size-locked by its own padding.
+            grid = config.patch.out_size
+            print(f"  each draws {cfg.n_samples} samples on the {grid}x{grid} "
+                  f"training grid in {2 * cfg.sample_steps} batched backward "
+                  f"passes; --n-samples 0 to skip")
         else:
             print("  no samples (n_samples = 0)")
     log_path = out / "log.jsonl"
@@ -332,16 +327,16 @@ def train(
             "receptive_radius": model.receptive_radius,
             "loss_margin": margin,
             "training_sizes": list(sizes),
-            "fed_sizes": list(fed),
-            # What the loss is actually computed on.  With the loader carrying
-            # 2R of context this is the nominal crop itself; it is recorded
-            # rather than assumed so a log line still says so if that changes.
-            "interior_sizes": [
-                geometry.interior_size(
-                    f, model.config.dilations, model.config.kernel_size)
-                for f in fed
+            # What the loss is actually computed on, and how much of the mean
+            # receptive field is zero padding rather than sky -- the two numbers
+            # that describe a same-mode model's geometry.
+            "loss_sizes": [s - 2 * margin for s in sizes],
+            "padding_fraction": [
+                round(geometry.padding_fraction(
+                    s, model.config.dilations, model.config.kernel_size), 3)
+                for s in sizes
             ],
-            "real_context": [round(config.real_context(s), 2) for s in sizes],
+            "input_offset": round(model.input_offset, 4),
             "sigma_min": sde.sigma_min,
             "sigma_max": sde.sigma_max,
             "start_step": start_step,
@@ -489,12 +484,12 @@ def _write_samples(ema_model, sde, config: Config, out: Path, step: int,
     cfg = config.train
     t0 = time.time()
     try:
-        from ..diffusion.sampler import sample_interior
+        from ..diffusion.sampler import sample_scene
 
-        x = sample_interior(
+        x = sample_scene(
             ema_model,
             jax.random.fold_in(key, step),
-            out_size=config.sample_size(),
+            out_size=config.patch.out_size,
             n_samples=cfg.n_samples,
             sde=sde,
             n_steps=cfg.sample_steps,
@@ -535,10 +530,7 @@ def _check_batch(batch: jnp.ndarray, model: ConvEnergyNet) -> None:
     need = 2 * model.loss_margin + 1
     if min(h, w) < need:
         raise ValueError(
-            f"patches are {h}x{w} but a model with R = {model.receptive_radius} "
-            f"needs more than 4R = {need - 1} pixels per side to leave any "
-            f"interior for the loss. The loader carries 2R = "
-            f"{model.loss_margin} px of context on every side for exactly this "
-            f"reason, so a batch this small means it was built with the wrong "
-            f"margin -- PatchDataset.make_batch takes it from config.energy."
+            f"patches are {h}x{w} but the configured loss margin is "
+            f"{model.loss_margin} px per side, which leaves nothing to compute "
+            f"a loss on. Reduce energy.loss_margin, or feed a larger grid."
         )

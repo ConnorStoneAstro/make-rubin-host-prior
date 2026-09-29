@@ -7,10 +7,17 @@ network that merely approximates one.  The practical consequences: the implied
 log-density is path-independent, the Jacobian of the score is symmetric, and you
 can evaluate relative log-probabilities of scenes directly.
 
-Because every convolution is "valid", the network is translation-equivariant and
-has no zero-padding border artefacts, and it accepts any input at least
-``min_input_size`` pixels on a side.  See ``geometry`` for the arithmetic, and in
-particular for why the loss is restricted to an interior window.
+Every convolution is **same-mode and zero-padded**, so the energy map is the
+size of the scene and every pixel has a score.  The price is that the network is
+no longer translation-equivariant -- it can read its distance from the border --
+and is therefore **size-locked**: a model trained on a 128x128 grid is a prior
+over 128x128 scenes and is not defined on any other size.  ``geometry`` has the
+reach arithmetic and what fraction of it lands on padding.
+
+This replaced valid-mode convolutions, which were equivariant and size-agnostic
+but needed ``2R`` pixels of real context on every side of the loss region.  At
+``R = 78`` that is 156 px per side, which no 512 px stamp can supply: measured,
+the usable window on a 256 grid was 16x16.
 """
 
 from __future__ import annotations
@@ -26,7 +33,7 @@ from .layers import ConvBlock, SigmaEmbedding
 
 
 class EnergyBranch(eqx.Module):
-    """One stack of valid convolutions ending in a 1x1 head.
+    """One stack of same-mode convolutions ending in a 1x1 head.
 
     Complete on its own, so its contribution is already a scalar field over the
     scene -- which is what makes summing several of them still an energy, and
@@ -97,22 +104,40 @@ class EnergyBranch(eqx.Module):
 
 
 class ConvEnergyNet(eqx.Module):
-    """Parallel stacks of valid convolutions, summed into a scalar energy.
+    """Parallel stacks of same-mode convolutions, summed into a scalar energy.
 
-    One branch is the ordinary case.  A second, narrow, heavily dilated branch
-    is how the model gets a scale the first cannot reach: see ``EnergyConfig``
-    for why dilation rather than pooling, and ``geometry`` for what the extra
-    reach costs in crop.
+    One branch is the ordinary case.  Several still work -- a sum of energies is
+    an energy -- and now simply add cell for cell, since same-mode padding
+    leaves every branch's map the size of the scene.  See ``EnergyConfig`` for
+    why dilation rather than pooling.
     """
 
     branches: tuple[EnergyBranch, ...]
     embed: SigmaEmbedding
     config: EnergyConfig = eqx.field(static=True)
+    #: Subtracted from the scene before the first layer, so that the zeros the
+    #: convolutions pad with sit at the sky rather than far below it.
+    #:
+    #: ``x`` is absolute log flux: the sky sits at ``log(s * log 2)``, around
+    #: +2.6 to +3.5 depending on depth, and a padded zero is ``exp(0) = 1 nJy``
+    #: -- five to ten sigma below the sky, a hard black frame the data never
+    #: contains.  Subtracting a constant leaves ``-grad_x E`` unchanged by the
+    #: chain rule, so this costs nothing in correctness and turns the worst
+    #: discontinuity in the network into a mild one.
+    #:
+    #: Static, like the Fourier basis and for the same reason: it is pytree
+    #: metadata, so it must come from the config that travels with the
+    #: checkpoint rather than from anything the optimiser or a deserialise
+    #: could reach.  ``Config.input_offset`` computes it from the measured
+    #: softening; it is not stored twice.
+    input_offset: float = eqx.field(static=True)
 
-    def __init__(self, config: EnergyConfig, *, key: PRNGKeyArray):
+    def __init__(self, config: EnergyConfig, *, input_offset: float = 0.0,
+                 key: PRNGKeyArray):
         if config.sigma_scaling not in ("inverse_sigma", "none"):
             raise ValueError(f"bad sigma_scaling {config.sigma_scaling!r}")
         self.config = config
+        self.input_offset = float(input_offset)
         keys = jax.random.split(key, config.n_branches + 1)
         # One embedding shared by every branch: it is a function of sigma alone,
         # so a copy per branch would be the same function learned twice -- and
@@ -151,39 +176,24 @@ class ConvEnergyNet(eqx.Module):
     def loss_margin(self) -> int:
         return self.config.loss_margin
 
-    @property
-    def min_input_size(self) -> int:
-        return 2 * self.receptive_radius + 1
-
     # -- forward ----------------------------------------------------------
 
     def energy_map(
         self, x: Float[Array, "c h w"], sigma: Float[Array, ""]
     ) -> Float[Array, "1 e e"]:
-        """The per-cell energy density, before summation.  Useful for diagnostics."""
-        # Without this check an undersized scene produces a zero-size energy map,
-        # so the energy is sum([]) == 0 and the score is identically zero -- valid
-        # arrays all the way down, and silently meaningless.
-        h, w = x.shape[-2:]
-        need = self.min_input_size
-        if min(h, w) < need:
-            raise ValueError(
-                f"scene is {h}x{w} but this architecture has a receptive radius "
-                f"of {self.receptive_radius}, so it needs at least {need} pixels "
-                f"per side"
-            )
+        """The per-cell energy density, before summation.  Useful for diagnostics.
+
+        Same shape as the scene, because the convolutions are same-mode.  The
+        scene is centred on ``input_offset`` first -- see the field.
+        """
         emb = self.embed(jnp.asarray(sigma))
-        radius = self.receptive_radius
+        h = x - self.input_offset
         total = None
         for branch in self.branches:
-            m = branch(x, emb)
-            # Centre-crop every branch to the longest one's map.  Cropped this
-            # way each cell sits on the same input centre whatever its reach,
-            # which is what leaves the loss margin at 2R of the *longest* branch
-            # rather than something larger.
-            c = radius - branch.radius
-            if c:
-                m = m[:, c:-c, c:-c]
+            # No centre-crop: same-mode convolutions leave every branch's map
+            # the size of the scene, so branches of different reach already
+            # agree cell for cell and simply add.
+            m = branch(h, emb)
             total = m if total is None else total + m
         return total
 

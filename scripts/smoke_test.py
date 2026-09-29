@@ -36,12 +36,12 @@ from rubin_host_prior.data import (
     estimate_softening,
     expected_sky_scatter,
     pool_shards,
-    context_advice,
+    reach_advice,
     suggest_sigma_range,
 )
 from rubin_host_prior.data.synthetic import write_synthetic_shards
-from rubin_host_prior.diffusion import VESDE, mean_dsm_loss, sample_interior
-from rubin_host_prior.nn import ConvEnergyNet, n_parameters
+from rubin_host_prior.diffusion import VESDE, mean_dsm_loss, sample_scene
+from rubin_host_prior.nn import n_parameters
 from rubin_host_prior.training import load_checkpoint, train
 
 
@@ -81,10 +81,9 @@ def main() -> None:
         channels=((32,) * args.n_layers,),
         dilations=(wedge(args.n_layers),),
     )
-    # The stamp has to hold the whole fed window -- out_size + 4R pooled px --
-    # because the loader will not reflect a shortfall.  32 native px of slack on
-    # top, so translation augmentation has somewhere to go.
-    native = (args.out_size + 4 * energy.receptive_radius) * 3 + 32
+    # The stamp holds the crop plus slack for translation -- same-mode
+    # convolutions need no context border, so the crop is the whole story.
+    native = args.out_size * 2 + 32
 
     t0 = time.time()
     write_synthetic_shards(
@@ -99,7 +98,7 @@ def main() -> None:
 
     config = Config()
     config.patch.out_size = args.out_size
-    config.patch.pool_factor = 3
+    config.patch.pool_factor = 2
     config.patch.native_size = shards.native_size
     if args.out_sizes:
         config.patch = dataclasses.replace(
@@ -129,10 +128,10 @@ def main() -> None:
     print(f"    sigma range [{config.sde.sigma_min:.4f}, {config.sde.sigma_max:.2f}]"
           f" about data mean {config.sde.data_mean:.2f}")
     cl = dataset.correlation_length(128)
-    print(f"    {context_advice(cl['xi'], config.energy.loss_margin)}"
+    print(f"    {reach_advice(cl['xi'], 2 * config.energy.receptive_radius)}"
           f"   ({cl['noise_fraction']:.0%} of variance is noise)")
 
-    model = ConvEnergyNet(config.energy, key=jax.random.key(0))
+    model = config.build_model(jax.random.key(0))
     print(f"[3] {n_parameters(model):,} parameters; "
           f"training sizes {config.patch.training_sizes}")
 
@@ -163,7 +162,7 @@ def main() -> None:
           f"{n_parameters(reloaded):,} parameters")
 
     t0 = time.time()
-    x = sample_interior(
+    x = sample_scene(
         reloaded, jax.random.key(1), out_size=args.out_size, n_samples=4,
         sde=VESDE.from_config(cfg2.sde), n_steps=64,
     )

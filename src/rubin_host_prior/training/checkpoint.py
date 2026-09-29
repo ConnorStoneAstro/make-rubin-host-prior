@@ -50,7 +50,7 @@ def load_checkpoint(
     config = Config.load(d / "config.json")
     step = json.loads((d / "state.json").read_text())["step"]
     # Any key works: every leaf is overwritten by the deserialised values.
-    skeleton = ConvEnergyNet(config.energy, key=jax.random.key(0))
+    skeleton = config.build_model(jax.random.key(0))
     name = {"ema": "ema.eqx", "model": "model.eqx"}[which]
     path = d / name
     if not path.exists():  # e.g. trained with ema disabled

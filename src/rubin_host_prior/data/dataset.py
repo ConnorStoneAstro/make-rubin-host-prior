@@ -92,18 +92,12 @@ class PatchDataset:
         translate: bool,
         scale_jitter: float,
         out_size: int | None = None,
-        context: int = 0,
     ) -> np.ndarray:
-        """Pooled flux in nJy, before the log transform.
-
-        ``context`` is the border the loss will crop away again; 0 gives the
-        nominal crop alone, which is what the diagnostics want.
-        """
+        """Pooled flux in nJy, before the log transform."""
         p = self.config.patch
         out_size = p.out_size if out_size is None else out_size
         stamps = self._native_stamps(indices)
-        side = out_size + 2 * context
-        out = np.empty((len(indices), side, side), dtype=np.float32)
+        out = np.empty((len(indices), out_size, out_size), dtype=np.float32)
         for i in range(len(indices)):
             out[i] = pool_to_training_grid(
                 stamps[i],
@@ -112,8 +106,7 @@ class PatchDataset:
                 rng=rng,
                 translate=translate,
                 scale_jitter=scale_jitter,
-                max_translate=self.config.max_translate_native(),
-                context=context,
+                max_translate=p.max_translate_native,
             )
         return out
 
@@ -124,9 +117,8 @@ class PatchDataset:
         translate: bool,
         scale_jitter: float,
         out_size: int | None = None,
-        context: int = 0,
     ) -> np.ndarray:
-        out = self._pool(indices, rng, translate, scale_jitter, out_size, context)
+        out = self._pool(indices, rng, translate, scale_jitter, out_size)
         # Pool in flux, THEN take the log.
         return self.transform.forward(out)
 
@@ -136,29 +128,22 @@ class PatchDataset:
         rng: np.random.Generator | None = None,
         augment: bool = True,
         out_size: int | None = None,
-        context: int | None = None,
     ) -> np.ndarray:
-        """``(B, 1, S, S)`` float32 in the log representation, ``S = out_size +
-        2 * context``.
+        """``(B, 1, S, S)`` float32 in the log representation, ``S = out_size``.
 
-        ``context`` defaults to the architecture's ``loss_margin``, so the loss
-        lands on exactly ``out_size``.  Every pixel of it is real sky, context
-        included -- the loader raises rather than reflect a shortfall, so a
-        config whose reach outruns the stamp fails at the first batch instead of
-        training the coarse score on a mirror symmetry.  The diagnostics pass 0,
-        which needs no context at all.
+        The loader used to carry ``2 * loss_margin`` of context on every side,
+        because valid convolutions scored only the interior.  Same-mode
+        convolutions score every pixel, so a batch is exactly the crop -- and
+        the reflected border that context sometimes needed is gone with it.
         """
         aug = self.config.augment
         out_size = self.config.patch.out_size if out_size is None else out_size
-        if context is None:
-            context = self.config.energy.loss_margin
         x = self._pool_and_transform(
             indices,
             rng,
             translate=augment and aug.translate,
             scale_jitter=aug.scale_jitter if augment else 0.0,
             out_size=out_size,
-            context=context,
         )
         if augment and aug.dihedral:
             if rng is None:
@@ -214,14 +199,14 @@ class PatchDataset:
         """
         rng = np.random.default_rng(seed)
         idx = np.sort(rng.choice(len(self), size=min(n, len(self)), replace=False))
-        x = self.make_batch(idx, rng=rng, augment=False, context=0)[:, 0]
+        x = self.make_batch(idx, rng=rng, augment=False)[:, 0]
         return correlation_length(x)
 
     def stats(self, n: int = 512, seed: int = 0) -> dict:
         """Summary of the log-space data. Read this before setting sigma_min/max."""
         rng = np.random.default_rng(seed)
         idx = np.sort(rng.choice(len(self), size=min(n, len(self)), replace=False))
-        x = self.make_batch(idx, rng=rng, augment=False, context=0)[:, 0]
+        x = self.make_batch(idx, rng=rng, augment=False)[:, 0]
         # Most pixels in a patch are sky, so the 16-84 half-width is the sky
         # scatter.  Taken across all the bands at once, which is meaningful
         # again now there is a single softening scale: every band's sky sits at

@@ -36,9 +36,9 @@ import jax
 from rubin_host_prior.config import Config
 from rubin_host_prior.selection import ExtractionConfig
 from rubin_host_prior.data import (LogFluxTransform, PatchDataset, ShardSet,
-                                   context_advice)
+                                   reach_advice)
 from rubin_host_prior.diffusion import VESDE
-from rubin_host_prior.nn import ConvEnergyNet, n_parameters
+from rubin_host_prior.nn import n_parameters
 from rubin_host_prior.training import train
 
 
@@ -160,11 +160,11 @@ def main() -> None:
         shards, config, transform, max_in_memory_gb=args.max_in_memory_gb
     )
 
-    model = ConvEnergyNet(config.energy, key=jax.random.key(config.train.seed))
+    model = config.build_model(jax.random.key(config.train.seed))
     print(f"{n_parameters(model):,} parameters | {len(dataset):,} patches")
     print(json.dumps(dataset.stats(min(256, len(dataset))), indent=2))
     cl = dataset.correlation_length(min(256, len(dataset)))
-    print(context_advice(cl["xi"], model.loss_margin))
+    print(reach_advice(cl["xi"], 2 * model.receptive_radius))
     print()
     # train() prints the full valid-convolution geometry, including exactly how
     # much of each patch the loss crop discards.

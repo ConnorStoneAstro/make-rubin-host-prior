@@ -3,8 +3,9 @@
 
     python scripts/sample.py --checkpoint runs/ecdfs_r/final --n 16 --out samples
 
-The canvas is automatically padded by ``2 * loss_margin`` and the interior kept,
-because the score is only correct away from the border.  Samples are shown in
+The model is size-locked -- same-mode zero padding means the grid it was trained
+on is part of the operator -- so ``--size`` defaults to that grid and passing a
+different one gives a different prior, not a different view.  Samples are shown in
 the log representation and in nJy -- the model map is ``exp(x)`` and no band
 enters it, so there is nothing per-band to pick.
 
@@ -20,7 +21,7 @@ import jax
 import numpy as np
 
 from rubin_host_prior.data import LogFluxTransform
-from rubin_host_prior.diffusion import VESDE, sample_interior
+from rubin_host_prior.diffusion import VESDE, sample_scene
 from rubin_host_prior.training import load_checkpoint
 
 
@@ -54,10 +55,13 @@ def main() -> None:
     size = args.size or config.patch.out_size
     n = config.train.n_samples if args.n is None else args.n
     steps = config.train.sample_steps if args.steps is None else args.steps
-    print(f"checkpoint step {step}; sampling {n} x {size}x{size} "
-          f"(canvas {size + 2 * model.loss_margin}) in {steps} steps")
+    if size != config.patch.out_size:
+        print(f"  WARNING: sampling at {size} but the model was trained on "
+              f"{config.patch.out_size}; zero padding makes the training grid "
+              f"part of the operator, so this is a different prior.")
+    print(f"checkpoint step {step}; sampling {n} x {size}x{size} in {steps} steps")
 
-    x = sample_interior(
+    x = sample_scene(
         model,
         jax.random.key(args.seed),
         out_size=size,

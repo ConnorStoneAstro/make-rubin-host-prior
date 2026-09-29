@@ -153,17 +153,14 @@ def plot_cutouts(shards, n: int = 100, seed: int = 0, out: Path | None = None):
 def plot_training_batch(dataset, n: int = 25, seed: int = 0, out: Path | None = None):
     """Grid of exactly what the network receives: pooled, log-space, augmented.
 
-    Exactly what it receives means the context border is in the picture too --
-    ``out_size + 2 * loss_margin`` per side, every pixel of it real sky cut from
-    the rest of the stamp.  There is no reflection to look for any more: the
-    loader raises rather than invent a border, so if this figure renders at all,
-    what is in it came off the sky.
+    The panel *is* the grid: same-mode convolutions score every pixel, so the
+    loader feeds exactly ``out_size`` and there is no context border to show and
+    no reflection to look for.
 
-    The **red square is the loss region**: inside it is what the model is scored
-    on, outside it is context the crop throws away.  It is a small fraction of
-    the panel by construction -- the score at a loss pixel reaches ``2R``, so the
-    context is four times R across while the loss region is whatever the stamp
-    has left.
+    A **red square** appears only if ``energy.loss_margin`` is non-zero, marking
+    the region the loss is computed on.  At the default margin of 0 there is no
+    square, because there is nothing being discarded: the model is size-locked,
+    so its border is part of the operator rather than an artefact.
 
     A shared colour scale across panels, so the spread between patches is
     visible rather than normalised away -- the prior has to cover that spread.
@@ -175,9 +172,8 @@ def plot_training_batch(dataset, n: int = 25, seed: int = 0, out: Path | None = 
     x = dataset.make_batch(idx, rng=rng, augment=True)[:, 0]
     lo, hi = np.percentile(x, (0.5, 99.5))
 
-    fed = x.shape[-1]
-    size = dataset.config.patch.out_size
-    margin = (fed - size) // 2
+    margin = dataset.config.energy.loss_margin
+    size = x.shape[-1] - 2 * margin
 
     rows, cols = _grid(n)
     fig, axes = plt.subplots(rows, cols, figsize=(2.1 * cols, 2.2 * rows))
@@ -188,8 +184,7 @@ def plot_training_batch(dataset, n: int = 25, seed: int = 0, out: Path | None = 
             im = _show(ax, x[k], lo, hi, cmap="viridis")
             if margin > 0:
                 # Inside the line is what the loss is computed on; outside it
-                # is the context the crop discards, all of it real sky.
-                # imshow puts pixel centres on
+                # is border the margin discards.  imshow puts pixel centres on
                 # integers, so the edge of pixel `margin` is at margin - 0.5.
                 # linewidth 1.0, not less: below about one output pixel the
                 # line is antialiased into the background and reads as grey on
@@ -213,10 +208,12 @@ def plot_training_batch(dataset, n: int = 25, seed: int = 0, out: Path | None = 
         f"; also cycles {', '.join(str(s) for s in sizes[1:])}"
         if len(sizes) > 1 else ""
     )
+    grid = x.shape[-1]
+    crop = f", loss on the middle {size}x{size} (red)" if margin else ""
     fig.suptitle(
-        f"training batch as the loader yields it: {fed}x{fed} fed, loss on the "
-        f"middle {size}x{size} (red), pooled "
-        f"{dataset.config.patch.pool_factor}x, log space, augmented{also}",
+        f"training batch as the loader yields it: {grid}x{grid} grid{crop}, "
+        f"pooled {dataset.config.patch.pool_factor}x, log space, "
+        f"augmented{also}",
         fontsize=10,
     )
     return fig, _save(fig, out, "training_batch")

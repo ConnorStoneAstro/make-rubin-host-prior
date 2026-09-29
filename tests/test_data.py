@@ -633,12 +633,12 @@ def test_accumulator_rejects_the_wrong_shape():
         AutocorrelationAccumulator(16).add(np.zeros((8, 8)))
 
 
-def test_context_advice_brackets_the_regimes():
-    from rubin_host_prior.data import context_advice
+def test_reach_advice_brackets_the_regimes():
+    from rubin_host_prior.data import reach_advice
 
-    assert "comfortable" in context_advice(xi=6.0, loss_margin=16)
-    assert "marginal" in context_advice(xi=16.0, loss_margin=16)
-    assert "TOO SMALL" in context_advice(xi=30.0, loss_margin=16)
+    assert "comfortable" in reach_advice(xi=6.0, reach=16)
+    assert "marginal" in reach_advice(xi=16.0, reach=16)
+    assert "TOO SMALL" in reach_advice(xi=30.0, reach=16)
 
 
 def test_dataset_reports_correlation_length_in_pooled_pixels(shard_dir):
@@ -700,76 +700,61 @@ def test_validation_batch_stays_at_the_reference_size(shard_dir):
             == config.patch.out_size + 2 * config.energy.loss_margin)
 
 
-# -- the context border ----------------------------------------------------
+# -- the crop is the whole story -------------------------------------------
 #
-# The loss crops 2R from every side, so the loader carries 2R of context along
-# and the loss lands on the whole nominal crop.  Every pixel of that context is
-# real sky: the shortfall used to be reflected, and that put a mirror symmetry
-# into exactly the large scales the model was failing to learn.  What must stay
-# true: the nominal crop itself is untouched, a window that does not fit is an
-# error rather than a reflection, and nothing synthetic reaches the diagnostics.
+# There used to be a context border here: valid convolutions scored only the
+# interior, so the loader carried 2R of extra sky on every side for the loss to
+# crop away, and reflected the shortfall where the stamp ran out.  That
+# reflection is the leading explanation for three architectures that learned no
+# structure above ~16 px -- a mirrored border is symmetric at every scale, and
+# the large scales were almost all border.  Same-mode convolutions score every
+# pixel, so a batch is now exactly the crop, and these pin that down.
 
 
-def test_the_context_leaves_the_nominal_crop_exactly_as_it_was(shard_dir):
-    """The whole scheme rests on this.  Whatever the border does, the pixels the
-    loss is computed on are the same pixels the loader produced before context
-    existed -- so turning it on does not change what is being learned, it only
-    surrounds it with enough input for the score to be untruncated."""
+def test_a_batch_is_exactly_the_crop(shard_dir):
+    """No border, no padding, no reflection: ``out_size`` pooled pixels of sky."""
     _, config, ds = _dataset(shard_dir)
-    idx = np.arange(4)
-    m = config.energy.loss_margin
-    bare = ds.make_batch(idx, rng=None, augment=False, context=0)
-    padded = ds.make_batch(idx, rng=None, augment=False)
-
-    assert bare.shape[-1] == config.patch.out_size
-    assert padded.shape[-1] == config.patch.out_size + 2 * m
-    np.testing.assert_array_equal(padded[:, :, m:-m, m:-m], bare)
+    b = ds.make_batch(np.arange(4), rng=None, augment=False)
+    assert b.shape[-1] == config.patch.out_size
+    assert np.all(np.isfinite(b))
 
 
-def test_the_border_is_the_stamp_and_nothing_else():
-    """A ramp makes it checkable by eye: every row of the border is the row the
-    stamp actually has there, not a mirror of one further in."""
+def test_the_crop_is_a_contiguous_slice_of_the_stamp():
+    """A ramp makes it checkable by eye: every row of the output is a row the
+    stamp actually has, in order, with nothing invented at either end."""
     a = np.arange(20)[:, None] * np.ones((1, 20))
-    out = pool_to_training_grid(a, out_size=10, pool_factor=1, context=4)
+    out = pool_to_training_grid(a, out_size=10, pool_factor=1)
 
-    assert out.shape == (18, 18)
-    # Crop rows 5..14 with 4 px of context: rows 1..18 of the stamp, in order.
-    np.testing.assert_array_equal(out[:, 6], np.arange(1, 19))
-
-
-def test_a_context_the_stamp_cannot_fill_is_an_error_not_a_reflection():
-    """The behaviour this replaced: reflect the shortfall and carry on.  It was
-    cheap-looking and wrong -- a reflected border is mirror-symmetric at every
-    scale, and the large scales are almost all border, so the coarse score was
-    fit to a symmetry nature does not have."""
-    a = np.arange(10)[:, None] * np.ones((1, 10))
-    with pytest.raises(ValueError, match="real sky or there is no batch"):
-        pool_to_training_grid(a, out_size=10, pool_factor=1, context=3)
+    assert out.shape == (10, 10)
+    # A centred 10 px crop of a 20 px stamp is rows 5..14, in order.
+    np.testing.assert_array_equal(out[:, 6], np.arange(5, 15))
 
 
-def test_the_diagnostics_are_measured_on_real_pixels_only(shard_dir):
-    """`correlation_length` and `stats` pass context=0.
+def test_the_loader_knows_nothing_about_the_architecture(shard_dir):
+    """A batch must not depend on the energy's reach, at all.
 
-    A reflected border would put a mirror correlation straight into xi -- the
-    number the reach of the model is judged against -- and double-count pixels
-    in the sky scatter that sets the sigma range.  Both must therefore be
-    independent of the architecture's reach, which is what this checks.
+    It used to: ``make_batch`` took its context from ``config.energy``, so
+    changing the dilations changed the pixels the diagnostics measured.  Now the
+    loader reads only ``config.patch``, which is what makes ``xi`` -- the number
+    the reach is judged against -- independent of the reach being judged.
     """
     from rubin_host_prior.config import EnergyConfig
 
     _, config, short = _dataset(shard_dir)
-    assert config.energy.loss_margin == 4             # TINY_ENERGY, R = 2
     long_cfg = Config(
         energy=EnergyConfig(channels=((8,) * 5,), dilations=((1, 2, 4, 8, 1),)),
         patch=config.patch,
     )
     long_cfg.transform = config.transform
-    assert long_cfg.energy.loss_margin == 32          # four times the reach
+    assert long_cfg.energy.receptive_radius == 16      # eight times TINY_ENERGY's
     long = PatchDataset.from_shards(short.shards, long_cfg, short.transform)
 
+    idx = np.arange(4)
+    np.testing.assert_array_equal(
+        short.make_batch(idx, rng=None, augment=False),
+        long.make_batch(idx, rng=None, augment=False),
+    )
     assert short.stats(16)["mean"] == pytest.approx(long.stats(16)["mean"])
-    assert short.stats(16)["sky_scatter"] == pytest.approx(
-        long.stats(16)["sky_scatter"])
     assert short.correlation_length(16)["xi"] == pytest.approx(
         long.correlation_length(16)["xi"])
 
