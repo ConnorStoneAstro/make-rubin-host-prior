@@ -255,12 +255,12 @@ def main() -> None:
         f"layers), loss crop 2R = {margin} px per side"
     )
     print(f"  out_size {size} trains on all {size} px; the loader is fed "
-          f"{config.fed_size()}")
-    print(f"  of the {margin} px context per side, {min(real, margin):.0f} is "
-          f"real sky and {max(margin - real, 0):.0f} is reflected "
-          f"(centred crop; translation moves it side to side)")
-    print(f"  sizes this stamp can serve: {lo} .. {hi}; context is wholly real "
-          f"at or below {max(hi - 2 * margin, 0)}")
+          f"{config.fed_size()} ({config.fed_native()} of {config.patch.native_size} "
+          f"native px)")
+    print(f"  the {margin} px context per side is real sky -- {real:.0f} px is "
+          f"available, and the loader refuses a batch rather than reflect")
+    print(f"  sizes this stamp can serve: {lo} .. {hi}; translation room "
+          f"+/-{config.max_translate_native()} native px")
     for w in config.check_sizes():
         print(f"  WARNING: {w}")
 

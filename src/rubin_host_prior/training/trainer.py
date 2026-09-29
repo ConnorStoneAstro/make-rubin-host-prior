@@ -238,10 +238,9 @@ def train(
     if verbose:
         print(setup)
         for size in sizes:
-            real = config.real_context(size)
-            print(f"  out_size {size}: fed {config.fed_size(size)}, context "
-                  f"{margin} px per side = {min(real, margin):.0f} real + "
-                  f"{max(margin - real, 0):.0f} reflected (centred crop)")
+            print(f"  out_size {size}: fed {config.fed_size(size)} "
+                  f"({config.fed_native(size)} native), context {margin} px per "
+                  f"side, all real sky")
         if len(sizes) > 1:
             print(f"  {len(sizes)} training sizes -> {len(sizes)} jit compilations "
                   f"of the train step, cycled round-robin across batches")
@@ -311,9 +310,9 @@ def train(
             # The same relation as the training patch: 2R of valid context on
             # every side.  The loader supplies it from the stamp, the sampler
             # generates it and throws it away.
-            canvas = config.fed_size()
+            canvas = config.fed_size(config.sample_size())
             print(f"  each draws {cfg.n_samples} samples on a {canvas}x{canvas} "
-                  f"canvas ({config.patch.out_size} + 4R) in "
+                  f"canvas ({config.sample_size()} + 4R) in "
                   f"{2 * cfg.sample_steps} batched backward passes; "
                   f"--n-samples 0 to skip")
         else:
@@ -495,7 +494,7 @@ def _write_samples(ema_model, sde, config: Config, out: Path, step: int,
         x = sample_interior(
             ema_model,
             jax.random.fold_in(key, step),
-            out_size=config.patch.out_size,
+            out_size=config.sample_size(),
             n_samples=cfg.n_samples,
             sde=sde,
             n_steps=cfg.sample_steps,

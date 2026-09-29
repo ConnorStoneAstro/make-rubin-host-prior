@@ -44,8 +44,8 @@ def shards(extracted):
 @pytest.fixture(scope="module")
 def dataset(shards):
     config = Config(energy=TINY_ENERGY, patch=PatchConfig(native_size=shards.native_size,
-                                      out_size=32,
-                                      pool_factor=3, out_sizes=(24, 32)))
+                                      out_size=24,
+                                      pool_factor=3, out_sizes=(16, 24)))
     pooled, bands = pool_shards(shards, config)
     config.transform.softening = estimate_softening(
         pooled, config.transform.softening_sigma
@@ -89,7 +89,7 @@ def test_training_batch_shows_what_the_loader_yields(dataset, tmp_path):
     assert box.get_width() == size and box.get_height() == size
     assert box.get_xy() == (margin - 0.5, margin - 0.5)
     assert box.get_edgecolor()[:3] == (1.0, 0.0, 0.0)
-    assert "also cycles 24" in fig._suptitle.get_text()
+    assert "also cycles 16" in fig._suptitle.get_text()
     plt.close(fig)
 
 

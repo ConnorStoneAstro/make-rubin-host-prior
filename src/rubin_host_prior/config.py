@@ -16,19 +16,28 @@ from typing import Any
 BANDS = ("u", "g", "r", "i", "z", "y")
 
 
-#: Ten layers at full width.  The dilations alternate a doubling series with
-#: ones, so every long-range layer has a local layer after it to integrate what
-#: it gathered, and the reach is ``sum = 36``.
+#: Eight layers at 64 channels, dilations up a doubling series and back down
+#: again, reach ``sum = 30``.  The descending tail is the standard de-gridding
+#: construction: a layer at dilation ``d`` samples a lattice of spacing ``d``,
+#: and the smaller dilations after it mix the lattices back together.
 #:
-#: This replaced a two-branch model -- a wide undilated stack summed with a
-#: narrow dilated one.  That version worked in every way it could be measured:
-#: the long-range branch carried 25-60% of the score and the training crops
-#: plainly contained galaxies wider than its reach.  It still produced no
-#: large-scale structure in its samples.  A single stack removes the one
-#: explanation that measurement could not rule out -- that a sum lets the
-#: cheaper branch answer for both, and nothing in the objective says otherwise.
-DEFAULT_CHANNELS: tuple[int, ...] = (128,) * 10
-DEFAULT_DILATIONS: tuple[int, ...] = (1, 1, 2, 1, 4, 1, 8, 1, 16, 1)
+#: **R is chosen by the stamp, not by the architecture.**  A loss pixel's score
+#: depends on ``2R`` around it, so training it on real sky needs
+#: ``out_size + 4R`` pooled pixels of real sky, and a 512 native stamp at
+#: ``pool_factor`` 3 has 170.  At ``out_size`` 32 that caps R at 34.  Reach
+#: beyond that is not free and not neutral: it is bought with reflected sky, so
+#: the large-scale part of the score gets trained on a mirror symmetry that
+#: nature does not have -- which is the leading explanation for samples that
+#: contain only small structure.  ``Config`` raises rather than pad, so a
+#: config asking for more reach than the stamp can feed says so.
+#:
+#: Two earlier architectures produced no large-scale structure: a wide undilated
+#: stack summed with a narrow dilated one (the long-range branch carried 25-60%
+#: of the score, so it was not being ignored), and a single 128-wide stack at
+#: R=36.  Both were fed a majority-reflected border, which neither diagnostic
+#: was looking at.
+DEFAULT_CHANNELS: tuple[int, ...] = (64,) * 8
+DEFAULT_DILATIONS: tuple[int, ...] = (1, 2, 4, 8, 8, 4, 2, 1)
 
 #: Said whenever `channels` and `dilations` disagree, because by far the most
 #: likely reason is that only one of them was given.
@@ -48,8 +57,8 @@ class EnergyConfig:
     energy maps are centre-cropped to a common size and added.  A sum of energies
     is an energy, so the score stays an exact gradient however many there are.
 
-    **The default is one branch**, ``DEFAULT_*``: ten layers at 128 channels
-    with alternating dilations, R = 36.  Several branches still work and are
+    **The default is one branch**, ``DEFAULT_*``: eight layers at 64 channels
+    with a rise-and-fall dilation series, R = 30.  Several branches still work and are
     tested -- the sum of any number of energies is an energy -- but the default
     is one, because a sum lets the branches compete to explain the same residual
     and nothing in the objective decides which should win.
@@ -80,8 +89,8 @@ class EnergyConfig:
     #: branch's reach is ``r * sum(dilations)``, so leaving it to be inferred
     #: would mean the single most consequential number in the geometry -- the
     #: loss crop follows from it -- was one nobody wrote down.
-    #: ``(1, 2, 4, 8, 16, 1)`` reaches R = 32 in six layers, the trailing 1
-    #: mixing neighbouring long-range features back together.
+    #: ``(1, 2, 4, 8, 8, 4, 2, 1)`` reaches R = 30 in eight layers, the
+    #: descending tail mixing the coarse lattices back together.
     dilations: tuple[tuple[int, ...], ...] = (DEFAULT_DILATIONS,)
     kernel_size: int = 3
     activation: str = "silu"  # must be C^1; see nn.layers.ACTIVATIONS
@@ -239,7 +248,7 @@ class PatchConfig:
     """
 
     native_size: int = 512  # pixels cut from the coadd
-    out_size: int = 128  # the reference training size, in pooled pixels
+    out_size: int = 32  # the reference training size, in pooled pixels
     pool_factor: int = 3
     #: Extra training sizes.  Each batch is drawn at one size (a batch must be
     #: shape-homogeneous), cycling over ``training_sizes``.  Larger patches
@@ -275,18 +284,6 @@ class PatchConfig:
             s for s in sorted(set(self.out_sizes)) if s != self.out_size
         )
 
-    @property
-    def max_translate_native(self) -> int:
-        """Native-pixel translation room, fixed at the *reference* size.
-
-        Smaller training crops leave more room in the stamp, but letting them
-        wander that far would change the data distribution with size -- small
-        patches would mostly land on blank sky away from the host.  Capping the
-        offset at the reference size's room keeps every size looking at the same
-        neighbourhood.
-        """
-        return max(self.native_size - self.nominal_crop, 0)
-
 
 @dataclass
 class AugmentConfig:
@@ -304,7 +301,7 @@ class AugmentConfig:
 
 @dataclass
 class TrainConfig:
-    batch_size: int = 64
+    batch_size: int = 128
     steps: int = 200_000
     learning_rate: float = 1e-4
     warmup_steps: int = 2_000
@@ -383,15 +380,53 @@ class Config:
             out_size, self.energy.dilations, self.energy.kernel_size
         )
 
+    def fed_native(self, out_size: int | None = None) -> int:
+        """Native pixels the loader must read to serve one training image.
+
+        ``fed_size * pool_factor``: the loss region plus the ``2R`` of context
+        on every side that the loss will crop away again.  **Every one of them
+        has to be real sky** -- see ``data.pooling.pool_to_training_grid``, which
+        raises rather than invent the shortfall.
+        """
+        return self.fed_size(out_size) * self.patch.pool_factor
+
+    def max_translate_native(self) -> int:
+        """Native px the crop may wander, keeping the fed window on real sky.
+
+        This cannot live on ``PatchConfig``: the window includes ``2R`` of
+        context per side and ``R`` is the energy's.  Taken at the *largest*
+        training size, which serves both purposes at once -- it is the size with
+        the least room, so no size can walk its context off the stamp, and every
+        size then looks at the same neighbourhood rather than small crops roaming
+        out onto blank sky.
+        """
+        largest = max(self.patch.training_sizes)
+        return max((self.patch.native_size - self.fed_native(largest)) // 2, 0)
+
+    def sample_size(self) -> int:
+        """Pooled px of scene a checkpoint sample grid should show: ``4R``.
+
+        **Not ``out_size``.**  That is the loss region, and the stamp caps it --
+        at the defaults it is 32 px while the score reaches ``2R = 60``, so a
+        sample the size of the loss region could not display the largest
+        structure the model is even able to represent, and "no large-scale
+        structure in the samples" would be a statement about the figure.  At
+        inference the canvas costs nothing but compute, since nothing has to
+        come off the sky, so it is set by the architecture instead: twice the
+        reach, which shows a feature at the reach with room either side of it.
+        """
+        return max(self.patch.out_size, 2 * self.energy.loss_margin)
+
     def real_context(self, out_size: int | None = None) -> float:
         """Pooled px of genuine sky either side of a centred nominal crop.
 
         The loss discards ``2R`` from every side, so the loader carries that
-        much context along; this is how much of it the stamp can supply.  The
-        rest is reflected, which is a deliberate trade -- see
-        ``data.pooling.pool_to_training_grid``.  Note that a crop is not always
-        centred: translation moves real context from one side to the other, it
-        does not create more.
+        much context along, and all of it must be real: anything less is an
+        error, not a reflected border.  So this is ``>= loss_margin`` for any
+        config that can serve ``out_size`` at all, and the excess is the room
+        translation wanders in.  Note that a crop is not always centred:
+        translation moves real context from one side to the other, it does not
+        create more.
         """
         p = self.patch
         out_size = p.out_size if out_size is None else out_size
@@ -400,44 +435,51 @@ class Config:
     def usable_size_range(self) -> tuple[int, int]:
         """``(smallest, largest)`` training size this config can actually serve.
 
-        The lower bound used to be architectural -- a patch had to exceed ``4R``
-        or the loss had no interior.  That is gone: the loader carries ``2R`` of
-        context on every side, so the loss lands on the whole nominal crop
-        whatever its size.  What remains is the stamp: the nominal crop itself
-        must be real pixels, so ``out_size * pool_factor`` cannot exceed
-        ``native_size``.  How much of the *context* is real is a separate
-        question -- ``real_context``.
+        The loader carries ``2R`` of context on every side and none of it may be
+        invented, so the whole fed window -- ``out_size + 4R`` pooled pixels --
+        has to come out of the stamp.  That is the binding constraint, and it is
+        much tighter than the nominal crop alone: at R = 30 a 512 px stamp at
+        pool 3 serves 170 pooled px, of which 120 are context.
         """
-        return 1, self.patch.native_size // self.patch.pool_factor
+        p = self.patch
+        return 1, max(p.native_size // p.pool_factor - 4 * self.energy.receptive_radius, 0)
 
     def check_sizes(self) -> list[str]:
         """Warnings about the configured training sizes; empty means fine."""
         _, hi = self.usable_size_range()
         margin = self.energy.loss_margin
         out = []
-        # A size that does not fit the stamp cannot get here: PatchConfig
-        # rejects it at construction, and dataclasses.replace re-runs that.
+        # PatchConfig rejects a *nominal crop* bigger than the stamp at
+        # construction; what it cannot see is the context, which is four times
+        # R again and is where the room actually goes.
         for s in self.patch.training_sizes:
-            if self.real_context(s) <= 0:
+            if self.fed_native(s) > self.patch.native_size:
                 out.append(
-                    f"size {s} leaves no real context: the whole {margin} px "
-                    f"border on every side would be reflection, so nothing "
-                    f"outside the nominal crop is new information. Extract "
-                    f"larger stamps, or reduce out_size below {hi}."
+                    f"size {s} needs {self.fed_native(s)} native px -- {s} for "
+                    f"the loss and {margin} pooled px of context on every side "
+                    f"-- but the stamp is {self.patch.native_size}. The loader "
+                    f"will refuse it rather than reflect the shortfall. Reduce "
+                    f"out_size to {hi} or below, cut R (now "
+                    f"{self.energy.receptive_radius}), or extract larger stamps."
                 )
             frac = (s / self.fed_size(s)) ** 2
             if frac < 0.10:
                 out.append(
                     f"size {s} is fed {self.fed_size(s)} px to train on {s} -- "
                     f"only {100 * frac:.0f}% of the arithmetic reaches the "
-                    f"loss. Use a larger out_size, or less reach."
+                    f"loss. This is the price of an all-real context and it "
+                    f"cannot be tuned away here: the stamp caps out_size at "
+                    f"{hi}, so this config's ceiling is "
+                    f"{100 * (hi / self.fed_size(hi)) ** 2:.0f}%. To do better, "
+                    f"extract larger stamps or cut R."
                 )
-        if self.augment.translate and self.patch.max_translate_native == 0:
+        if self.augment.translate and self.max_translate_native() == 0:
             out.append(
-                f"translation augmentation has no room: native_size "
-                f"({self.patch.native_size}) equals out_size * pool_factor. "
-                f"Enlarge native_size or reduce out_size -- translation is exact "
-                f"and free, so losing it silently is a waste."
+                f"translation augmentation has no room: the fed window "
+                f"({self.fed_native()} native px) fills the stamp "
+                f"({self.patch.native_size}). Enlarge native_size, or reduce "
+                f"out_size or R -- translation is exact and free, so losing it "
+                f"silently is a waste."
             )
         return out
 

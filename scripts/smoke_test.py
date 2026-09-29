@@ -28,7 +28,7 @@ from pathlib import Path
 import jax
 import numpy as np
 
-from rubin_host_prior.config import DEFAULT_DILATIONS, Config, EnergyConfig
+from rubin_host_prior.config import Config, EnergyConfig
 from rubin_host_prior.data import (
     LogFluxTransform,
     PatchDataset,
@@ -43,6 +43,19 @@ from rubin_host_prior.data.synthetic import write_synthetic_shards
 from rubin_host_prior.diffusion import VESDE, mean_dsm_loss, sample_interior
 from rubin_host_prior.nn import ConvEnergyNet, n_parameters
 from rubin_host_prior.training import load_checkpoint, train
+
+
+def wedge(n: int) -> tuple[int, ...]:
+    """A doubling series up and back down again, in ``n`` layers.
+
+    The same shape as the project default, scaled to whatever depth the smoke
+    test is run at: the ascent reaches and the descent de-grids.  Built rather
+    than sliced off ``DEFAULT_DILATIONS`` because a slice of it is a bare
+    ascent -- no de-gridding tail, and a reach that grows like ``2^n``, which at
+    four layers already wants a stamp three times the size.
+    """
+    up = tuple(2 ** i for i in range((n + 1) // 2))
+    return up + tuple(reversed(up))[n % 2:]
 
 
 def main() -> None:
@@ -60,11 +73,24 @@ def main() -> None:
     work = Path(args.workdir or tempfile.mkdtemp(prefix="rhp-smoke-"))
     print(f"workdir: {work}\n")
 
+    # Uniform width so the residual skips are possible, and the same
+    # rise-and-fall dilation shape as the default, so the run exercises dilation
+    # and residual together rather than a plain stack -- this is the rehearsal
+    # for NERSC, so the shapes it checks should be the shapes that go there.
+    energy = EnergyConfig(
+        channels=((32,) * args.n_layers,),
+        dilations=(wedge(args.n_layers),),
+    )
+    # The stamp has to hold the whole fed window -- out_size + 4R pooled px --
+    # because the loader will not reflect a shortfall.  32 native px of slack on
+    # top, so translation augmentation has somewhere to go.
+    native = (args.out_size + 4 * energy.receptive_radius) * 3 + 32
+
     t0 = time.time()
     write_synthetic_shards(
         work / "shards",
         n_patches=args.n_patches,
-        native_size=args.out_size * 3 + 32,
+        native_size=native,
         seed=0,
     )
     shards = ShardSet.from_dir(work / "shards")
@@ -79,15 +105,7 @@ def main() -> None:
         config.patch = dataclasses.replace(
             config.patch, out_sizes=tuple(args.out_sizes)
         )
-    # Uniform width so the residual skips are possible, and the head of the
-    # default dilation pattern so the run exercises dilation and residual
-    # together rather than a plain stack -- this is the rehearsal for NERSC, so
-    # the shapes it checks should be the shapes that go there.
-    n = args.n_layers
-    config.energy = EnergyConfig(
-        channels=((32,) * n,),
-        dilations=((DEFAULT_DILATIONS + (1,) * n)[:n],),
-    )
+    config.energy = energy
     config.train.steps = args.steps
     config.train.batch_size = args.batch_size
     config.train.log_every = max(args.steps // 10, 1)

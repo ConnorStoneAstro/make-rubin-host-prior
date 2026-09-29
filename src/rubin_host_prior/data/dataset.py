@@ -112,7 +112,7 @@ class PatchDataset:
                 rng=rng,
                 translate=translate,
                 scale_jitter=scale_jitter,
-                max_translate=p.max_translate_native,
+                max_translate=self.config.max_translate_native(),
                 context=context,
             )
         return out
@@ -142,9 +142,11 @@ class PatchDataset:
         2 * context``.
 
         ``context`` defaults to the architecture's ``loss_margin``, so the loss
-        lands on exactly ``out_size`` -- the nominal crop, all of it real.  The
-        diagnostics pass 0, since a reflected border would put a mirror
-        correlation into a measurement of the correlation length.
+        lands on exactly ``out_size``.  Every pixel of it is real sky, context
+        included -- the loader raises rather than reflect a shortfall, so a
+        config whose reach outruns the stamp fails at the first batch instead of
+        training the coarse score on a mirror symmetry.  The diagnostics pass 0,
+        which needs no context at all.
         """
         aug = self.config.augment
         out_size = self.config.patch.out_size if out_size is None else out_size
@@ -306,7 +308,5 @@ def pool_shards(
     stamps = shards.gather(idx, "image") if len(idx) < len(shards) else shards.load("image")
     out = np.empty((len(idx), p.out_size, p.out_size), dtype=np.float32)
     for i in range(len(idx)):
-        out[i] = pool_to_training_grid(
-            stamps[i], out_size=p.out_size, pool_factor=p.pool_factor
-        )
+        out[i] = pool_to_training_grid(stamps[i], out_size=p.out_size, pool_factor=p.pool_factor)
     return out, np.asarray(shards.meta["band_idx"])[idx]

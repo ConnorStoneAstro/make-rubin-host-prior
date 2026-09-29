@@ -490,7 +490,7 @@ def test_shard_metadata_is_preserved(shard_dir):
     assert np.all(ss.meta["sky_noise"] > 0)
 
 
-def _dataset(shard_dir, out_size=32):
+def _dataset(shard_dir, out_size=24):
     ss = ShardSet.from_dir(shard_dir)
     config = Config(
         energy=TINY_ENERGY,
@@ -665,7 +665,7 @@ def test_config_rejects_sizes_the_stamp_cannot_supply():
 
 def _varsize_dataset(shard_dir, out_sizes):
     ss = ShardSet.from_dir(shard_dir)
-    config = Config(energy=TINY_ENERGY, patch=PatchConfig(native_size=ss.native_size, out_size=32, pool_factor=3,
+    config = Config(energy=TINY_ENERGY, patch=PatchConfig(native_size=ss.native_size, out_size=24, pool_factor=3,
                                       out_sizes=out_sizes))
     pooled, pooled_bands = pool_shards(ss, config)
     config.transform.softening = estimate_softening(
@@ -677,17 +677,17 @@ def _varsize_dataset(shard_dir, out_sizes):
 
 
 def test_batches_cycle_sizes_round_robin(shard_dir):
-    _, _, ds = _varsize_dataset(shard_dir, (16, 24, 32))
+    _, _, ds = _varsize_dataset(shard_dir, (12, 16, 24))
     it = ds.batches(4, seed=0)
     m = 2 * ds.config.energy.loss_margin
     sizes = [next(it).shape[-1] - m for _ in range(9)]
-    assert sizes == [32, 16, 24] * 3, sizes
+    assert sizes == [24, 12, 16] * 3, sizes
 
 
 def test_every_size_is_a_valid_pooled_image(shard_dir):
-    _, _, ds = _varsize_dataset(shard_dir, (16, 24, 32))
+    _, _, ds = _varsize_dataset(shard_dir, (12, 16, 24))
     m = ds.config.energy.loss_margin
-    for s in (16, 24, 32):
+    for s in (12, 16, 24):
         b = ds.make_batch(np.arange(4), rng=np.random.default_rng(0), out_size=s)
         assert b.shape == (4, 1, s + 2 * m, s + 2 * m)
         assert np.all(np.isfinite(b))
@@ -695,7 +695,7 @@ def test_every_size_is_a_valid_pooled_image(shard_dir):
 
 def test_validation_batch_stays_at_the_reference_size(shard_dir):
     """Otherwise validation losses are not comparable across runs or steps."""
-    _, config, ds = _varsize_dataset(shard_dir, (16, 24, 32))
+    _, config, ds = _varsize_dataset(shard_dir, (12, 16, 24))
     assert (ds.validation_batch(4).shape[-1]
             == config.patch.out_size + 2 * config.energy.loss_margin)
 
@@ -703,9 +703,11 @@ def test_validation_batch_stays_at_the_reference_size(shard_dir):
 # -- the context border ----------------------------------------------------
 #
 # The loss crops 2R from every side, so the loader carries 2R of context along
-# and the loss lands on the whole nominal crop.  The border is real sky wherever
-# the stamp has any and reflected beyond that.  What must stay true: the nominal
-# crop itself is untouched, and nothing synthetic reaches the diagnostics.
+# and the loss lands on the whole nominal crop.  Every pixel of that context is
+# real sky: the shortfall used to be reflected, and that put a mirror symmetry
+# into exactly the large scales the model was failing to learn.  What must stay
+# true: the nominal crop itself is untouched, a window that does not fit is an
+# error rather than a reflection, and nothing synthetic reaches the diagnostics.
 
 
 def test_the_context_leaves_the_nominal_crop_exactly_as_it_was(shard_dir):
@@ -724,29 +726,25 @@ def test_the_context_leaves_the_nominal_crop_exactly_as_it_was(shard_dir):
     np.testing.assert_array_equal(padded[:, :, m:-m, m:-m], bare)
 
 
-def test_the_border_reflects_without_repeating_the_edge_pixel():
-    """`reflect`, not `symmetric`: the edge row appears once, so no column is
-    counted twice.  A ramp makes the mirror checkable by eye."""
+def test_the_border_is_the_stamp_and_nothing_else():
+    """A ramp makes it checkable by eye: every row of the border is the row the
+    stamp actually has there, not a mirror of one further in."""
     a = np.arange(20)[:, None] * np.ones((1, 20))
-    out = pool_to_training_grid(a, out_size=10, pool_factor=1, context=6)
+    out = pool_to_training_grid(a, out_size=10, pool_factor=1, context=4)
 
-    assert out.shape == (22, 22)
-    # The crop is rows 5..14; the 6 px border reaches one row past each end.
-    assert out[1, 6] == 0.0 and out[20, 6] == 19.0   # the stamp's own extremes
-    assert out[0, 6] == 1.0                          # mirrored about row 0
-    assert out[21, 6] == 18.0                         # mirrored about row 19
+    assert out.shape == (18, 18)
+    # Crop rows 5..14 with 4 px of context: rows 1..18 of the stamp, in order.
+    np.testing.assert_array_equal(out[:, 6], np.arange(1, 19))
 
 
-def test_a_crop_that_fills_the_stamp_gets_a_wholly_synthetic_border():
-    """The extreme the design accepts: no real sky left over, so the context is
-    all reflection.  It still runs -- `reflect` handles a pad wider than the
-    array by reflecting again -- and `Config.check_sizes` is what says so."""
+def test_a_context_the_stamp_cannot_fill_is_an_error_not_a_reflection():
+    """The behaviour this replaced: reflect the shortfall and carry on.  It was
+    cheap-looking and wrong -- a reflected border is mirror-symmetric at every
+    scale, and the large scales are almost all border, so the coarse score was
+    fit to a symmetry nature does not have."""
     a = np.arange(10)[:, None] * np.ones((1, 10))
-    out = pool_to_training_grid(a, out_size=10, pool_factor=1, context=3)
-
-    assert out.shape == (16, 16)
-    np.testing.assert_array_equal(out[3:13, 5], a[:, 5])
-    assert out[2, 5] == 1.0 and out[13, 5] == 8.0
+    with pytest.raises(ValueError, match="real sky or there is no batch"):
+        pool_to_training_grid(a, out_size=10, pool_factor=1, context=3)
 
 
 def test_the_diagnostics_are_measured_on_real_pixels_only(shard_dir):

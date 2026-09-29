@@ -326,8 +326,15 @@ def test_nominal_crop_is_derived_rather_than_stated():
     with them by hand."""
     p = PatchConfig(native_size=224, out_size=64, pool_factor=3)
     assert p.nominal_crop == 192
-    assert p.max_translate_native == 224 - 192
     assert "nominal_crop" not in {f.name for f in dataclasses.fields(PatchConfig)}
+    # Translation room is not PatchConfig's to know: the window the crop has to
+    # keep inside the stamp includes 2R of context per side, and R is the
+    # energy's.  R = 2 here, so the window is (64 + 2*4) * 3 = 216 native.
+    assert not hasattr(p, "max_translate_native")
+    c = Config(energy=EnergyConfig(channels=((8,) * 2,), dilations=((1,) * 2,)),
+               patch=p)
+    assert c.fed_native() == 216
+    assert c.max_translate_native() == (224 - 216) // 2
     with pytest.raises(ValueError, match="native_size .* must be >="):
         PatchConfig(native_size=100, out_size=64, pool_factor=3)
 
@@ -373,7 +380,7 @@ def test_setup_note_is_printed_and_reports_the_derived_crop(tmp_path, capsys):
     # names is the nominal crop itself rather than something smaller.
     assert "patch   28x28" in out
     assert "loss on interior 16x16" in out
-    assert "out_size 16: fed 28, context 6 px per side" in out
+    assert "out_size 16: fed 28 (84 native), context 6 px per side, all real sky" in out
     assert "N + 12 px" in out
 
 
@@ -419,18 +426,24 @@ def test_variable_sizes_train_without_recompilation_errors(tmp_path):
     assert n_parameters(ema) == n_parameters(model)
 
 
-def test_usable_size_range_no_longer_has_an_architectural_floor():
-    """The lower bound used to be 4R + 1 -- below that the loss had no interior.
-    The loader supplying the context removed that floor entirely; what is left
-    is the stamp, which still has to hold the nominal crop itself."""
+def test_usable_size_range_is_bounded_by_the_stamp_minus_the_context():
+    """The ceiling is ``native // pool - 4R``, not ``native // pool``.
+
+    It used to be the latter, on the reasoning that the loader could reflect
+    whatever context the stamp could not supply.  That is gone: the context is
+    real sky or it is an error, so R comes straight off the largest size a stamp
+    can serve -- four pixels of ceiling for every pixel of reach.
+    """
     c = Config(energy=EnergyConfig(channels=((32,) * 8,), dilations=((1,) * 8,)),
                patch=PatchConfig(native_size=224, out_size=64,
                                  pool_factor=3))
-    assert c.usable_size_range() == (1, 74)   # 224 // 3
+    assert c.energy.receptive_radius == 8
+    assert c.usable_size_range() == (1, 74 - 32)   # 224 // 3, less 4R
     deep = Config(energy=EnergyConfig(channels=((32,) * 20,), dilations=((1,) * 20,)),
                   patch=PatchConfig(native_size=224, out_size=64, pool_factor=3))
-    # R = 20 now, and it makes no difference to what sizes can be served.
-    assert deep.usable_size_range() == (1, 74)
+    # R = 20 wants 80 px of context out of 74, so this stamp serves no size at
+    # all -- which is the honest answer, and used to read as "up to 74".
+    assert deep.usable_size_range() == (1, 0)
 
 
 def test_the_default_architecture_is_the_one_that_gets_trained():
@@ -443,23 +456,33 @@ def test_the_default_architecture_is_the_one_that_gets_trained():
     assert c.energy.channels == (DEFAULT_CHANNELS,)
     assert c.energy.dilations == (DEFAULT_DILATIONS,)
     assert c.energy.n_branches == 1 and c.energy.residual
-    assert c.energy.receptive_radius == 36 and c.energy.loss_margin == 72
-    # and the loader will carry that much context for it
-    assert c.patch.out_size + 2 * c.energy.loss_margin == 272
+    assert c.energy.receptive_radius == 30 and c.energy.loss_margin == 60
+    # and the loader will carry that much context for it, all of it real sky:
+    # 152 pooled px is 456 native, inside the 512 px stamp with room to translate.
+    assert c.patch.out_size + 2 * c.energy.loss_margin == 152
+    assert c.fed_native() == 456 <= c.patch.native_size
+    assert c.max_translate_native() == 28
 
 
-def test_the_dilations_alternate_local_layers_with_the_doubling_series():
-    """Each long-range layer is followed by a d=1 layer that integrates what it
-    gathered.  Without those the reachable offsets still have no holes, but
-    nothing local ever mixes them."""
+def test_the_dilations_rise_through_a_doubling_series_and_come_back_down():
+    """Up a doubling series, then down again.  The ascent is what reaches, and
+    a doubling series leaves no holes; the descent is the de-gridding tail -- a
+    layer at dilation d samples a lattice of spacing d, and the smaller
+    dilations after it are what mix those lattices back together."""
     from rubin_host_prior.config import DEFAULT_DILATIONS
 
-    assert DEFAULT_DILATIONS == (1, 1, 2, 1, 4, 1, 8, 1, 16, 1)
-    assert sum(DEFAULT_DILATIONS) == 36
-    doubling = [d for d in DEFAULT_DILATIONS if d > 1]
-    assert doubling == [2, 4, 8, 16]                       # no repeats
-    for big in doubling:                                   # each followed by a 1
-        assert DEFAULT_DILATIONS[DEFAULT_DILATIONS.index(big) + 1] == 1
+    assert DEFAULT_DILATIONS == (1, 2, 4, 8, 8, 4, 2, 1)
+    assert sum(DEFAULT_DILATIONS) == 30
+    peak = DEFAULT_DILATIONS.index(max(DEFAULT_DILATIONS))
+    up, down = DEFAULT_DILATIONS[: peak + 1], DEFAULT_DILATIONS[peak + 1 :]
+    assert up == (1, 2, 4, 8) and len(set(up)) == len(up)   # doubling, no repeats
+    assert down == tuple(reversed(up))                      # and back down again
+    # Gap-free: after n layers of the ascent the reach is sum(up[:n]), and the
+    # next dilation never exceeds 2 * reach + 1, so nothing is skipped over.
+    reach = 0
+    for d in up:
+        assert d <= 2 * reach + 1
+        reach += d
 
 
 def test_residuals_are_refused_rather_than_silently_dropped():
@@ -505,14 +528,18 @@ def test_real_context_is_what_the_stamp_has_left_over():
     assert c.real_context(160) < 0                     # it does not even fit
 
 
-def test_check_sizes_flags_a_border_that_is_all_reflection():
+def test_check_sizes_flags_a_size_the_stamp_cannot_feed():
+    """The warning used to be that the border would be all reflection.  Now
+    there is no reflection to have, so it is that the loader will refuse the
+    batch -- said at config time rather than at the first step."""
     c = Config(energy=EnergyConfig(channels=((32,) * 8,), dilations=((1,) * 8,)),
-               patch=PatchConfig(native_size=384, out_size=96,
+               patch=PatchConfig(native_size=416, out_size=96,
                                  pool_factor=3))
-    assert c.check_sizes() == []      # 16 real of a 16 px border: exactly enough
+    assert c.fed_native() == 384 <= 416      # R = 8, so 96 + 32 pooled px
+    assert c.check_sizes() == []
 
     c.patch = dataclasses.replace(c.patch, out_sizes=(96, 128))
-    assert any("128 leaves no real context" in w for w in c.check_sizes())
+    assert any("size 128 needs 480 native px" in w for w in c.check_sizes())
 
     # A size that does not fit the stamp never reaches check_sizes: PatchConfig
     # refuses it outright, which is the better place for it.
@@ -544,15 +571,17 @@ def test_defaults_leave_room_for_translation():
     128 px patch) silently disables the translation augmentation, because the
     crop then fills the whole stamp.  The defaults must not be in that state."""
     c = Config()
-    assert c.patch.out_size == 128
-    assert c.patch.max_translate_native > 0
-    assert c.check_sizes() == []
+    assert c.patch.out_size == 32
+    assert c.max_translate_native() > 0
+    # An all-real context costs efficiency and check_sizes says so; what must
+    # not be there is the translation warning.
+    assert not any("translation" in w for w in c.check_sizes())
 
 
 def test_zero_translation_room_is_reported():
     c = Config(patch=PatchConfig(native_size=384, out_size=128,
                                  pool_factor=3))
-    assert c.patch.max_translate_native == 0
+    assert c.max_translate_native() == 0
     assert any("no room" in w for w in c.check_sizes())
 
 

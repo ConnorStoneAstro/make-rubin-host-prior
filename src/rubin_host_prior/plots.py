@@ -154,15 +154,16 @@ def plot_training_batch(dataset, n: int = 25, seed: int = 0, out: Path | None = 
     """Grid of exactly what the network receives: pooled, log-space, augmented.
 
     Exactly what it receives means the context border is in the picture too --
-    ``out_size + 2 * loss_margin`` per side, the outer part of it reflected.
-    That is deliberate: this is the figure to look at if the sample grids start
-    showing mirror-symmetric structure, because it is where the reflection is
-    visible before the model has had a chance to learn it.
+    ``out_size + 2 * loss_margin`` per side, every pixel of it real sky cut from
+    the rest of the stamp.  There is no reflection to look for any more: the
+    loader raises rather than invent a border, so if this figure renders at all,
+    what is in it came off the sky.
 
     The **red square is the loss region**: inside it is what the model is scored
-    on, outside it is context the crop throws away.  Mirror symmetry about the
-    red line is the reflection doing its job; mirror symmetry *inside* it is the
-    artefact to worry about.
+    on, outside it is context the crop throws away.  It is a small fraction of
+    the panel by construction -- the score at a loss pixel reaches ``2R``, so the
+    context is four times R across while the loss region is whatever the stamp
+    has left.
 
     A shared colour scale across panels, so the spread between patches is
     visible rather than normalised away -- the prior has to cover that spread.
@@ -186,9 +187,9 @@ def plot_training_batch(dataset, n: int = 25, seed: int = 0, out: Path | None = 
         if k < n:
             im = _show(ax, x[k], lo, hi, cmap="viridis")
             if margin > 0:
-                # Inside the line is what the loss is computed on; outside it is
-                # the context the crop discards -- real sky as far as the stamp
-                # reached, reflection beyond that.  imshow puts pixel centres on
+                # Inside the line is what the loss is computed on; outside it
+                # is the context the crop discards, all of it real sky.
+                # imshow puts pixel centres on
                 # integers, so the edge of pixel `margin` is at margin - 0.5.
                 # linewidth 1.0, not less: below about one output pixel the
                 # line is antialiased into the background and reads as grey on
