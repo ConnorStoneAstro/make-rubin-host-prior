@@ -436,9 +436,8 @@ def plot_hosts(shards, hosts=None, band: str = "r", out: Path | None = None):
     fig, axes = plt.subplots(rows, cols, figsize=(3.2 * cols, 2.7 * rows))
     flat = np.atleast_1d(axes).ravel()
 
-    band_idx = np.asarray(meta["band_idx"])
-    counts = [int(np.sum(band_idx == i)) for i in range(len(BANDS))]
-    flat[0].bar(list(BANDS), counts, color="darkseagreen")
+    counts = shards.band_counts()
+    flat[0].bar(list(BANDS), [counts[b] for b in BANDS], color="darkseagreen")
     flat[0].set_title("patches per band", fontsize=9)
     flat[0].tick_params(labelsize=7)
     flat[0].set_ylabel("count", fontsize=8)

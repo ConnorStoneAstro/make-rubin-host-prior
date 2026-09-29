@@ -469,6 +469,39 @@ def test_prepare_config_keeps_a_value_you_set_yourself(tmp_path, shard_dir,
     assert "sde.sigma_max = 7.5" in capsys.readouterr().out
 
 
+def test_band_counts_reads_the_global_index_not_the_shard_subset(tmp_path):
+    """Regression: a run extracting a subset of bands had its counts shifted.
+
+    ``band_idx`` is ``BANDS.index(name)`` -- a *global* index, so g is 1 whether
+    or not u was collected, which is what lets runs with different band lists be
+    merged.  ``prepare_config.py`` enumerated the shard's own ``bands`` instead
+    and compared the position to the stored value, so for a griz run every band
+    reported the next band's count and g reported zero -- printed as "no patches
+    in ['g']" on a run whose diagnostics plainly showed g-band patches.
+    """
+    from rubin_host_prior.data.shards import META_DTYPES, ShardWriter
+
+    subset, truth = ("g", "r", "i", "z"), (30, 25, 20, 15)
+    w = ShardWriter(tmp_path / "s", native_size=8, patches_per_shard=64,
+                    attrs={"bands": list(subset)})
+    rng = np.random.default_rng(0)
+    for band, n in zip(subset, truth):
+        for _ in range(n):
+            meta = {k: 0 for k in META_DTYPES}
+            meta.update(band_idx=BANDS.index(band), sky_noise=1.0)
+            w.add(rng.normal(size=(8, 8)).astype(np.float32), meta)
+    w.close()
+
+    ss = ShardSet.from_dir(tmp_path / "s")
+    assert ss.bands == subset            # the run's own list, a subset
+    counts = ss.band_counts()
+    assert [counts[b] for b in subset] == list(truth)
+    # Keyed by the global band list, so the bands this run skipped are zero
+    # rather than missing -- and none of them is the first of the subset.
+    assert counts["u"] == 0 and counts["y"] == 0
+    assert set(counts) == set(BANDS)
+
+
 def test_gather_returns_rows_in_the_requested_order(shard_dir):
     """Reads are reordered per shard for efficiency; the caller must not see it."""
     ss = ShardSet.from_dir(shard_dir)

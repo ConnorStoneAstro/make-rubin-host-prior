@@ -51,14 +51,6 @@ DEFAULT_SHARDS = Path(ExtractionConfig.out) / "shards"
 DEFAULT_OUT = "config.json"
 
 
-def _band_counts(shards) -> dict[str, int]:
-    """How many patches each band actually contributed."""
-    import numpy as np
-
-    idx = np.asarray(shards.meta["band_idx"], dtype=int)
-    return {b: int(np.sum(idx == i)) for i, b in enumerate(shards.bands)}
-
-
 def parser() -> argparse.ArgumentParser:
     """Built separately so a test can ask what a flag defaults to.
 
@@ -154,9 +146,9 @@ def main() -> None:
     # more: a band with no patches no longer leaves a hole in the transform.
     # It is still worth seeing, because a band missing entirely usually means
     # the extraction stopped at its target before reaching it.
-    counts = _band_counts(shards)
-    print("patches per band: " + ", ".join(f"{b}={counts.get(b, 0)}" for b in shards.bands))
-    absent = [b for b in shards.bands if counts.get(b, 0) == 0]
+    counts = shards.band_counts()
+    print("patches per band: " + ", ".join(f"{b}={counts[b]}" for b in shards.bands))
+    absent = [b for b in shards.bands if counts[b] == 0]
     if absent:
         print(
             f"  NOTE: no patches in {absent}. Check the manifest's "

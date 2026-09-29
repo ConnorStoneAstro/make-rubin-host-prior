@@ -32,6 +32,12 @@ from ..config import BANDS
 #: Per-patch scalar columns and their on-disk dtypes.  ``-1`` is the convention
 #: for "not applicable".
 META_DTYPES: dict[str, str] = {
+    # Index into the **global** ``config.BANDS``, not into whatever subset a
+    # given run extracted: ``BANDS.index(band_name)``, so g is always 1 whether
+    # or not u was collected.  That is what lets shards from runs with different
+    # band lists be merged and read together.  Read it with
+    # ``ShardSet.band_counts()``; enumerating a shard's own ``bands`` and
+    # comparing the position to this is an off-by-one, and was one.
     "band_idx": "u1",
     "x0": "i4",
     "y0": "i4",
@@ -225,6 +231,18 @@ class ShardSet:
     @property
     def bands(self) -> tuple[str, ...]:
         return tuple(json.loads(self.attrs.get("bands", json.dumps(list(BANDS)))))
+
+    def band_counts(self) -> dict[str, int]:
+        """Patches per band name, over the global ``BANDS``.
+
+        ``band_idx`` is a global index, so this cannot be computed by walking
+        ``self.bands`` -- that is the subset this run extracted, and its
+        positions are not the stored values.  Doing exactly that made
+        ``prepare_config.py`` report every band's count against the next band's
+        name, and the first band of the subset as absent.
+        """
+        idx = np.asarray(self.meta["band_idx"], dtype=int)
+        return {b: int(np.sum(idx == i)) for i, b in enumerate(BANDS)}
 
     def nbytes(self, key: str = "image") -> int:
         n = self.native_size
