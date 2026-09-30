@@ -54,30 +54,80 @@ def dsm_loss(
 def dsm_loss_by_sigma(
     model: ConvEnergyNet,
     x: Float[Array, "b c h w"],
-    sigma: Float[Array, " b"],
+    sigmas: Float[Array, " n"],
     key: PRNGKeyArray,
     sde: VESDE,
     margin: int | None = None,
-) -> Float[Array, " b"]:
-    """Per-example loss at *prescribed* noise levels.
+) -> Float[Array, "n b"]:
+    """Loss of **every** patch at **every** sigma: shape ``(n_sigma, b)``.
 
     For validation: a loss curve against sigma tells you which part of the
-    schedule is underfit, which an aggregate number hides completely.
+    schedule is underfit, which an aggregate number hides entirely.
 
-    Two things to know when reading that curve.  It should *fall* with sigma --
-    for data of scale ``tau`` the optimal residual variance is
-    ``tau^2 / (tau^2 + sigma^2)``, which tends to 1 as sigma falls (a tiny amount
-    of added noise is unidentifiable) and to 0 as sigma grows.  And each point is
-    a single example, so its Monte Carlo error is about
-    ``sqrt(2 / n_interior_pixels)`` -- roughly 4% for a 32x32 interior.  Scatter
-    of that size is noise, not structure.
+    **It used to give one patch per sigma**, pairing example ``i`` with
+    ``sigma[i]``, and that made the curve unreadable. The scatter between
+    neighbouring points was not the sigma dependence, it was the difference
+    between a blank-sky patch and one with a bright galaxy in it -- swings of
+    0.68 to 0.04 to 0.45 at adjacent sigmas, reproducible from one eval to the
+    next only because the batch and the pairing were fixed. A docstring here
+    claimed the scatter was Monte Carlo at the ~4% level and that anything that
+    size was noise; the real scatter was ten times that and came from the
+    patches, not the noise draw.
+
+    Every patch now sees every sigma, with an independent noise draw per sigma,
+    so averaging across the batch axis leaves the sigma dependence and nothing
+    else. Cost is ``n_sigma`` batches instead of one, evaluated one at a time so
+    the memory is a single batch; at 32 of each that is a few seconds on a
+    schedule that runs every few thousand steps.
     """
     if margin is None:
         margin = model.loss_margin
-    x_noisy, eps = sde.perturb(key, x, sigma)
-    s = batched_score(model, x_noisy, sigma)
-    residual = sigma[:, None, None, None] * s + eps
-    return jnp.mean(crop_interior(residual, margin) ** 2, axis=(1, 2, 3))
+    sigmas = jnp.atleast_1d(jnp.asarray(sigmas))
+    batch = x.shape[0]
+
+    def at(carry):
+        sigma, k = carry
+        full = jnp.full((batch,), sigma)
+        x_noisy, eps = sde.perturb(k, x, full)
+        s = batched_score(model, x_noisy, full)
+        residual = full[:, None, None, None] * s + eps
+        return jnp.mean(crop_interior(residual, margin) ** 2, axis=(1, 2, 3))
+
+    keys = jax.random.split(key, len(sigmas))
+    # `lax.map` and not `vmap`: vmapping would put n_sigma batches of a
+    # gradient-of-a-gradient on the device at once, which is the one thing here
+    # that can exhaust it.
+    return jax.lax.map(at, (sigmas, keys))
+
+
+def gaussian_loss_floor(
+    x: Float[Array, "b c h w"], sigmas: Float[Array, " n"]
+) -> Float[Array, " n"]:
+    """The loss the best *Gaussian* model of this data would reach, per sigma.
+
+    Averaged over Fourier modes, ``P_k / (P_k + sigma^2)`` with ``P_k`` the
+    data's own per-mode power. It is what ``dsm_loss_by_sigma`` should be
+    compared against, and it is the number every hand-wave about "is the model
+    underfit here" has been standing in for.
+
+    **An upper bound on what is achievable, not a lower one.** The true score of
+    a non-Gaussian distribution carries more information than its covariance, so
+    the real optimum sits at or below this. Which makes the comparison one-sided
+    and useful: a model *above* this curve is definitely underfit at that sigma,
+    while one below it is exploiting structure a Gaussian cannot.
+    """
+    v = jnp.asarray(x)
+    if v.ndim == 4:
+        v = v[:, 0]
+    v = v - jnp.mean(v, axis=(-2, -1), keepdims=True)
+    h = v.shape[-1]
+    # Per-mode power, averaged over the batch.  Parseval: the mean over modes of
+    # `power` is the per-pixel variance, which is what makes the ratio below the
+    # fraction of variance that survives at this sigma.
+    power = jnp.mean(jnp.abs(jnp.fft.fft2(v)) ** 2, axis=0) / h ** 2
+    s2 = jnp.asarray(sigmas)[:, None] ** 2
+    flat = power.reshape(1, -1)
+    return jnp.mean(flat / (flat + s2), axis=1)
 
 
 def mean_dsm_loss(

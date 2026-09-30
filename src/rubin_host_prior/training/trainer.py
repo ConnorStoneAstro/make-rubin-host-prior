@@ -28,7 +28,8 @@ from jax.sharding import AxisType, NamedSharding, PartitionSpec
 
 from .. import geometry
 from ..config import Config, TrainConfig
-from ..diffusion.loss import dsm_loss, dsm_loss_by_sigma
+from ..diffusion.loss import (dsm_loss, dsm_loss_by_sigma,
+                              gaussian_loss_floor)
 from ..diffusion.sde import VESDE
 from ..nn.energy import ConvEnergyNet, n_parameters
 from .checkpoint import load_checkpoint, load_opt_state, save_checkpoint
@@ -289,9 +290,10 @@ def train(
 
     @eqx.filter_jit
     def eval_fn(model, batch, key, sigmas):
-        # One fixed sigma per example, spanning the schedule: a loss curve
-        # against sigma shows *where* the model is underfit, which the scalar
-        # training loss hides entirely.
+        # Every patch at every sigma, so averaging over the batch leaves the
+        # sigma dependence and nothing else.  Pairing one patch with each sigma
+        # -- which this did -- produced a curve whose bumps were the difference
+        # between a blank patch and a bright one, not a property of the model.
         return dsm_loss_by_sigma(model, batch, sigmas, key, sde, margin)
 
     # Folded with the step the run starts from, so a resumed chunk does not
@@ -377,14 +379,26 @@ def train(
             if (eval_batch is not None and cfg.eval_every
                     and step % cfg.eval_every == 0):
                 key, k_eval = jax.random.split(key)
-                n = eval_batch.shape[0]
-                sigmas = sde.sigma(jnp.linspace(0.0, 1.0, n))
+                sigmas = sde.sigma(jnp.linspace(0.0, 1.0, cfg.eval_sigmas))
                 per = eval_fn(ema_model, jnp.asarray(eval_batch), k_eval, sigmas)
+                n = per.shape[1]
+                mean = jnp.mean(per, axis=1)
+                # Standard error on that mean, so a bump can be told from the
+                # scatter of the patches it was averaged over.
+                err = jnp.std(per, axis=1) / jnp.sqrt(n)
                 record = {
                     "step": step,
                     "event": "eval",
                     "sigma": [float(s) for s in sigmas],
-                    "loss_by_sigma": [float(v) for v in per],
+                    "loss_by_sigma": [float(v) for v in mean],
+                    "loss_by_sigma_err": [float(v) for v in err],
+                    # What the best Gaussian model of this batch would score.
+                    # Above it is definitely underfit; below it means the model
+                    # is using structure a covariance cannot express.
+                    "gaussian_floor": [
+                        float(v) for v in gaussian_loss_floor(
+                            jnp.asarray(eval_batch), sigmas)
+                    ],
                 }
                 log_file.write(json.dumps(record) + "\n")
                 log_file.flush()

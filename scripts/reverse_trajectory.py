@@ -125,10 +125,12 @@ def main() -> None:
         gb = plots.band_power(reference, tuple(args.scales))
         # Everything coarser than the largest band, which is only a handful of
         # modes and, in a field this red, is not a handful of the variance.
+        below_ratio = ga["below_rms"] / gb["below_rms"]
+        below_err = (ga["below_rel_error"] ** 2
+                     + gb["below_rel_error"] ** 2) ** 0.5
         print(f"{'>' + str(ga['below_scale']):>7} {ga['below_rms']:>10.4g} "
-              f"{gb['below_rms']:>10.4g} "
-              f"{ga['below_rms'] / gb['below_rms']:>8.2f}"
-              f"{'':>8} {ga['below_modes']:>7,}")
+              f"{gb['below_rms']:>10.4g} {below_ratio:>8.2f} "
+              f"{below_err * below_ratio:>7.2f} {ga['below_modes']:>7,}")
         print(f"{'all':>7} {ga['total_rms']:>10.4g} {gb['total_rms']:>10.4g} "
               f"{ga['total_rms'] / gb['total_rms']:>8.2f}"
               f"{'':>8} {sum(ga['n_modes']) + ga['below_modes']:>7,}")

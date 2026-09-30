@@ -349,6 +349,12 @@ class TrainConfig:
     #: sources of truth drift.
     eval_every: int = 5000
     eval_size: int = 32
+    #: Rungs on the eval's sigma ladder.  Decoupled from ``eval_size``, which it
+    #: used to be equal to for the wrong reason: the eval paired example ``i``
+    #: with ``sigma[i]``, so one number served as both the number of patches and
+    #: the number of noise levels, and the curve it produced was a picture of
+    #: which patch got which sigma.  Every patch now sees every rung.
+    eval_sigmas: int = 32
 
     #: Checkpoints spread evenly over the run, rather than an interval that has
     #: to be recomputed every time ``steps`` changes.  The last one lands on the

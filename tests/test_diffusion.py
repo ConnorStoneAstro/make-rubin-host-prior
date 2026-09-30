@@ -115,16 +115,20 @@ def test_analytic_score_beats_a_zero_score():
 
 
 def test_loss_by_sigma_resolves_the_schedule():
+    """Every patch at every sigma, so the batch axis is an average and the
+    curve is a property of the model rather than of which patch got which."""
     sde = VESDE(0.01, 10.0)
     tau = 0.8
-    x = tau * jax.random.normal(jax.random.key(6), (64, 1, 32, 32))
-    sigmas = sde.sigma(jnp.linspace(0.0, 1.0, 64))
+    x = tau * jax.random.normal(jax.random.key(6), (24, 1, 32, 32))
+    sigmas = sde.sigma(jnp.linspace(0.0, 1.0, 20))
     per = np.asarray(
         dsm_loss_by_sigma(
             GaussianEnergy(tau=tau), x, sigmas, jax.random.key(7), sde, margin=0
         )
     )
-    assert per.shape == (64,)
+    assert per.shape == (20, 24)          # (n_sigma, n_patches), not (b,)
+    curve = per.mean(axis=1)
+
     # For data N(0, tau^2) the optimal residual variance is exactly
     # tau^2 / (tau^2 + sigma^2).  Note which way round that runs: it tends to 1
     # as sigma -> 0 (tiny added noise is unidentifiable, so the best denoiser
@@ -132,13 +136,59 @@ def test_loss_by_sigma_resolves_the_schedule():
     # pure noise, so eps is recoverable).  The loss curve against sigma therefore
     # *falls* with sigma for a well-fit model.
     expected = tau**2 / (tau**2 + np.asarray(sigmas) ** 2)
-    deviation = np.abs(per - expected)
-    # Each point is one example over a 32x32 interior, so its own Monte Carlo
-    # error is ~sqrt(2/1024) = 4.4%.  The mean is the tight constraint; the max
-    # over 64 points is allowed a few sigma.
-    assert deviation.mean() < 0.05, deviation.mean()
-    assert deviation.max() < 0.25, deviation.max()
-    assert per[0] > 0.9 and per[-1] < 0.1
+    deviation = np.abs(curve - expected)
+    assert deviation.mean() < 0.02, deviation.mean()
+    assert deviation.max() < 0.06, deviation.max()
+    assert curve[0] > 0.9 and curve[-1] < 0.1
+    # Averaging is what buys that: one patch per sigma scatters several times
+    # more, and it was the patch and not the sigma doing the scattering.
+    one_each = per[np.arange(20), np.arange(20) % 24]
+    assert np.std(one_each - expected) > 2 * np.std(curve - expected)
+
+
+def test_the_gaussian_floor_is_the_bar_the_curve_is_read_against():
+    """``P_k/(P_k + sigma^2)`` averaged over modes: what the best Gaussian model
+    of this data would score, and the thing every "is it underfit here" guess
+    has been standing in for."""
+    from rubin_host_prior.diffusion import gaussian_loss_floor
+
+    sde = VESDE(0.01, 10.0)
+    sigmas = sde.sigma(jnp.linspace(0.0, 1.0, 16))
+
+    tau = 0.7
+    white = tau * jax.random.normal(jax.random.key(0), (64, 1, 32, 32))
+    got = np.asarray(gaussian_loss_floor(white, sigmas))
+    # White data has one power for every mode, so the average collapses to the
+    # closed form.
+    assert got == pytest.approx(
+        tau**2 / (tau**2 + np.asarray(sigmas) ** 2), rel=0.02)
+    assert np.all(np.diff(got) < 0)
+
+    # And a model that IS that Gaussian sits on the floor, which is what makes
+    # the comparison readable at all.
+    per = np.asarray(dsm_loss_by_sigma(
+        GaussianEnergy(tau=tau), white, sigmas, jax.random.key(1), sde, margin=0))
+    assert np.abs(per.mean(axis=1) - got).max() < 0.05
+
+    # A red field of the *same variance* has a lower floor, not a higher one,
+    # and the direction is worth stating because it is the opposite of the
+    # intuition that large structure "survives longer".  It does -- per mode.
+    # The floor averages over modes, and a red field puts its variance in a few
+    # of them, so the great majority die sooner and the mean falls faster.
+    # Which matters for reading a real curve: galaxy stamps are steeply red, so
+    # there is more on the table than `var/(var+sigma^2)` suggests.
+    n = 32
+    ky, kx = np.meshgrid(np.fft.fftfreq(n) * n, np.fft.fftfreq(n) * n,
+                         indexing="ij")
+    k = np.hypot(ky, kx)
+    k[0, 0] = 1.0
+    rng = np.random.default_rng(0)
+    red = np.fft.ifft2((rng.normal(size=(64, n, n))
+                        + 1j * rng.normal(size=(64, n, n))) * k ** -1.5).real
+    red = red / red.std() * tau
+    red_floor = np.asarray(gaussian_loss_floor(red[:, None], sigmas))
+    assert np.all(red_floor <= got + 1e-6), (red_floor, got)
+    assert (red_floor / got).min() < 0.5, (red_floor / got).min()
 
 
 @pytest.mark.parametrize(

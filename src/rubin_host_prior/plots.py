@@ -249,6 +249,10 @@ def band_power(x: np.ndarray, scales, window: bool = False) -> dict:
     out["below_modes"] = int(below.sum())
     out["below_rms"] = float(
         np.sqrt(float(power[..., below].sum(-1).mean()) / h ** 4))
+    # The fewest modes of any row, so the row that most needs its error bar.
+    out["below_rel_error"] = (
+        float(1.0 / np.sqrt(2.0 * out["below_modes"] * n_patches))
+        if out["below_modes"] else float("inf"))
     # Measured the same way as the bands, so the table's last row is the sum of
     # the ones above it rather than a number from a different estimator.
     out["total_rms"] = float(
