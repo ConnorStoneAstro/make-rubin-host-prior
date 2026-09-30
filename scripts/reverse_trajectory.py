@@ -75,9 +75,15 @@ def main() -> None:
         dataset = PatchDataset.from_shards(
             shards, config, LogFluxTransform.from_config(config.transform),
             in_memory=False)
-        # The same scenes forward_diffusion.py shows, so the two figures and
-        # the table below all describe one set of patches.
-        reference = plots.forward_patches(dataset, 16, False, args.seed)
+        # Augmented, and that is not cosmetic: the model was trained on
+        # translated crops, so the distribution it is matching is the one where
+        # the host can sit anywhere and can be cut by the frame.  A centred
+        # reference has 16% more power at 32 px than the training distribution
+        # does, and charging the samples for that is charging them for the
+        # loader's convention.  More patches than the sample count, because the
+        # augmentation draw adds its own scatter -- ~4% at the largest band.
+        reference = plots.forward_patches(dataset, 64, augment=True,
+                                          seed=args.seed)
 
     # The same lines forward_diffusion.py prints, from the same file, so the
     # two can be put next to each other and checked rather than assumed.
@@ -115,8 +121,11 @@ def main() -> None:
             err = (got["rel_error"][i] ** 2 + want["rel_error"][i] ** 2) ** 0.5
             print(f"{sc:>7} {a:>10.4g} {b:>10.4g} {a / b:>8.2f} "
                   f"{err * a / b:>7.2f} {got['n_modes'][i]:>7,}")
-        print(f"{'all':>7} {np.std(final):>10.4g} {np.std(reference):>10.4g} "
-              f"{np.std(final) / np.std(reference):>8.2f}   (total std)")
+        ga = plots.band_power(final, tuple(args.scales))
+        gb = plots.band_power(reference, tuple(args.scales))
+        print(f"{'all':>7} {ga['total_rms']:>10.4g} {gb['total_rms']:>10.4g} "
+              f"{ga['total_rms'] / gb['total_rms']:>8.2f}"
+              f"{'':>8} {sum(ga['n_modes']):>7,}")
     print(f"\nwrote {path}")
 
 

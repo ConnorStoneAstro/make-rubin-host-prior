@@ -156,7 +156,7 @@ def plot_cutouts(shards, n: int = 100, seed: int = 0, out: Path | None = None):
 # column where they stop resembling each other is the sigma range to suspect.
 
 
-def band_power(x: np.ndarray, scales, window: bool = True) -> dict:
+def band_power(x: np.ndarray, scales, window: bool = False) -> dict:
     """Variance per octave band, straight off the periodogram.
 
     ``scales`` are in pixels; the band for ``l`` is the octave ``|k|`` from
@@ -170,19 +170,34 @@ def band_power(x: np.ndarray, scales, window: bool = True) -> dict:
     0.400 exactly. It is also the basis the mode-counting argument is made in,
     so the measurement and the reasoning are about the same object.
 
-    **A Hann window, because the FFT assumes the patch is periodic** and a stamp
-    is not. A gradient across the frame -- a mis-subtracted sky, a bright
-    neighbour just outside -- wraps into a step at the edge, and a step has
-    power at every ``k``: measured, an unwindowed periodogram put **540x** too
-    much power in the 1 px band. The window removes that exactly. What it does
-    not remove, and should not, is genuine large-scale content: a real gradient
-    is real power at 32 px, and if it is in the data but not in the samples it
-    will show up here as a deficit. That is a true statement about the samples
-    and a thing to be aware of when reading one.
+**``window`` is off by default, and that is the opposite of the usual
+    advice.**  A Hann window is the standard guard against the FFT's periodicity
+    assumption: a gradient across the frame wraps into a step at the edge, and a
+    step has power at every ``k`` -- measured on a red field, an unwindowed
+    periodogram put **540x** too much power in the 1 px band.
+
+    But a Hann window is *itself* a centred bump, so it preserves large-scale
+    power that sits in the middle of the frame and suppresses large-scale power
+    that does not.  Measured by taking a host-centred stamp and randomising its
+    Fourier phases -- identical power spectrum mode for mode, centring
+    destroyed, so the true ratio is exactly 1.000 -- the window reported
+    **0.631 at 16 px and 0.434 at 32 px**, while the unwindowed periodogram gave
+    1.011 and 1.002.
+
+    That bias lands exactly where this measurement is used: the real patches are
+    host-centred by construction and model samples have no preferred centre, so
+    windowing charges the samples a factor of two at the largest scale for a
+    difference that is not in their power spectrum.  Off by default; turn it on
+    only for data with a genuine gradient, and know what it costs.
 
     ``n_modes`` and ``rel_error`` come back with it because the largest band is
     small -- 36 modes on a 128 px grid -- and a ratio quoted from it deserves
     its error bar.
+
+    The bands are the octaves ``|k|`` in ``[N/2l, N/l)``, which are disjoint and
+    cover everything except ``|k| < 2`` -- the very largest modes, which no 128
+    px stamp constrains anyway -- so their variances sum to the field's, and
+    ``total_rms`` is that sum rather than a separate ``np.std``.
     """
     x = np.asarray(x, dtype=np.float64)
     if x.ndim == 4:
@@ -205,7 +220,7 @@ def band_power(x: np.ndarray, scales, window: bool = True) -> dict:
     k = np.hypot(ky, kx)
 
     out = {"scales": tuple(int(s) for s in scales), "rms": [], "n_modes": [],
-           "rel_error": [], "white_rms": []}
+           "rel_error": [], "white_rms": [], "total_rms": 0.0}
     for scale in out["scales"]:
         band = (k >= h / (2.0 * scale)) & (k < h / float(scale))
         m = int(band.sum())
@@ -220,6 +235,9 @@ def band_power(x: np.ndarray, scales, window: bool = True) -> dict:
         # White noise of unit variance is flat, so its share of a band is just
         # the band's share of the modes.  Exact, and no Monte Carlo draw.
         out["white_rms"].append(float(np.sqrt(m / h ** 2)))
+    # Measured the same way as the bands, so the table's last row is the sum of
+    # the ones above it rather than a number from a different estimator.
+    out["total_rms"] = float(np.sqrt(sum(v ** 2 for v in out["rms"])))
     return out
 
 
@@ -276,10 +294,18 @@ def forward_patches(dataset, n: int, augment: bool = False, seed: int = 0):
     """The patches the forward figure buries, and the ones its table measures.
 
     The same scenes either way -- the indices are the ones ``validation_batch``
-    fixes -- so ``--augment`` changes how they are presented and not which they
-    are.  Unaugmented by default, because a diagnostic that moves between runs
-    is one more thing to hold constant; pass ``augment`` to see exactly what
-    training is fed, dihedral and translation included.
+    fixes -- so ``augment`` changes how they are presented and not which they
+    are.
+
+    **Which to use depends on the question.**  For a figure, unaugmented: it is
+    the same picture every run, which is one less thing to hold constant. For a
+    *comparison against samples*, augmented, because that is the distribution
+    the model was trained to match and it is not the same distribution. The
+    translation is not a mere shift -- a crop that wanders can cut the host in
+    half, which no shift does -- so the spectra genuinely differ: measured on
+    stamps with the default geometry, the augmented reference has **16% less**
+    power at 32 px, and under 3% difference at every smaller scale. Comparing
+    samples against a centred reference charges them that 16%.
     """
     rng = np.random.default_rng(12345)
     idx = np.sort(rng.choice(len(dataset), size=min(n, len(dataset)),

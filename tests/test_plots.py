@@ -370,6 +370,7 @@ def test_band_power_windows_against_the_wrap():
     clean = band_power(red, (fine,))["rms"][0]
     leaked = band_power(ramp, (fine,), window=False)["rms"][0]
     fixed = band_power(ramp, (fine,), window=True)["rms"][0]
+    # ...which is why the option exists, even though it is off by default.
     assert leaked > 100 * clean, (leaked, clean)
     assert fixed == pytest.approx(clean, rel=0.05), (fixed, clean)
 
@@ -384,3 +385,78 @@ def test_band_power_reports_its_own_error_bar():
     assert got["n_modes"] == [3535, 600, 36]
     assert all(b > a for a, b in zip(got["rel_error"], got["rel_error"][1:]))
     assert got["rel_error"][-1] == pytest.approx(1 / np.sqrt(2 * 36 * 16))
+
+
+def test_the_window_would_charge_off_centre_structure_and_is_therefore_off():
+    """Why ``window`` defaults to False, against the usual advice.
+
+    A Hann window is a centred bump, so it preserves large-scale power in the
+    middle of the frame and suppresses large-scale power that is not.  Take a
+    host-centred stamp and randomise its Fourier phases: the power spectrum is
+    identical mode for mode and only the centring is gone, so the true band
+    ratio is exactly 1.000.  The window does not report that.
+
+    It matters because this is used to compare host-centred real patches
+    against model samples, which have no preferred centre -- so the bias falls
+    entirely on the thing being measured.
+    """
+    from rubin_host_prior.plots import band_power
+
+    n, m = 128, 32
+    rng = np.random.default_rng(0)
+    yy, xx = np.mgrid[:n, :n]
+    r = np.hypot(yy - n / 2, xx - n / 2)
+    centred = (2.0 * np.exp(-(r / 18.0) ** 1.2)[None]
+               + 0.54 * rng.normal(size=(m, n, n)))
+    spec = np.abs(np.fft.fft2(centred))
+    phase = rng.uniform(0, 2 * np.pi, size=spec.shape)
+    scrambled = np.fft.ifft2(spec * np.exp(1j * phase)).real
+    # Random phases are not Hermitian-symmetric, so `.real` drops half the
+    # power -- a flat factor across every band, restored here so the comparison
+    # is about the *shape* of the spectrum and nothing else.
+    scrambled *= np.sqrt(centred.var(axis=(1, 2))
+                         / scrambled.var(axis=(1, 2)))[:, None, None]
+
+    scales = (1, 2, 4, 8, 16, 32)
+    plain = [b / a for a, b in zip(band_power(centred, scales)["rms"],
+                                   band_power(scrambled, scales)["rms"])]
+    windowed = [b / a for a, b in
+                zip(band_power(centred, scales, window=True)["rms"],
+                    band_power(scrambled, scales, window=True)["rms"])]
+    assert plain == pytest.approx([1.0] * len(scales), abs=0.05), plain
+    assert windowed[-1] < 0.6, windowed        # 32 px, truth 1.0
+    assert windowed[-2] < 0.8, windowed        # 16 px
+
+
+def test_the_total_row_is_the_sum_of_the_bands():
+    """Or the table's last line would come from a different estimator than the
+    lines above it, and would not add up."""
+    from rubin_host_prior.plots import band_power
+
+    x = np.random.default_rng(0).normal(size=(8, 128, 128))
+    got = band_power(x, (1, 2, 4, 8, 16, 32))
+    assert got["total_rms"] == pytest.approx(
+        np.sqrt(sum(v ** 2 for v in got["rms"])))
+    # The bands miss only |k| < 2, so they account for nearly all the variance.
+    assert got["total_rms"] == pytest.approx(float(np.std(x)), rel=0.02)
+
+
+def test_the_augmented_reference_is_a_different_distribution(dataset):
+    """Not a quibble: the loader's translation can cut the host at the frame,
+    which a shift cannot, so the spectra really differ.  A periodogram is
+    translation-invariant, so this is *not* a centring effect -- it is the crop
+    landing somewhere that contains less galaxy.
+    """
+    from rubin_host_prior.plots import band_power, forward_patches
+
+    scales = (1, 2, 4, 8)
+    centred = band_power(forward_patches(dataset, 24, augment=False), scales)
+    augmented = [band_power(forward_patches(dataset, 24, augment=True, seed=s),
+                            scales) for s in range(4)]
+
+    fine = np.mean([b["rms"][0] for b in augmented]) / centred["rms"][0]
+    coarse = np.mean([b["rms"][-1] for b in augmented]) / centred["rms"][-1]
+    # Fine scales are sky and are unmoved by where the crop landed; the coarse
+    # band is the galaxy and is not.
+    assert fine == pytest.approx(1.0, abs=0.08), fine
+    assert abs(coarse - 1.0) > abs(fine - 1.0), (coarse, fine)
