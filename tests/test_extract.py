@@ -786,6 +786,69 @@ def test_merging_parts_looks_exactly_like_one_run(monkeypatch, tmp_path):
     assert "part" not in summary["counts"]
 
 
+def test_repack_rewrites_the_parts_into_uniform_shards(monkeypatch, tmp_path):
+    """Linking preserves each part's partial tail shard; repacking removes them.
+
+    A 20-part campaign came out as 41 shards of between 1 and 1,024 rows where
+    31 full ones would have held it, because every part flushes whatever is in
+    its buffer when it finishes.  That is harmless for a cached run and awkward
+    for shard-level sampling, where a uniformly chosen shard over-represents the
+    small ones and a shard shorter than the batch cannot fill one.
+    """
+    from rubin_host_prior.data import ShardSet
+
+    out = tmp_path / "campaign"
+    for k in range(3):
+        _campaign(monkeypatch, out / "parts" / str(k), part=(k, 3))
+
+    linked = _merge_parts_module().merge(out)
+    before = ShardSet.from_dir(out / "shards")
+    assert len(before.paths) > 1
+    images_before = before.load("image")
+    meta_before = {k: np.array(v) for k, v in before.meta.items()}
+
+    per_shard = 4
+    merged = _merge_parts_module().merge(out, repack=per_shard)
+    after = ShardSet.from_dir(out / "shards")
+
+    # Same patches, same order, same metadata -- only the packing changed.
+    assert len(after) == len(before)
+    np.testing.assert_array_equal(after.load("image"), images_before)
+    for key, value in meta_before.items():
+        np.testing.assert_array_equal(after.meta[key], value, err_msg=key)
+    assert after.native_size == before.native_size
+    assert after.bands == before.bands
+
+    # Uniform: every shard full except the last.
+    counts = list(after.counts)
+    assert all(c == per_shard for c in counts[:-1]), counts
+    assert 0 < counts[-1] <= per_shard
+    assert len(after.paths) == -(-len(after) // per_shard)
+    assert merged["repacked_to"] == per_shard
+
+    # Real files now, not links, and the parts they came from still exist.
+    originals = {p.stat().st_ino for p in (out / "parts").glob("*/shards/*.h5")}
+    assert not ({p.stat().st_ino for p in after.paths} & originals)
+    assert len(list((out / "parts").glob("*/shards/*.h5"))) == len(linked["shards"])
+
+
+def test_repack_is_rerunnable(monkeypatch, tmp_path):
+    """It replaces `<out>/shards` and reads only from `<out>/parts`, so running
+    it twice is not running it on its own output."""
+    from rubin_host_prior.data import ShardSet
+
+    out = tmp_path / "campaign"
+    for k in range(2):
+        _campaign(monkeypatch, out / "parts" / str(k), part=(k, 2))
+    _merge_parts_module().merge(out, repack=4)
+    once = ShardSet.from_dir(out / "shards")
+    n, images = len(once), once.load("image")
+    _merge_parts_module().merge(out, repack=4)
+    twice = ShardSet.from_dir(out / "shards")
+    assert len(twice) == n
+    np.testing.assert_array_equal(twice.load("image"), images)
+
+
 def test_merging_with_no_parts_says_so(tmp_path):
     with pytest.raises(SystemExit, match="no parts under"):
         _merge_parts_module().merge(tmp_path / "nothing")

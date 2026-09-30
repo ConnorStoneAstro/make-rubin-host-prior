@@ -14,6 +14,17 @@ the parts are already on the filesystem the merged set will live on; a link
 costs an inode. They are renamed ``part<K>-<original>`` on the way, which is
 what keeps two parts' ``patches-00000.h5`` apart.
 
+**``--repack`` rewrites them instead, into uniform shards.**  Linking preserves
+whatever each part happened to write, and every part flushes a partial shard
+when it finishes: a 20-part campaign of 30,737 patches came out as 41 shards
+between 1 and 1,024 rows, where 31 full ones would have held it. That is
+harmless for a run that caches the set in RAM and awkward for anything that
+samples by shard -- a shard chosen uniformly over-represents the small ones, and
+one with fewer rows than the batch cannot fill a batch at all. Repacking costs
+one full copy of the campaign, once, and is what makes shard-level sampling
+uniform. It reads from ``parts/`` and replaces ``shards/``; the parts are never
+touched, so it can be re-run.
+
 **What is summed and what is not.**  The counts and the rejection tallies are
 additive and are added. Wall-clock stages are summed too, which gives the
 campaign's total compute rather than its elapsed time -- the jobs ran at once.
@@ -48,10 +59,52 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("--copy", action="store_true",
                    help="copy the shards instead of hard-linking them, for a "
                         "parts directory on a different filesystem")
+    p.add_argument("--repack", type=int, nargs="?", const=-1, default=None,
+                   metavar="ROWS",
+                   help="rewrite the shards into uniform ROWS-row files "
+                        "instead of linking them; omit ROWS to use the "
+                        "config's stamps.patches_per_shard. Costs one full "
+                        "copy and makes shard-level sampling uniform.")
     return p
 
 
-def merge(out: Path, copy: bool = False) -> dict:
+def _repack(sources: list[Path], shard_dir: Path, per_shard: int,
+            block: int = 128) -> list[Path]:
+    """Rewrite ``sources`` as uniform ``per_shard``-row shards in ``shard_dir``.
+
+    Streamed in blocks rather than loaded whole: a campaign is tens of GiB and
+    the writer already buffers a shard's worth, so reading a shard's worth on
+    top of that would be the peak for no reason.  The reads are contiguous, so
+    each block is one hyperslab pass rather than a scatter.
+    """
+    import numpy as np
+
+    from rubin_host_prior.data.shards import META_DTYPES, ShardSet, ShardWriter
+
+    src = ShardSet.open(sources)
+    stale = sorted(shard_dir.glob("*.h5"))
+    if stale:
+        print(f"  replacing {len(stale)} shard files in {shard_dir} "
+              f"(the parts they came from are untouched)")
+        for p in stale:
+            p.unlink()
+    attrs = {k: v for k, v in src.attrs.items() if k != "n_patches"}
+    writer = ShardWriter(shard_dir, native_size=src.native_size,
+                         patches_per_shard=per_shard, attrs=attrs)
+    n = len(src)
+    for start in range(0, n, block):
+        stop = min(start + block, n)
+        images = src.gather(np.arange(start, stop), "image")
+        for i in range(stop - start):
+            writer.add(images[i],
+                       {k: src.meta[k][start + i] for k in META_DTYPES})
+    paths = writer.close()
+    print(f"  repacked {n:,} patches into {len(paths)} shards of "
+          f"{per_shard} (last one short)")
+    return paths
+
+
+def merge(out: Path, copy: bool = False, repack: int | None = None) -> dict:
     parts = sorted((out / "parts").glob("*/summary.json"))
     if not parts:
         raise SystemExit(
@@ -63,7 +116,7 @@ def merge(out: Path, copy: bool = False) -> dict:
     shard_dir = out / "shards"
     shard_dir.mkdir(parents=True, exist_ok=True)
     merged: dict = {"merged_from": [], "parts": [], "shards": []}
-    manifests, hosts = [], []
+    manifests, hosts, to_repack = [], [], []
 
     for summary_path in parts:
         part_dir = summary_path.parent
@@ -76,6 +129,9 @@ def merge(out: Path, copy: bool = False) -> dict:
                     merged.setdefault(key, {})
                     merged[key][name] = merged[key].get(name, 0) + value
         for src in sorted((part_dir / "shards").glob("*.h5")):
+            if repack:
+                to_repack.append(src)
+                continue
             dest = shard_dir / f"{part_dir.name}-{src.name}"
             if dest.exists():
                 dest.unlink()
@@ -89,6 +145,9 @@ def merge(out: Path, copy: bool = False) -> dict:
             if path.exists():
                 into.append(pd.read_parquet(path))
 
+    if repack:
+        merged["shards"] = [str(p) for p in _repack(to_repack, shard_dir, repack)]
+        merged["repacked_to"] = repack
     # `part` is a per-job label and means nothing for the whole; `stamps_
     # requested` summed back up is the campaign target it was divided from.
     merged.get("counts", {}).pop("part", None)
@@ -102,8 +161,12 @@ def merge(out: Path, copy: bool = False) -> dict:
 
 def main() -> None:
     args = parser().parse_args()
-    out = Path(args.out or ExtractionConfig.load(args.config).out)
-    merged = merge(out, copy=args.copy)
+    config = ExtractionConfig.load(args.config)
+    out = Path(args.out or config.out)
+    repack = args.repack
+    if repack == -1:
+        repack = config.stamps.patches_per_shard
+    merged = merge(out, copy=args.copy, repack=repack)
     counts = merged.get("counts", {})
     print(f"merged {len(merged['merged_from'])} parts into {out}")
     print(f"  {len(merged['shards'])} shards, "

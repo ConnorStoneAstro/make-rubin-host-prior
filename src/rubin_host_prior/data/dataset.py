@@ -35,6 +35,9 @@ class PatchDataset:
         band_idx: np.ndarray,
         shards: ShardSet | None = None,
         native: np.ndarray | None = None,
+        pool_shards: int = 8,
+        pool_refill_every: int = 64,
+        prefetch_depth: int = 3,
     ):
         if shards is None and native is None:
             raise ValueError("need shards or native stamps")
@@ -43,34 +46,46 @@ class PatchDataset:
         self.band_idx = np.asarray(band_idx)
         self.shards = shards
         self._native = native
+        #: Machine properties, not config fields -- the same run on a node with
+        #: more RAM should hold more shards, exactly as ``--devices`` and
+        #: ``--max-in-memory-gb`` are the machine and not the model.
+        self.pool_shards = pool_shards
+        self.pool_refill_every = pool_refill_every
+        self.prefetch_depth = prefetch_depth
+        self._shard_pool = None
 
     @property
     def in_memory(self) -> bool:
-        """Whether batches come from RAM or from the shard files each time.
+        """Whether the whole set is cached, or served from a pool of shards.
 
-        **This is a performance cliff, not a preference.**  Cached, a batch is a
-        numpy fancy-index; streaming, it is one HDF5 open per shard the batch
-        touches plus one compressed-chunk read per patch, and a batch of 128
-        random indices touches nearly every shard of a large set.  Measured on
-        NERSC: 0.39 s/step cached against 2.92 s/step streaming, same model,
-        same batch, same four devices -- the only difference being that the set
-        had grown past ``max_in_memory_gb``.  ``storage_note`` is what says so
-        at startup, because crossing this silently is what made that a day.
+        Cached, a batch is a numpy fancy-index and every patch is equally
+        available.  Otherwise ``batches`` draws from ``ShardPool`` -- whole
+        shards held in RAM, one replaced at a time by a sequential read -- which
+        costs a fraction of the RAM and, measured, about the same per step.
+        What is *not* an option any more is a row-by-row read of the whole set
+        per batch: on a parallel filesystem that measured 22x the cost of
+        reading a shard in one pass, and it silently became the fallback the
+        moment a campaign grew past ``max_in_memory_gb``.
         """
         return self._native is not None
 
     def storage_note(self, max_in_memory_gb: float | None = None) -> str:
-        """One line on where batches come from and what it costs."""
+        """One line on where batches come from."""
         gb = self.shards.nbytes("image") / 1024**3 if self.shards else 0.0
         if self.in_memory:
-            return f"dataset: {gb:.2f} GiB of stamps cached in RAM"
+            return (f"dataset: {gb:.2f} GiB of stamps cached in RAM, "
+                    f"prefetch depth {self.prefetch_depth}")
         over = (f", over the {max_in_memory_gb:g} GiB cap"
                 if max_in_memory_gb is not None else "")
+        held = min(self.pool_shards, len(self.shards.paths))
+        per = self.shards.nbytes("image") / max(len(self.shards.paths), 1) / 1024**3
         return (
-            f"dataset: {gb:.2f} GiB of stamps STREAMING from "
-            f"{len(self.shards.paths)} shards{over} -- every batch re-reads "
-            f"them, which is several times slower per step than a cached run. "
-            f"Pass --max-in-memory-gb {max(gb + 2, 2):.0f} if the node has the RAM."
+            f"dataset: {gb:.2f} GiB of stamps in {len(self.shards.paths)} "
+            f"shards{over}; batches come from a pool of {held} resident "
+            f"(~{held * per:.1f} GiB), one replaced every "
+            f"{self.pool_refill_every} batches by a background sequential read, "
+            f"prefetch depth {self.prefetch_depth}. "
+            f"--max-in-memory-gb {max(gb + 2, 2):.0f} would cache it outright."
         )
 
     # -- construction -----------------------------------------------------
@@ -83,6 +98,9 @@ class PatchDataset:
         transform: LogFluxTransform,
         in_memory: bool | str = "auto",
         max_in_memory_gb: float = 16.0,
+        pool_shards: int = 8,
+        pool_refill_every: int = 64,
+        prefetch_depth: int = 3,
     ) -> "PatchDataset":
         if shards.native_size < config.patch.native_size:
             raise ValueError(
@@ -105,6 +123,9 @@ class PatchDataset:
             band_idx=shards.meta["band_idx"],
             shards=shards,
             native=native,
+            pool_shards=pool_shards,
+            pool_refill_every=pool_refill_every,
+            prefetch_depth=prefetch_depth,
         )
 
     def __len__(self) -> int:
@@ -117,20 +138,24 @@ class PatchDataset:
             return self._native[indices]
         return self.shards.gather(indices, "image")
 
-    def _pool(
+    def _pool_stamps(
         self,
-        indices: np.ndarray,
+        stamps: np.ndarray,
         rng: np.random.Generator | None,
         translate: bool,
         scale_jitter: float,
         out_size: int | None = None,
     ) -> np.ndarray:
-        """Pooled flux in nJy, before the log transform."""
+        """Pooled flux in nJy, before the log transform.
+
+        Takes stamps rather than indices, because the shard pool has native
+        stamps to hand and no global index to offer: it holds whole shards and
+        draws rows out of them.
+        """
         p = self.config.patch
         out_size = p.out_size if out_size is None else out_size
-        stamps = self._native_stamps(indices)
-        out = np.empty((len(indices), out_size, out_size), dtype=np.float32)
-        for i in range(len(indices)):
+        out = np.empty((len(stamps), out_size, out_size), dtype=np.float32)
+        for i in range(len(stamps)):
             out[i] = pool_to_training_grid(
                 stamps[i],
                 out_size=out_size,
@@ -142,17 +167,36 @@ class PatchDataset:
             )
         return out
 
-    def _pool_and_transform(
+    def batch_from_stamps(
         self,
-        indices: np.ndarray,
-        rng: np.random.Generator | None,
-        translate: bool,
-        scale_jitter: float,
+        stamps: np.ndarray,
+        rng: np.random.Generator | None = None,
+        augment: bool = True,
         out_size: int | None = None,
     ) -> np.ndarray:
-        out = self._pool(indices, rng, translate, scale_jitter, out_size)
+        """``(B, 1, S, S)`` float32 in the log representation, from raw stamps.
+
+        Everything ``make_batch`` does except deciding which stamps: crop and
+        pool, take the log, then the dihedral draw.  Split out so the shard pool
+        can hand its own rows in -- it holds whole shards, so it has stamps and
+        not global indices.
+        """
+        aug = self.config.augment
+        out_size = self.config.patch.out_size if out_size is None else out_size
+        x = self._pool_stamps(
+            stamps,
+            rng,
+            translate=augment and aug.translate,
+            scale_jitter=aug.scale_jitter if augment else 0.0,
+            out_size=out_size,
+        )
         # Pool in flux, THEN take the log.
-        return self.transform.forward(out)
+        x = self.transform.forward(x)
+        if augment and aug.dihedral:
+            if rng is None:
+                raise ValueError("dihedral augmentation requires an rng")
+            x = random_dihedral(x, rng)
+        return np.ascontiguousarray(x[:, None].astype(np.float32))
 
     def make_batch(
         self,
@@ -163,46 +207,56 @@ class PatchDataset:
     ) -> np.ndarray:
         """``(B, 1, S, S)`` float32 in the log representation, ``S = out_size``.
 
-        The loader used to carry ``2 * loss_margin`` of context on every side,
-        because valid convolutions scored only the interior.  Same-mode
-        convolutions score every pixel, so a batch is exactly the crop -- and
-        the reflected border that context sometimes needed is gone with it.
+        By global index, which means a read per patch when the set is not
+        cached -- right for the diagnostics and for ``validation_batch``, which
+        need particular patches, and wrong for training, which needs a great
+        many and does not care which.  ``batches`` uses the pool instead.
         """
-        aug = self.config.augment
-        out_size = self.config.patch.out_size if out_size is None else out_size
-        x = self._pool_and_transform(
-            indices,
-            rng,
-            translate=augment and aug.translate,
-            scale_jitter=aug.scale_jitter if augment else 0.0,
-            out_size=out_size,
-        )
-        if augment and aug.dihedral:
-            if rng is None:
-                raise ValueError("dihedral augmentation requires an rng")
-            x = random_dihedral(x, rng)
-        return np.ascontiguousarray(x[:, None].astype(np.float32))
+        return self.batch_from_stamps(
+            self._native_stamps(indices), rng, augment, out_size)
 
-    def batches(
+    def pool(self) -> "ShardPool":
+        """The resident-shard pool, built on first use.
+
+        Lazy because it costs ``n_resident`` whole-shard reads and a thread, and
+        most things that hold a dataset -- the diagnostics, ``prepare_config``,
+        a validation batch -- never ask for a training stream.
+        """
+        from .pool import ShardPool
+
+        if self._shard_pool is None:
+            if self.shards is None:
+                raise ValueError("a pool needs shards to read from")
+            self._shard_pool = ShardPool(
+                self.shards,
+                n_resident=self.pool_shards,
+                refill_every=self.pool_refill_every,
+                seed=self.config.train.seed,
+            )
+        return self._shard_pool
+
+    def _raw_batches(
         self,
         batch_size: int,
-        seed: int = 0,
-        shuffle: bool = True,
-        sizes: tuple[int, ...] | None = None,
+        seed: int,
+        shuffle: bool,
+        sizes: tuple[int, ...],
     ) -> Iterator[np.ndarray]:
-        """Infinite stream of augmented batches, reshuffled every epoch.
-
-        A batch is shape-homogeneous (JAX needs that), so when several sizes are
-        configured they are cycled round-robin across batches -- deterministic,
-        equal coverage, and a predictable number of jit compilations (one per
-        distinct size).
-        """
         rng = np.random.default_rng(seed)
-        sizes = tuple(sizes) if sizes else self.config.patch.training_sizes
+        k = 0
+        if self._native is None:
+            # Not cached: draw from whole shards held in RAM rather than reading
+            # scattered rows, which measured 22x slower per row on a parallel
+            # filesystem.  There is no epoch here -- residency is the shuffle.
+            pool = self.pool()
+            while True:
+                yield self.batch_from_stamps(
+                    pool.draw(rng, batch_size), rng,
+                    out_size=sizes[k % len(sizes)])
+                k += 1
         n = len(self)
         if n < batch_size:
             raise ValueError(f"{n} patches is fewer than batch_size {batch_size}")
-        k = 0
         while True:
             order = rng.permutation(n) if shuffle else np.arange(n)
             for start in range(0, n - batch_size + 1, batch_size):
@@ -212,6 +266,41 @@ class PatchDataset:
                     out_size=sizes[k % len(sizes)],
                 )
                 k += 1
+
+    def batches(
+        self,
+        batch_size: int,
+        seed: int = 0,
+        shuffle: bool = True,
+        sizes: tuple[int, ...] | None = None,
+        prefetch: int | None = None,
+    ) -> Iterator[np.ndarray]:
+        """Infinite stream of augmented batches, produced on a background thread.
+
+        A batch is shape-homogeneous (JAX needs that), so when several sizes are
+        configured they are cycled round-robin across batches -- deterministic,
+        equal coverage, and a predictable number of jit compilations (one per
+        distinct size).
+
+        **The thread is not an optimisation of the I/O alone.**  Building a
+        batch is 154 ms of pooling and transform against a 234 ms step, so even
+        a fully cached run spends 40% of its wall clock with the GPU idle.
+        Both numbers are numpy and h5py, which release the GIL over the work,
+        so the overlap is real.  ``prefetch=0`` runs inline, which is what the
+        determinism tests want.
+        """
+        from .pool import prefetch as _prefetch
+
+        sizes = tuple(sizes) if sizes else self.config.patch.training_sizes
+        raw = self._raw_batches(batch_size, seed, shuffle, sizes)
+        depth = self.prefetch_depth if prefetch is None else prefetch
+        return _prefetch(raw, depth) if depth else raw
+
+    def close(self) -> None:
+        """Stop the pool's reader thread.  Idempotent; safe if there is no pool."""
+        if self._shard_pool is not None:
+            self._shard_pool.close()
+            self._shard_pool = None
 
     def validation_batch(self, n: int, seed: int = 12345) -> np.ndarray:
         """Fixed, un-augmented, nominally pooled batch -- comparable across runs."""
@@ -248,7 +337,8 @@ class PatchDataset:
         p16, p84 = np.percentile(x, [16, 84])
         sky_scatter = float(0.5 * (p84 - p16))
         deepest_sigma = np.nan
-        flux = self._pool(idx, rng=None, translate=False, scale_jitter=0.0)
+        flux = self._pool_stamps(self._native_stamps(idx), rng=None,
+                                 translate=False, scale_jitter=0.0)
         sigma_pooled = (
             np.asarray(self.shards.meta["sky_noise"])[idx] / self.config.patch.pool_factor
         )

@@ -72,6 +72,11 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("--rounds", type=int, default=2,
                    help="passes over the same shards; round 2 shows page cache")
     p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--pool-shards", type=int, default=8)
+    p.add_argument("--pool-refill-every", type=int, default=64)
+    p.add_argument("--pool-batches", type=int, default=0,
+                   help="also time this many batches through the real loader "
+                        "in pool mode, which is what training will do")
     return p
 
 
@@ -129,9 +134,9 @@ def main() -> None:
     config = Config()
     config.patch.native_size = shards.native_size
     small = min(len(shards), 512)
-    pooled, _ = pool_shards(shards, config, n=small)
+    sample, _ = pool_shards(shards, config, n=small)
     config.transform.softening = estimate_softening(
-        pooled, config.transform.softening_sigma)
+        sample, config.transform.softening_sigma)
     cached = PatchDataset.from_shards(
         shards, config, LogFluxTransform.from_config(config.transform),
         in_memory=False)
@@ -142,10 +147,38 @@ def main() -> None:
     print(f"--- CPU floor " + "-" * 53)
     print(f"  make_batch from RAM       {_fmt(np.median(cpu))}"
           f"   (pool + transform + augment, no I/O)")
+    if args.pool_batches:
+        pooled = PatchDataset.from_shards(
+            shards, config, LogFluxTransform.from_config(config.transform),
+            max_in_memory_gb=1e-9, pool_shards=args.pool_shards,
+            pool_refill_every=args.pool_refill_every, prefetch_depth=3)
+        print(f"\n--- the real loader, pool mode " + "-" * 36)
+        print(f"  {pooled.storage_note(1e-9)}")
+        t0 = time.perf_counter()
+        first = _time(lambda: next(pooled.batches(b, seed=0)))[0]
+        fill = time.perf_counter() - t0
+        it = pooled.batches(b, seed=0)
+        next(it)
+        per = []
+        for _ in range(args.pool_batches):
+            per.append(_time(next, it)[0])
+        pooled.close()
+        per = np.asarray(per)
+        print(f"  first batch (includes the pool's initial fill) {_fmt(fill)}")
+        print(f"  median batch              {_fmt(np.median(per))}"
+              f"   <- what a training step waits for")
+        print(f"  slowest of {len(per):>4}           {_fmt(per.max())}"
+              f"   (a refill that the prefetch queue did not cover)")
+        print(f"  over the {args.pool_refill_every}-batch refill period, "
+              f"{100 * (per > 2 * np.median(per)).mean():.0f}% of batches were "
+              f"more than twice the median")
+
     print("\nA resident pool only pays off if 'whole shard, sequential' divided")
     print("by the batches you serve from it beats 'scattered, all shards'.")
     print("'Random shard per batch' only pays off if 'scattered, one shard' is")
     print("much cheaper than 'scattered, all shards' -- i.e. if opens dominate.")
+    print("The 'real loader' block is the one that settles it: it is the code")
+    print("training runs, prefetch thread and all.")
 
 
 if __name__ == "__main__":

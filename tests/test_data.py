@@ -502,6 +502,162 @@ def test_band_counts_reads_the_global_index_not_the_shard_subset(tmp_path):
     assert set(counts) == set(BANDS)
 
 
+# -- the shard pool and the prefetcher --------------------------------------
+#
+# Measured on a NERSC GPU node, 128 stamps out of a 30 GiB campaign: scattered
+# across all 41 shards 6.03 s, scattered inside one shard 1.08 s, one whole
+# shard read sequentially 2.09 ms/row -- 22x.  Not the file opens (41 of those
+# are 86 ms) but locality.  So training never reads a row on its own any more.
+
+
+def _pool_dataset(tmp_path, n_patches=120, per_shard=10, **kw):
+    from rubin_host_prior.data.synthetic import write_synthetic_shards
+
+    d = tmp_path / "shards"
+    if not d.exists():
+        write_synthetic_shards(d, n_patches=n_patches, native_size=64,
+                               patches_per_shard=per_shard, seed=3)
+    ss = ShardSet.from_dir(d)
+    config = Config(energy=TINY_ENERGY,
+                    patch=PatchConfig(native_size=64, out_size=16, pool_factor=2))
+    pooled, _ = pool_shards(ss, config)
+    config.transform.softening = estimate_softening(
+        pooled, config.transform.softening_sigma)
+    kw.setdefault("max_in_memory_gb", 1e-9)
+    kw.setdefault("pool_shards", 3)
+    kw.setdefault("pool_refill_every", 2)
+    return ss, PatchDataset.from_shards(
+        ss, config, LogFluxTransform.from_config(config.transform), **kw)
+
+
+def test_training_batches_never_read_scattered_rows(tmp_path, monkeypatch):
+    """The whole point.  ``gather`` is for the diagnostics and for a validation
+    batch, which need *particular* patches; training needs a great many and does
+    not care which, so it goes through the pool and ``gather`` is never called.
+    """
+    ss, ds = _pool_dataset(tmp_path)
+    assert not ds.in_memory
+
+    def boom(*a, **k):
+        raise AssertionError("batches() read scattered rows")
+
+    monkeypatch.setattr(type(ss), "gather", boom)
+    try:
+        it = ds.batches(8, seed=0, prefetch=0)
+        for _ in range(12):
+            b = next(it)
+            assert b.shape == (8, 1, 16, 16) and np.all(np.isfinite(b))
+    finally:
+        ds.close()
+
+
+def test_the_pool_mixes_across_every_resident_shard(tmp_path):
+    """A batch drawn from one shard would be ~106 distinct galaxies against 127,
+    and all of them from one run of the patch-ordered walk -- one region of sky,
+    one depth, one seeing.  Drawing across the residency is what avoids that."""
+    ss, ds = _pool_dataset(tmp_path, pool_shards=4, pool_refill_every=1000)
+    try:
+        pool = ds.pool()
+        assert pool.n_resident == 4
+        assert pool.resident_rows == 40          # 4 shards of 10
+        rng = np.random.default_rng(0)
+        # Every resident shard must be represented across a few draws.
+        rows = np.concatenate([pool.draw(rng, 8) for _ in range(5)])
+        whole = ss.load("image")
+        which = {int(np.argmin(np.abs(whole - r).sum(axis=(1, 2)))) // 10
+                 for r in rows}
+        assert len({s for s in pool._slot_shard} & which) == 4
+    finally:
+        ds.close()
+
+
+def test_the_pool_reaches_every_shard_eventually(tmp_path):
+    """Residency is the shuffle, so coverage has to come from the refill cycle.
+    A shuffled cycle, not an independent draw: with replacement a shard can go
+    unread for far longer than the cycle and coverage is uneven for no gain."""
+    ss, ds = _pool_dataset(tmp_path, pool_shards=3, pool_refill_every=1)
+    try:
+        it = ds.batches(8, seed=0, prefetch=0)
+        seen = set()
+        for _ in range(300):
+            next(it)
+            seen.update(ds.pool()._slot_shard)
+        assert seen == set(range(len(ss.paths))), sorted(seen)
+    finally:
+        ds.close()
+
+
+def test_the_pool_holds_whole_shards_not_selections(tmp_path):
+    """A resident slot is a shard read in one pass -- the thing that is 22x
+    cheaper per row than selecting the same rows out of it."""
+    ss, ds = _pool_dataset(tmp_path, pool_shards=2, pool_refill_every=10_000)
+    try:
+        pool = ds.pool()
+        whole = ss.load("image")
+        for slot, shard in zip(pool._slots, pool._slot_shard):
+            lo, hi = ss.offsets[shard], ss.offsets[shard + 1]
+            assert len(slot) == hi - lo
+            np.testing.assert_array_equal(slot, whole[lo:hi])
+    finally:
+        ds.close()
+
+
+def test_a_pool_smaller_than_the_batch_says_so(tmp_path):
+    ss, ds = _pool_dataset(tmp_path, pool_shards=1, pool_refill_every=1000)
+    try:
+        with pytest.raises(ValueError, match="holds 10 rows but a batch of 64"):
+            ds.pool().draw(np.random.default_rng(0), 64)
+    finally:
+        ds.close()
+
+
+def test_prefetch_changes_the_timing_and_not_the_batches(tmp_path):
+    """A background producer must be invisible in the output.  Same seed, same
+    batches, whatever the queue depth -- otherwise the thread would be a second
+    source of randomness and a run would not be reproducible."""
+    _, ds = _pool_dataset(tmp_path, max_in_memory_gb=16.0)
+    inline = [b.copy() for b, _ in zip(ds.batches(8, seed=5, prefetch=0), range(6))]
+    for depth in (1, 4):
+        threaded = [b.copy() for b, _ in
+                    zip(ds.batches(8, seed=5, prefetch=depth), range(6))]
+        for a, c in zip(inline, threaded):
+            np.testing.assert_array_equal(a, c)
+
+
+def test_prefetch_re_raises_in_the_consumer(tmp_path):
+    """Otherwise a failing loader leaves the training loop blocked on an empty
+    queue with the traceback in a thread nobody is watching."""
+    from rubin_host_prior.data import prefetch
+
+    def source():
+        yield 1
+        raise RuntimeError("loader broke")
+
+    it = prefetch(source(), depth=2)
+    assert next(it) == 1
+    with pytest.raises(RuntimeError, match="loader broke"):
+        next(it)
+
+    with pytest.raises(ValueError, match="at least 1"):
+        next(prefetch(iter([1]), depth=0))
+
+
+def test_prefetch_finishes_a_finite_source(tmp_path):
+    from rubin_host_prior.data import prefetch
+
+    assert list(prefetch(iter(range(50)), depth=3)) == list(range(50))
+
+
+def test_closing_the_dataset_stops_the_reader(tmp_path):
+    ss, ds = _pool_dataset(tmp_path)
+    pool = ds.pool()
+    assert pool._reader.is_alive()
+    ds.close()
+    pool._reader.join(timeout=3.0)
+    assert not pool._reader.is_alive()
+    ds.close()          # idempotent
+
+
 def test_gather_never_uses_h5py_fancy_indexing(shard_dir):
     """Reading rows by a list is a 32x performance trap, so it is not used.
 
@@ -530,16 +686,13 @@ def test_gather_never_uses_h5py_fancy_indexing(shard_dir):
         np.testing.assert_array_equal(got, whole[idx], err_msg=label)
 
 
-def test_caching_is_a_cliff_and_says_so(shard_dir):
-    """The 16 GiB default is a performance cliff, and crossing it was silent.
-
-    Cached, a batch is a numpy fancy-index; streaming, it is one HDF5 open per
-    shard the batch touches plus a compressed-chunk read per patch, and 128
-    random indices touch nearly every shard of a large set.  Measured on NERSC
-    with everything else identical: 0.39 s/step against 2.92 s/step, the only
-    difference being that the set had grown from 2,051 patches (2.0 GiB) to
-    30,737 (30.0 GiB).  Nothing in the startup output said which mode was
-    running, which is the part this pins.
+def test_the_storage_mode_is_announced_either_way(shard_dir):
+    """Crossing ``max_in_memory_gb`` used to be silent, and used to be a cliff:
+    the same config on 2,051 patches cached and on 30,737 fell back to a
+    row-by-row read, 0.39 s/step against 2.92 s/step, with nothing in the output
+    saying which was running.  It is no longer a cliff -- above the cap batches
+    come from a pool of resident shards -- but it is still a different machine
+    and still has to say so.
     """
     ss = ShardSet.from_dir(shard_dir)
     config = Config(energy=TINY_ENERGY, patch=PatchConfig(
@@ -550,19 +703,22 @@ def test_caching_is_a_cliff_and_says_so(shard_dir):
     transform = LogFluxTransform.from_config(config.transform)
 
     cached = PatchDataset.from_shards(ss, config, transform, max_in_memory_gb=16.0)
-    streamed = PatchDataset.from_shards(ss, config, transform,
-                                        max_in_memory_gb=1e-9)
-    assert cached.in_memory and not streamed.in_memory
+    pooled_ds = PatchDataset.from_shards(ss, config, transform,
+                                         max_in_memory_gb=1e-9)
+    assert cached.in_memory and not pooled_ds.in_memory
     assert "cached in RAM" in cached.storage_note(16.0)
-    note = streamed.storage_note(1e-9)
-    assert "STREAMING" in note and "--max-in-memory-gb" in note
+    note = pooled_ds.storage_note(1e-9)
+    assert "pool of" in note and "resident" in note
+    assert "--max-in-memory-gb" in note      # and how to cache it outright
 
-    # And the two must be the same data, or the cliff would also be a fork.
+    # By index the two are the same data; only `batches` differs, and only in
+    # which patches it chooses, never in how a chosen patch is rendered.
     idx = np.arange(4)
     np.testing.assert_array_equal(
         cached.make_batch(idx, rng=None, augment=False),
-        streamed.make_batch(idx, rng=None, augment=False),
+        pooled_ds.make_batch(idx, rng=None, augment=False),
     )
+    pooled_ds.close()
 
 
 def test_load_fills_one_array_rather_than_concatenating(shard_dir):

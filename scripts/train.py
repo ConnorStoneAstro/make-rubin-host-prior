@@ -57,7 +57,8 @@ def parser() -> argparse.ArgumentParser:
     ``out_size`` to 64 whatever the config said.
 
     Two kinds of flag are not config fields and do carry values:
-    ``--max-in-memory-gb`` and ``--devices`` describe the machine this run
+    ``--max-in-memory-gb``, ``--pool-shards``, ``--pool-refill-every``,
+    ``--prefetch`` and ``--devices`` describe the machine this run
     happens to be on rather than the run, and ``--shards``, ``--config``,
     ``--out`` and ``--resume`` say where to read and write.
     """
@@ -99,7 +100,18 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("--eval-size", type=int, default=None,
                    help="patches in the validation batch; omit to use the "
                         "config's own value")
-    p.add_argument("--max-in-memory-gb", type=float, default=16.0)
+    p.add_argument("--max-in-memory-gb", type=float, default=16.0,
+                   help="cache the whole set in host RAM below this size; "
+                        "above it, batches come from a pool of resident shards")
+    p.add_argument("--pool-shards", type=int, default=8,
+                   help="whole shards held in RAM when the set is not cached "
+                        "(default 8, about 8 GiB at 1024x512px shards)")
+    p.add_argument("--pool-refill-every", type=int, default=64,
+                   help="batches between one shard being replaced, by a "
+                        "background sequential read")
+    p.add_argument("--prefetch", type=int, default=3,
+                   help="batches built ahead on a background thread; 0 runs "
+                        "batch construction inline on the training thread")
     p.add_argument("--verbose", "-v", action="count", default=1)
     return p
 
@@ -157,7 +169,11 @@ def main() -> None:
     transform = LogFluxTransform.from_config(config.transform)
     shards = ShardSet.from_dir(args.shards)
     dataset = PatchDataset.from_shards(
-        shards, config, transform, max_in_memory_gb=args.max_in_memory_gb
+        shards, config, transform,
+        max_in_memory_gb=args.max_in_memory_gb,
+        pool_shards=args.pool_shards,
+        pool_refill_every=args.pool_refill_every,
+        prefetch_depth=args.prefetch,
     )
 
     model = config.build_model(jax.random.key(config.train.seed))
@@ -178,18 +194,28 @@ def main() -> None:
     if resume:
         start = json.loads((Path(resume) / "state.json").read_text())["step"]
 
-    train(
-        model,
-        dataset.batches(config.train.batch_size,
-                        seed=config.train.seed + start),
-        config,
-        out_dir=args.out,
-        sde=VESDE.from_config(config.sde),
-        eval_batch=dataset.validation_batch(config.train.eval_size),
-        on_log=lambda r: print(json.dumps(r)) if "event" not in r else None,
-        resume=resume,
-        n_devices=args.devices,
-    )
+    # The validation batch is drawn before the pool exists, by global index,
+    # so it is the same patches on every run whatever the residency happens to
+    # be when training starts.
+    eval_batch = dataset.validation_batch(config.train.eval_size)
+    try:
+        train(
+            model,
+            dataset.batches(config.train.batch_size,
+                            seed=config.train.seed + start),
+            config,
+            out_dir=args.out,
+            sde=VESDE.from_config(config.sde),
+            eval_batch=eval_batch,
+            on_log=lambda r: print(json.dumps(r)) if "event" not in r else None,
+            resume=resume,
+            n_devices=args.devices,
+        )
+    finally:
+        # Stops the pool's reader thread.  A daemon thread would die with the
+        # process anyway; doing it here means an interactive session or a test
+        # that trains twice does not accumulate readers.
+        dataset.close()
 
 
 if __name__ == "__main__":

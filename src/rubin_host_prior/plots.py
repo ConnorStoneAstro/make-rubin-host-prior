@@ -235,7 +235,8 @@ def plot_transform(dataset, n: int = 4, seed: int = 0, out: Path | None = None):
     n = min(n, len(dataset))
     idx = np.sort(rng.choice(len(dataset), size=n, replace=False))
     native = dataset._native_stamps(idx)
-    pooled = dataset._pool(idx, rng=None, translate=False, scale_jitter=0.0)
+    pooled = dataset._pool_stamps(native, rng=None, translate=False,
+                                  scale_jitter=0.0)
     logged = dataset.transform.forward(pooled)
     noise = np.asarray(dataset.shards.meta["sky_noise"])[idx]
 
