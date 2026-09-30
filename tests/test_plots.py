@@ -212,3 +212,90 @@ def test_package_imports_without_matplotlib(monkeypatch):
     monkeypatch.setattr(builtins, "__import__", fail)
     with pytest.raises(ImportError, match="need matplotlib"):
         plots._plt()
+
+
+# -- the diffusion, forwards and backwards ----------------------------------
+
+
+def test_scale_visibility_measures_what_it_claims():
+    """Two fields with known answers.
+
+    Band-pass noise falls like ``1/scale``, so for a *white* field -- whose
+    structure falls the same way -- every scale must cross at the same sigma,
+    and that sigma is the field's own rms: white data dies all at once. For a
+    red field, whose power is concentrated at large scales, the crossing must
+    rise with scale. That contrast is the whole content of the measurement, and
+    it is what says whether the galaxies in a patch outlive the stars.
+    """
+    from rubin_host_prior.plots import _box_smooth, scale_visibility
+
+    rng = np.random.default_rng(0)
+    scales = (1, 2, 4, 8, 16)
+
+    white = 3.0 * rng.normal(size=(4, 64, 64))
+    flat = scale_visibility(white, scales=scales)["sigma_visible"]
+    assert flat == pytest.approx([3.0] * len(scales), rel=0.05), flat
+
+    red = sum(float(s) * _box_smooth(rng.normal(size=(4, 64, 64)), s)
+              for s in scales)
+    rising = scale_visibility(red, scales=scales)["sigma_visible"]
+    assert all(b > a for a, b in zip(rising, rising[1:])), rising
+    assert rising[-1] > 4 * rising[0], rising
+
+
+def test_forward_diffusion_shows_every_level_and_the_scale_panel(dataset, tmp_path):
+    from rubin_host_prior.diffusion import VESDE
+
+    sde = VESDE(sigma_min=0.02, sigma_max=4.0)
+    fig, path = plots.plot_forward_diffusion(
+        dataset, sde, n=2, n_sigma=5, scales=(1, 2, 4), out=tmp_path)
+    assert path.exists()
+    drawn = [ax for ax in fig.axes if ax.images]
+    assert len(drawn) == 2 * (5 + 1)          # a clean column plus the ladder
+    size = dataset.config.patch.out_size
+    assert drawn[0].images[0].get_array().shape[-1] == size
+    # The SNR panel: one line per scale plus the SNR = 1 rule.
+    panel = [ax for ax in fig.axes if ax.get_xlabel() == "sigma"][0]
+    assert len(panel.get_lines()) == 3 + 1
+    assert panel.get_xscale() == "log" and panel.get_yscale() == "log"
+    plt.close(fig)
+
+
+def test_reverse_trajectory_lines_up_with_the_forward_one(tiny_model, tmp_path):
+    """Same ladder in both figures, so column k is the same sigma in each."""
+    from rubin_host_prior.diffusion import VESDE
+
+    sde = VESDE(sigma_min=0.05, sigma_max=2.0)
+    fig, path = plots.plot_reverse_trajectory(
+        tiny_model, sde, out_size=12, n=2, n_sigma=4, n_steps=6,
+        data_std=0.5, out=tmp_path)
+    assert path.exists()
+    drawn = [ax for ax in fig.axes if ax.images]
+    assert len(drawn) == 2 * 4
+    assert drawn[0].images[0].get_array().shape[-1] == 12
+    # Columns are labelled with their sigma, descending left to right.
+    titles = [float(ax.get_title()) for ax in drawn[:4] if ax.get_title()]
+    assert titles == sorted(titles, reverse=True), titles
+    # The width panel carries the trajectory and the forward reference.
+    panel = [ax for ax in fig.axes if ax.get_xlabel() == "sigma"][0]
+    assert len(panel.get_lines()) == 2
+    plt.close(fig)
+
+
+def test_forward_patches_shows_the_same_scenes_either_way(dataset):
+    """``--augment`` changes how the patches are presented, not which they are:
+    the indices are the ones ``validation_batch`` fixes, so the figure and its
+    table stay comparable between runs."""
+    from rubin_host_prior.plots import forward_patches
+
+    plain = forward_patches(dataset, 4, augment=False, seed=0)
+    again = forward_patches(dataset, 4, augment=False, seed=1)
+    aug = forward_patches(dataset, 4, augment=True, seed=0)
+
+    size = dataset.config.patch.out_size
+    assert plain.shape == (4, size, size) == aug.shape
+    # Unaugmented is deterministic whatever the seed; augmented is not the same
+    # pixels, but it is the same scenes and so the same overall level.
+    np.testing.assert_array_equal(plain, again)
+    assert not np.array_equal(plain, aug)
+    assert aug.mean() == pytest.approx(plain.mean(), rel=0.2)

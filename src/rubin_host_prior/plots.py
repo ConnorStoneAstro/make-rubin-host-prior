@@ -147,6 +147,246 @@ def plot_cutouts(shards, n: int = 100, seed: int = 0, out: Path | None = None):
     return fig, _save(fig, out, "cutouts")
 
 
+# -- the diffusion itself, forwards and backwards ---------------------------
+#
+# These two are meant to be read side by side.  ``VESDE.ladder`` gives both the
+# same noise levels, so column k of one is the same sigma as column k of the
+# other, and a model that has learned the score should produce at each sigma
+# something whose structure matches what the forward process leaves there.  The
+# column where they stop resembling each other is the sigma range to suspect.
+
+
+def _box_smooth(x: np.ndarray, k: int) -> np.ndarray:
+    """Separable box filter over the trailing two axes, reflect-padded.
+
+    Cumulative sums rather than a convolution, so smoothing on a 64 px scale
+    costs what smoothing on a 2 px scale does and the scale sweep below is not
+    dominated by its largest entry.
+    """
+    if k <= 1:
+        return np.asarray(x, dtype=np.float64)
+    a = np.asarray(x, dtype=np.float64)
+    lo, hi = k // 2, k - 1 - k // 2
+    for axis in (-2, -1):
+        pad = [(0, 0)] * a.ndim
+        pad[axis] = (lo, hi)
+        c = np.cumsum(np.pad(a, pad, mode="reflect"), axis=axis)
+        zero = np.zeros_like(np.take(c, [0], axis=axis))
+        c = np.concatenate([zero, c], axis=axis)
+        n = c.shape[axis] - k
+        a = (np.take(c, np.arange(k, k + n), axis=axis)
+             - np.take(c, np.arange(0, n), axis=axis)) / k
+    return a
+
+
+def _bandpass_rms(x: np.ndarray, scale: int) -> float:
+    """RMS of the structure at ``scale``: smoothed at it, minus smoothed at 2x.
+
+    A band-pass and not a low-pass, because a low-pass at 32 px still contains
+    everything above 32 px and would report the galaxy's total flux as though it
+    were structure on that scale.
+    """
+    return float(np.std(_box_smooth(x, scale) - _box_smooth(x, 2 * scale)))
+
+
+def scale_visibility(
+    clean: np.ndarray, scales=(1, 2, 4, 8, 16, 32), seed: int = 0
+) -> dict:
+    """At which sigma does structure of each spatial scale stop being visible?
+
+    **The question behind "the samples are all stars".**  Band-pass noise scales
+    exactly linearly with sigma, so measuring it once at unit noise gives the
+    signal-to-noise at every sigma for free:
+
+        SNR(scale, sigma) = rms_signal(scale) / (sigma * rms_unit_noise(scale))
+
+    and the crossing ``SNR = 1`` is the noise level above which that scale is
+    gone.  Read against the schedule: a scale whose crossing sits above
+    ``sigma_max`` is never resolved by the model at any noise level it trains
+    on, and one whose crossing sits far below ``sigma_min`` is only ever learned
+    in the last few steps of sampling.
+    """
+    x = np.asarray(clean, dtype=np.float64)
+    if x.ndim == 4:
+        x = x[:, 0]
+    noise = np.random.default_rng(seed).normal(size=x.shape)
+    out = {"scales": tuple(int(s) for s in scales), "signal": [], "noise": [],
+           "sigma_visible": []}
+    for scale in out["scales"]:
+        sig = _bandpass_rms(x, scale)
+        nse = _bandpass_rms(noise, scale)
+        out["signal"].append(sig)
+        out["noise"].append(nse)
+        out["sigma_visible"].append(sig / nse if nse > 0 else np.inf)
+    return out
+
+
+def _sigma_panel(ax, vis, sde, title):
+    """SNR against sigma, one line per spatial scale, with the schedule marked."""
+    sigmas = np.geomspace(sde.sigma_min * 0.5, sde.sigma_max * 2.0, 200)
+    cmap = _plt().get_cmap("viridis")
+    for i, scale in enumerate(vis["scales"]):
+        snr = vis["signal"][i] / (sigmas * vis["noise"][i])
+        ax.loglog(sigmas, snr, color=cmap(i / max(len(vis["scales"]) - 1, 1)),
+                  label=f"{scale} px", lw=1.6)
+    ax.axhline(1.0, color="k", ls=":", lw=1.0)
+    ax.axvspan(sde.sigma_min, sde.sigma_max, color="0.85", zorder=0)
+    ax.set_xlabel("sigma")
+    ax.set_ylabel("signal / noise at this scale")
+    ax.set_title(title, fontsize=9)
+    ax.legend(fontsize=6, ncol=2, title="scale", title_fontsize=6)
+    ax.grid(alpha=0.25, which="both")
+
+
+def forward_patches(dataset, n: int, augment: bool = False, seed: int = 0):
+    """The patches the forward figure buries, and the ones its table measures.
+
+    The same scenes either way -- the indices are the ones ``validation_batch``
+    fixes -- so ``--augment`` changes how they are presented and not which they
+    are.  Unaugmented by default, because a diagnostic that moves between runs
+    is one more thing to hold constant; pass ``augment`` to see exactly what
+    training is fed, dihedral and translation included.
+    """
+    rng = np.random.default_rng(12345)
+    idx = np.sort(rng.choice(len(dataset), size=min(n, len(dataset)),
+                             replace=False))
+    return dataset.make_batch(idx, rng=np.random.default_rng(seed),
+                              augment=augment)[:, 0]
+
+
+def plot_forward_diffusion(
+    dataset,
+    sde,
+    n: int = 4,
+    n_sigma: int = 8,
+    seed: int = 0,
+    scales=(1, 2, 4, 8, 16, 32),
+    augment: bool = False,
+    out: Path | None = None,
+):
+    """Real patches buried by the forward process, and what survives where.
+
+    The rows are patches from the loader, the first column clean and the rest at
+    the ``VESDE.ladder`` noise levels, ascending.  **One noise field per patch,
+    scaled** -- the marginals are identical either way, and reusing it makes the
+    progression legible: the same structure is watched going under rather than a
+    fresh pattern each column.
+
+    Each column is stretched to its own percentiles.  A shared stretch would
+    show the high-sigma columns as flat grey, which is true and useless; the
+    question these answer is *what is still discernible here*, which is what a
+    per-column stretch asks.
+
+    The bottom panel is the quantitative version, and the one to read first: the
+    noise level at which each spatial scale stops being visible.
+    """
+    plt = _plt()
+
+    clean = forward_patches(dataset, n, augment, seed)
+    n = len(clean)
+    ladder = np.asarray(sde.ladder(n_sigma))[::-1]          # ascending
+    rng = np.random.default_rng(seed)
+    eps = rng.normal(size=clean.shape)
+
+    cols = n_sigma + 1
+    fig = plt.figure(figsize=(1.45 * cols, 1.45 * n + 4.0))
+    outer = fig.add_gridspec(2, 1, height_ratios=[1.45 * n, 3.2], hspace=0.30)
+    grid = outer[0].subgridspec(n, cols, hspace=0.06, wspace=0.05)
+    for j in range(cols):
+        panel = clean if j == 0 else clean + ladder[j - 1] * eps
+        lo, hi = np.percentile(panel, (0.5, 99.5))
+        for i in range(n):
+            ax = fig.add_subplot(grid[i, j])
+            _show(ax, panel[i], lo, hi, cmap="viridis")
+            if i == 0:
+                ax.set_title("clean" if j == 0 else f"{ladder[j - 1]:.3g}",
+                             fontsize=7)
+
+    vis = scale_visibility(clean, scales, seed=seed)
+    _sigma_panel(fig.add_subplot(outer[1]), vis, sde,
+                 "what survives: SNR per spatial scale against sigma "
+                 "(shaded = the trained schedule; dotted = SNR 1)")
+    fig.suptitle(
+        f"forward diffusion: {n} real patches at {n_sigma} noise levels, "
+        f"each column on its own stretch"
+        + (", as training sees them" if augment else ""), fontsize=10)
+    return fig, _save(fig, out, "forward_diffusion")
+
+
+def plot_reverse_trajectory(
+    model,
+    sde,
+    out_size: int,
+    n: int = 4,
+    n_sigma: int = 8,
+    n_steps: int = 128,
+    seed: int = 0,
+    data_std: float | None = None,
+    out: Path | None = None,
+):
+    """How a sample comes out of the noise: the sampler, with a recorder on it.
+
+    Columns descend the same ``VESDE.ladder`` the forward figure ascends, so the
+    two line up and can be compared at matched sigma.  Each column is stretched
+    to its own percentiles, for the same reason.
+
+    The bottom panel is the check that costs nothing and catches a diverging
+    sampler: the marginal of the forward process at ``sigma`` has width
+    ``sqrt(data_var + sigma^2)``, so a reverse trajectory whose spread departs
+    from that curve is not tracking the distribution it is supposed to be
+    reversing -- whatever the pictures look like.
+    """
+    import jax
+
+    from .diffusion.sampler import pflow_trajectory
+
+    plt = _plt()
+
+    shape = (n, model.config.in_channels, out_size, out_size)
+    states, step_sigmas = pflow_trajectory(
+        model, jax.random.key(seed), shape, sde, n_steps=n_steps)
+    states = np.asarray(states)[:, :, 0]                  # (steps, n, H, W)
+    step_sigmas = np.asarray(step_sigmas)
+
+    ladder = np.asarray(sde.ladder(n_sigma))              # descending
+    picks = [int(np.argmin(np.abs(np.log(step_sigmas) - np.log(s))))
+             for s in ladder]
+
+    cols = len(picks)
+    fig = plt.figure(figsize=(1.45 * cols, 1.45 * n + 4.0))
+    outer = fig.add_gridspec(2, 1, height_ratios=[1.45 * n, 3.2], hspace=0.30)
+    grid = outer[0].subgridspec(n, cols, hspace=0.06, wspace=0.05)
+    for j, k in enumerate(picks):
+        panel = states[k]
+        finite = panel[np.isfinite(panel)]
+        lo, hi = (np.percentile(finite, (0.5, 99.5)) if finite.size else (0, 1))
+        for i in range(n):
+            ax = fig.add_subplot(grid[i, j])
+            _show(ax, panel[i], lo, hi, cmap="viridis")
+            if i == 0:
+                ax.set_title(f"{step_sigmas[k]:.3g}", fontsize=7)
+
+    ax = fig.add_subplot(outer[1])
+    spread = states.reshape(len(states), -1).std(axis=1)
+    ax.loglog(step_sigmas, spread, lw=1.6, label="trajectory")
+    var = 0.0 if data_std is None else float(data_std) ** 2
+    ax.loglog(step_sigmas, np.sqrt(step_sigmas ** 2 + var), "k--", lw=1.2,
+              label=r"$\sqrt{\sigma^2 + \mathrm{var}(x)}$"
+                    + ("" if data_std is not None else "  (data var unknown)"))
+    ax.set_xlabel("sigma")
+    ax.set_ylabel("std of the scene")
+    ax.set_title("does the trajectory keep the width the forward process has "
+                 "at this sigma?", fontsize=9)
+    ax.invert_xaxis()
+    ax.legend(fontsize=7)
+    ax.grid(alpha=0.25, which="both")
+    fig.suptitle(
+        f"reverse trajectory: {n} samples at {n_sigma} of {n_steps} steps, "
+        f"sigma falling left to right, each column on its own stretch",
+        fontsize=10)
+    return fig, _save(fig, out, "reverse_trajectory")
+
+
 # -- what the loader yields ------------------------------------------------
 
 

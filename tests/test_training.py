@@ -284,6 +284,25 @@ def _script(name: str):
     return module
 
 
+def test_both_trajectory_scripts_read_one_config():
+    """They only line up if they share a schedule, and the only way to be sure
+    is to read the same file.  ``reverse_trajectory.py`` has no choice -- the
+    config comes out of the checkpoint -- so ``forward_diffusion.py`` is given
+    ``--checkpoint`` to match it, and is refused if it is told neither."""
+    p = _script("forward_diffusion.py").parser()
+    assert p.get_default("checkpoint") is None
+    assert p.get_default("config") is None
+    args = p.parse_args(["--checkpoint", "runs/r/final"])
+    assert args.checkpoint == "runs/r/final" and args.config is None
+    with pytest.raises(SystemExit):
+        p.parse_args([])                                   # one is required
+    with pytest.raises(SystemExit):
+        p.parse_args(["--checkpoint", "a", "--config", "b"])  # and not both
+    # The reverse script takes only a checkpoint, so there is nothing to agree.
+    r = _script("reverse_trajectory.py").parser()
+    assert r.parse_args(["--checkpoint", "runs/r/final"]).checkpoint
+
+
 def test_no_script_decides_a_config_value_for_itself():
     """``config.py`` is the one source of truth for defaults.
 

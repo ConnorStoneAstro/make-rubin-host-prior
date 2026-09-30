@@ -13,6 +13,7 @@ from rubin_host_prior.diffusion import (
     dsm_loss_by_sigma,
     pflow_sample,
     reverse_sde_sample,
+    pflow_trajectory,
     sample_scene,
 )
 
@@ -236,3 +237,40 @@ def test_unknown_sampler_rejected(tiny_model):
     with pytest.raises(ValueError, match="unknown sampler"):
         sample_scene(tiny_model, jax.random.key(11), 12, VESDE(),
                         sampler="nope")
+
+
+# -- watching the process, forwards and backwards ---------------------------
+
+
+def test_the_ladder_descends_the_schedule_geometrically():
+    sde = VESDE(sigma_min=0.01, sigma_max=10.0)
+    for n in (2, 5, 9):
+        rungs = np.asarray(sde.ladder(n))
+        assert len(rungs) == n
+        assert rungs[0] == pytest.approx(sde.sigma_max)
+        assert rungs[-1] == pytest.approx(sde.sigma_min)
+        assert np.all(np.diff(rungs) < 0)
+        # Geometric: equal ratios, which is what makes a forward figure and a
+        # reverse one line up column for column.
+        ratios = rungs[:-1] / rungs[1:]
+        assert np.allclose(ratios, ratios[0], rtol=1e-6)
+    with pytest.raises(ValueError, match="at least 2"):
+        sde.ladder(1)
+
+
+def test_the_trajectory_is_the_sampler_with_a_recorder_on_it(tiny_model):
+    """If it were a second implementation the figure would be a picture of
+    something other than what sampling does."""
+    sde = VESDE(sigma_min=0.02, sigma_max=3.0)
+    shape, steps = (2, 1, 12, 12), 8
+    key = jax.random.key(4)
+    final = np.asarray(pflow_sample(tiny_model, key, shape, sde, n_steps=steps))
+    states, sigmas = pflow_trajectory(tiny_model, key, shape, sde, n_steps=steps)
+    states, sigmas = np.asarray(states), np.asarray(sigmas)
+
+    assert states.shape == (steps,) + shape
+    assert sigmas.shape == (steps,)
+    np.testing.assert_array_equal(states[-1], final)
+    # One sigma per recorded state, ending at the bottom of the schedule.
+    assert np.all(np.diff(sigmas) < 0)
+    assert sigmas[-1] == pytest.approx(sde.sigma_min, rel=1e-5)

@@ -29,6 +29,29 @@ def _sigma_schedule(sde: VESDE, n_steps: int) -> Float[Array, " n"]:
     return sde.sigma(jnp.linspace(1.0, 0.0, n_steps + 1))
 
 
+def _pflow_scan(model, key, shape, sde, n_steps, heun):
+    """The integration itself, emitting every intermediate state.
+
+    Factored out so ``pflow_sample`` and ``pflow_trajectory`` cannot drift: a
+    trajectory that came from a second implementation would be a picture of
+    something other than what sampling does.
+    """
+    sigmas = _sigma_schedule(sde, n_steps)
+    x = sde.prior_sample(key, shape)
+    batch = shape[0]
+
+    def step(x, i):
+        s_cur, s_next = sigmas[i], sigmas[i + 1]
+        d_cur = -s_cur * batched_score(model, x, jnp.full((batch,), s_cur))
+        x_next = x + (s_next - s_cur) * d_cur
+        if heun:
+            d_next = -s_next * batched_score(model, x_next, jnp.full((batch,), s_next))
+            x_next = x + (s_next - s_cur) * 0.5 * (d_cur + d_next)
+        return x_next, x_next
+
+    return jax.lax.scan(step, x, jnp.arange(n_steps))
+
+
 @eqx.filter_jit
 def pflow_sample(
     model: ConvEnergyNet,
@@ -44,21 +67,31 @@ def pflow_sample(
     costs two score evaluations per step and is worth it -- Euler needs several
     times more steps for the same accuracy.
     """
-    sigmas = _sigma_schedule(sde, n_steps)
-    x = sde.prior_sample(key, shape)
-    batch = shape[0]
-
-    def step(x, i):
-        s_cur, s_next = sigmas[i], sigmas[i + 1]
-        d_cur = -s_cur * batched_score(model, x, jnp.full((batch,), s_cur))
-        x_next = x + (s_next - s_cur) * d_cur
-        if heun:
-            d_next = -s_next * batched_score(model, x_next, jnp.full((batch,), s_next))
-            x_next = x + (s_next - s_cur) * 0.5 * (d_cur + d_next)
-        return x_next, None
-
-    x, _ = jax.lax.scan(step, x, jnp.arange(n_steps))
+    x, _ = _pflow_scan(model, key, shape, sde, n_steps, heun)
     return x
+
+
+@eqx.filter_jit
+def pflow_trajectory(
+    model: ConvEnergyNet,
+    key: PRNGKeyArray,
+    shape: tuple[int, int, int, int],
+    sde: VESDE,
+    n_steps: int = 256,
+    heun: bool = True,
+) -> tuple[Float[Array, "n b c h w"], Float[Array, " n"]]:
+    """Every state the sampler passes through, and the sigma each sits at.
+
+    ``(states, sigmas)`` with ``states[i]`` the scene after the step that ended
+    at ``sigmas[i]``, so ``states[-1]`` is exactly what ``pflow_sample`` returns
+    for the same key.  Same noise, same integration -- this is the sampler with
+    a recorder on it, not a reimplementation of it.
+
+    Memory is ``n_steps`` times a batch, so keep the batch small: 128 steps of
+    four 128x128 scenes is 33 MB, four hundred is not.
+    """
+    _, xs = _pflow_scan(model, key, shape, sde, n_steps, heun)
+    return xs, _sigma_schedule(sde, n_steps)[1:]
 
 
 @eqx.filter_jit

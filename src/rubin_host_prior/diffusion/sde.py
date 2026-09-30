@@ -67,6 +67,20 @@ class VESDE:
     def sigma(self, t: Float[Array, "..."]) -> Float[Array, "..."]:
         return self.sigma_min * (self.sigma_max / self.sigma_min) ** t
 
+    def ladder(self, n: int) -> Float[Array, " n"]:
+        """``n`` noise levels from ``sigma_max`` down to ``sigma_min``.
+
+        The schedule's own geometric spacing, so a forward figure and a reverse
+        one drawn with the same ``n`` have columns that correspond: the same
+        noise level in both, which is the comparison worth making.  A model that
+        has learned the score produces, at each sigma, something whose structure
+        matches what the forward process leaves at that sigma -- so the two
+        figures should look like each other, column by column.
+        """
+        if n < 2:
+            raise ValueError(f"a ladder needs at least 2 levels, got {n}")
+        return self.sigma(jnp.linspace(1.0, 0.0, n))
+
     def t_of_sigma(self, sigma: Float[Array, "..."]) -> Float[Array, "..."]:
         return jnp.log(sigma / self.sigma_min) / self.log_ratio
 
