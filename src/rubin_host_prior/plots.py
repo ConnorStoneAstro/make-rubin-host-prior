@@ -321,7 +321,8 @@ def plot_reverse_trajectory(
     n_sigma: int = 8,
     n_steps: int = 128,
     seed: int = 0,
-    data_std: float | None = None,
+    reference: np.ndarray | None = None,
+    scales=(1, 2, 4, 8, 16, 32),
     out: Path | None = None,
 ):
     """How a sample comes out of the noise: the sampler, with a recorder on it.
@@ -330,11 +331,18 @@ def plot_reverse_trajectory(
     two line up and can be compared at matched sigma.  Each column is stretched
     to its own percentiles, for the same reason.
 
-    The bottom panel is the check that costs nothing and catches a diverging
-    sampler: the marginal of the forward process at ``sigma`` has width
-    ``sqrt(data_var + sigma^2)``, so a reverse trajectory whose spread departs
-    from that curve is not tracking the distribution it is supposed to be
-    reversing -- whatever the pictures look like.
+    The bottom left panel is the check that costs nothing and catches a
+    diverging sampler: the forward marginal at ``sigma`` has width
+    ``sqrt(data_var + sigma^2)``, so a trajectory whose spread departs from that
+    curve is not tracking the distribution it is supposed to be reversing --
+    whatever the pictures look like.
+
+    Pass ``reference`` -- real patches, ideally the ones ``forward_patches``
+    gives, so the two figures describe the same scenes -- and the bottom right
+    panel asks what the left one cannot: **the same total variance can be spent
+    on any mixture of scales.** A model that follows the width curve exactly and
+    still draws only point sources is putting its variance in the wrong place,
+    and that shows up here as a ratio rather than an impression.
     """
     import jax
 
@@ -366,20 +374,37 @@ def plot_reverse_trajectory(
             if i == 0:
                 ax.set_title(f"{step_sigmas[k]:.3g}", fontsize=7)
 
-    ax = fig.add_subplot(outer[1])
+    bottom = outer[1].subgridspec(1, 2, wspace=0.28)
+    ax = fig.add_subplot(bottom[0])
     spread = states.reshape(len(states), -1).std(axis=1)
     ax.loglog(step_sigmas, spread, lw=1.6, label="trajectory")
-    var = 0.0 if data_std is None else float(data_std) ** 2
+    data_std = None if reference is None else float(np.std(reference))
+    var = 0.0 if data_std is None else data_std ** 2
     ax.loglog(step_sigmas, np.sqrt(step_sigmas ** 2 + var), "k--", lw=1.2,
               label=r"$\sqrt{\sigma^2 + \mathrm{var}(x)}$"
                     + ("" if data_std is not None else "  (data var unknown)"))
     ax.set_xlabel("sigma")
     ax.set_ylabel("std of the scene")
-    ax.set_title("does the trajectory keep the width the forward process has "
-                 "at this sigma?", fontsize=9)
+    ax.set_title("total width against sigma", fontsize=9)
     ax.invert_xaxis()
     ax.legend(fontsize=7)
     ax.grid(alpha=0.25, which="both")
+
+    ax2 = fig.add_subplot(bottom[1])
+    got = scale_visibility(states[-1], scales, seed=seed)
+    ax2.loglog(got["scales"], got["signal"], "o-", lw=1.6, label="samples")
+    if reference is not None:
+        want = scale_visibility(reference, scales, seed=seed)
+        ax2.loglog(want["scales"], want["signal"], "s--", lw=1.4, color="k",
+                   label="real patches")
+        for sc, a, b in zip(got["scales"], got["signal"], want["signal"]):
+            ax2.annotate(f"x{a / b:.2f}", (sc, a), textcoords="offset points",
+                         xytext=(0, -12), ha="center", fontsize=6)
+    ax2.set_xlabel("spatial scale (px)")
+    ax2.set_ylabel("band-pass rms")
+    ax2.set_title("and where that width is spent", fontsize=9)
+    ax2.legend(fontsize=7)
+    ax2.grid(alpha=0.25, which="both")
     fig.suptitle(
         f"reverse trajectory: {n} samples at {n_sigma} of {n_steps} steps, "
         f"sigma falling left to right, each column on its own stretch",

@@ -266,9 +266,11 @@ def test_reverse_trajectory_lines_up_with_the_forward_one(tiny_model, tmp_path):
     from rubin_host_prior.diffusion import VESDE
 
     sde = VESDE(sigma_min=0.05, sigma_max=2.0)
+    rng = np.random.default_rng(0)
+    reference = rng.normal(size=(6, 12, 12)) * 0.5
     fig, path = plots.plot_reverse_trajectory(
         tiny_model, sde, out_size=12, n=2, n_sigma=4, n_steps=6,
-        data_std=0.5, out=tmp_path)
+        reference=reference, scales=(1, 2, 4), out=tmp_path)
     assert path.exists()
     drawn = [ax for ax in fig.axes if ax.images]
     assert len(drawn) == 2 * 4
@@ -279,6 +281,13 @@ def test_reverse_trajectory_lines_up_with_the_forward_one(tiny_model, tmp_path):
     # The width panel carries the trajectory and the forward reference.
     panel = [ax for ax in fig.axes if ax.get_xlabel() == "sigma"][0]
     assert len(panel.get_lines()) == 2
+    # And the power panel carries the samples against the real patches: the
+    # same total width can be spent on any mixture of scales, so matching the
+    # width curve says nothing about which scales got it.
+    power = [ax for ax in fig.axes
+             if ax.get_xlabel() == "spatial scale (px)"][0]
+    assert len(power.get_lines()) == 2
+    assert power.get_xscale() == "log" and power.get_yscale() == "log"
     plt.close(fig)
 
 

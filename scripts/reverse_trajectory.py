@@ -27,6 +27,8 @@ from pathlib import Path
 
 import numpy as np
 
+import jax
+
 from rubin_host_prior import plots
 from rubin_host_prior.data import LogFluxTransform, PatchDataset, ShardSet
 from rubin_host_prior.diffusion import VESDE
@@ -38,8 +40,12 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("--checkpoint", required=True)
     p.add_argument("--out", default="diagnostics")
     p.add_argument("--shards", default=None,
-                   help="optional; measures the data variance for the width "
-                        "reference in the bottom panel")
+                   help="optional but worth it: real patches for the two "
+                        "bottom panels to compare the samples against, drawn "
+                        "exactly as forward_diffusion.py draws them")
+    p.add_argument("--scales", type=int, nargs="+",
+                   default=[1, 2, 4, 8, 16, 32],
+                   help="spatial scales, in pooled pixels, for the power panel")
     p.add_argument("--n", type=int, default=4, help="samples, one per row")
     p.add_argument("--n-sigma", type=int, default=8, help="columns")
     p.add_argument("--steps", type=int, default=None,
@@ -63,15 +69,15 @@ def main() -> None:
               f"{config.patch.out_size}; zero padding makes the training grid "
               f"part of the operator, so this is a different prior.")
 
-    data_std = None
+    reference = None
     if args.shards:
         shards = ShardSet.from_dir(args.shards)
         dataset = PatchDataset.from_shards(
             shards, config, LogFluxTransform.from_config(config.transform),
             in_memory=False)
-        data_std = float(np.std(dataset.validation_batch(
-            min(64, len(dataset)))))
-        print(f"data std {data_std:.4g} (from {args.shards})")
+        # The same scenes forward_diffusion.py shows, so the two figures and
+        # the table below all describe one set of patches.
+        reference = plots.forward_patches(dataset, 16, False, args.seed)
 
     # The same lines forward_diffusion.py prints, from the same file, so the
     # two can be put next to each other and checked rather than assumed.
@@ -87,8 +93,26 @@ def main() -> None:
           f"at {size}x{size}")
     fig, path = plots.plot_reverse_trajectory(
         model, sde, size, n=args.n, n_sigma=args.n_sigma, n_steps=steps,
-        seed=args.seed, data_std=data_std, out=Path(args.out))
-    print(f"wrote {path}")
+        seed=args.seed, reference=reference, scales=tuple(args.scales),
+        out=Path(args.out))
+
+    if reference is not None:
+        from rubin_host_prior.diffusion import pflow_sample
+
+        final = np.asarray(pflow_sample(
+            model, jax.random.key(args.seed),
+            (args.n, model.config.in_channels, size, size), sde, n_steps=steps))
+        got = plots.scale_visibility(final, tuple(args.scales), seed=args.seed)
+        want = plots.scale_visibility(reference, tuple(args.scales),
+                                      seed=args.seed)
+        print("\nband-pass rms of the samples against real patches")
+        print("1.00 = the right amount of structure at that scale\n")
+        print(f"{'scale':>7} {'samples':>10} {'real':>10} {'ratio':>8}")
+        for sc, a, b in zip(got["scales"], got["signal"], want["signal"]):
+            print(f"{sc:>7} {a:>10.4g} {b:>10.4g} {a / b:>8.2f}")
+        print(f"{'all':>7} {np.std(final):>10.4g} {np.std(reference):>10.4g} "
+              f"{np.std(final) / np.std(reference):>8.2f}   (total std)")
+    print(f"\nwrote {path}")
 
 
 if __name__ == "__main__":

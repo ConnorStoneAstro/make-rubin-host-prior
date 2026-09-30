@@ -268,9 +268,17 @@ def test_the_trajectory_is_the_sampler_with_a_recorder_on_it(tiny_model):
     states, sigmas = pflow_trajectory(tiny_model, key, shape, sde, n_steps=steps)
     states, sigmas = np.asarray(states), np.asarray(sigmas)
 
-    assert states.shape == (steps,) + shape
-    assert sigmas.shape == (steps,)
+    assert states.shape == (steps + 1,) + shape
+    assert sigmas.shape == (steps + 1,)
     np.testing.assert_array_equal(states[-1], final)
-    # One sigma per recorded state, ending at the bottom of the schedule.
+    # One sigma per recorded state, spanning the whole schedule: the first entry
+    # is the draw the process starts from, at sigma_max itself, so a forward
+    # figure and a reverse one share their first column exactly.
     assert np.all(np.diff(sigmas) < 0)
+    assert sigmas[0] == pytest.approx(sde.sigma_max, rel=1e-5)
     assert sigmas[-1] == pytest.approx(sde.sigma_min, rel=1e-5)
+    # The same draw: inside the jit it is computed once and shared with the
+    # scan, so this comparison is against an un-jitted recompute and agrees to
+    # float32 fusion differences rather than exactly.
+    np.testing.assert_allclose(
+        states[0], np.asarray(sde.prior_sample(key, shape)), rtol=1e-5)

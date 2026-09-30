@@ -82,16 +82,26 @@ def pflow_trajectory(
 ) -> tuple[Float[Array, "n b c h w"], Float[Array, " n"]]:
     """Every state the sampler passes through, and the sigma each sits at.
 
-    ``(states, sigmas)`` with ``states[i]`` the scene after the step that ended
-    at ``sigmas[i]``, so ``states[-1]`` is exactly what ``pflow_sample`` returns
-    for the same key.  Same noise, same integration -- this is the sampler with
-    a recorder on it, not a reimplementation of it.
+    ``(states, sigmas)`` of length ``n_steps + 1``.  ``states[0]`` is the draw
+    the reverse process starts from, at ``sigma_max`` itself, and ``states[-1]``
+    is exactly what ``pflow_sample`` returns for the same key.  Same noise, same
+    integration -- this is the sampler with a recorder on it, not a
+    reimplementation of it.
+
+    The initial draw is included deliberately.  Recording only the post-step
+    states left the first entry one step below ``sigma_max`` -- 15.5 against
+    16.3 at 128 steps -- so a trajectory figure and a forward figure drawn from
+    the same ``ladder`` did not quite share their first column, and a comparison
+    whose whole point is matched sigma should not start with a 5% mismatch.
 
     Memory is ``n_steps`` times a batch, so keep the batch small: 128 steps of
     four 128x128 scenes is 33 MB, four hundred is not.
     """
+    # Recomputed rather than threaded out of the scan: `prior_sample` is
+    # deterministic in the key, so this is the same array the scan started from.
+    x0 = sde.prior_sample(key, shape)
     _, xs = _pflow_scan(model, key, shape, sde, n_steps, heun)
-    return xs, _sigma_schedule(sde, n_steps)[1:]
+    return jnp.concatenate([x0[None], xs], axis=0), _sigma_schedule(sde, n_steps)
 
 
 @eqx.filter_jit
