@@ -227,17 +227,22 @@ def test_scale_visibility_measures_what_it_claims():
     rise with scale. That contrast is the whole content of the measurement, and
     it is what says whether the galaxies in a patch outlive the stars.
     """
-    from rubin_host_prior.plots import _box_smooth, scale_visibility
+    from rubin_host_prior.plots import scale_visibility
 
     rng = np.random.default_rng(0)
-    scales = (1, 2, 4, 8, 16)
+    scales, n = (1, 2, 4, 8, 16), 64
 
-    white = 3.0 * rng.normal(size=(4, 64, 64))
+    white = 3.0 * rng.normal(size=(16, n, n))
     flat = scale_visibility(white, scales=scales)["sigma_visible"]
-    assert flat == pytest.approx([3.0] * len(scales), rel=0.05), flat
+    assert flat == pytest.approx([3.0] * len(scales), rel=0.08), flat
 
-    red = sum(float(s) * _box_smooth(rng.normal(size=(4, 64, 64)), s)
-              for s in scales)
+    # Built in Fourier, so its spectrum is exactly what the test says it is.
+    ky, kx = np.meshgrid(np.fft.fftfreq(n) * n, np.fft.fftfreq(n) * n,
+                         indexing="ij")
+    k = np.hypot(ky, kx)
+    k[0, 0] = 1.0
+    phases = (rng.normal(size=(16, n, n)) + 1j * rng.normal(size=(16, n, n)))
+    red = np.fft.ifft2(phases * k ** -1.2).real
     rising = scale_visibility(red, scales=scales)["sigma_visible"]
     assert all(b > a for a, b in zip(rising, rising[1:])), rising
     assert rising[-1] > 4 * rising[0], rising
@@ -308,3 +313,74 @@ def test_forward_patches_shows_the_same_scenes_either_way(dataset):
     np.testing.assert_array_equal(plain, again)
     assert not np.array_equal(plain, aug)
     assert aug.mean() == pytest.approx(plain.mean(), rel=0.2)
+
+
+def test_band_power_beats_a_box_filter_at_attribution():
+    """Why the FFT replaced a difference of box filters.
+
+    Against a field with a *known* attenuation above 16 px, the box estimator
+    reported 0.76 at 8 px where the truth is 1.00 -- sinc sidelobes smear a
+    deficit a full octave down, which is exactly the kind of error that would
+    have moved the crossover in a diagnosis. The periodogram attributes the
+    band exactly, and it is the basis the mode-counting argument is made in.
+    """
+    from rubin_host_prior.plots import band_power
+
+    n, truth = 128, 0.40
+    rng = np.random.default_rng(0)
+    ky, kx = np.meshgrid(np.fft.fftfreq(n) * n, np.fft.fftfreq(n) * n,
+                         indexing="ij")
+    k = np.hypot(ky, kx)
+    k[0, 0] = 1.0
+    base = (rng.normal(size=(32, n, n))
+            + 1j * rng.normal(size=(32, n, n))) * k ** -1.2
+    clean = np.fft.ifft2(base).real
+    starved = np.fft.ifft2(base * np.where(k < n / 16.0, truth, 1.0)).real
+
+    scales = (1, 2, 4, 8, 16, 32)
+    a = band_power(clean, scales)
+    b = band_power(starved, scales)
+    ratio = [x / y for x, y in zip(b["rms"], a["rms"])]
+    assert ratio[:3] == pytest.approx([1.0, 1.0, 1.0], abs=0.02), ratio
+    assert ratio[3] == pytest.approx(1.0, abs=0.03), ratio   # 8 px untouched
+    assert ratio[5] == pytest.approx(truth, abs=0.03), ratio  # 32 px starved
+
+
+def test_band_power_windows_against_the_wrap():
+    """The FFT assumes the patch is periodic and a stamp is not: a gradient
+    across the frame is a step at the edge, and a step has power at every k.
+    Unwindowed that put 540x too much into the 1 px band."""
+    from rubin_host_prior.plots import band_power
+
+    n = 128
+    rng = np.random.default_rng(1)
+    # A red field, which is the case that matters: its fine-scale power is
+    # small, so an edge step buries it.  In a white field the 1 px band has
+    # thousands of modes carrying most of the variance and the wrap is lost in
+    # it -- the leak is real there too, just invisible.
+    ky, kx = np.meshgrid(np.fft.fftfreq(n) * n, np.fft.fftfreq(n) * n,
+                         indexing="ij")
+    k = np.hypot(ky, kx)
+    k[0, 0] = 1.0
+    red = np.fft.ifft2((rng.normal(size=(8, n, n))
+                        + 1j * rng.normal(size=(8, n, n))) * k ** -1.2).real
+    ramp = red + 1.5 * np.linspace(-1, 1, n)[:, None]
+
+    fine = 1
+    clean = band_power(red, (fine,))["rms"][0]
+    leaked = band_power(ramp, (fine,), window=False)["rms"][0]
+    fixed = band_power(ramp, (fine,), window=True)["rms"][0]
+    assert leaked > 100 * clean, (leaked, clean)
+    assert fixed == pytest.approx(clean, rel=0.05), (fixed, clean)
+
+
+def test_band_power_reports_its_own_error_bar():
+    """The largest band is tens of modes on a 128 px grid, so a ratio quoted
+    from it without an error bar is over-claiming."""
+    from rubin_host_prior.plots import band_power
+
+    got = band_power(np.random.default_rng(0).normal(size=(16, 128, 128)),
+                     (1, 8, 32))
+    assert got["n_modes"] == [3535, 600, 36]
+    assert all(b > a for a, b in zip(got["rel_error"], got["rel_error"][1:]))
+    assert got["rel_error"][-1] == pytest.approx(1 / np.sqrt(2 * 36 * 16))

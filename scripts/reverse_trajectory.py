@@ -102,14 +102,19 @@ def main() -> None:
         final = np.asarray(pflow_sample(
             model, jax.random.key(args.seed),
             (args.n, model.config.in_channels, size, size), sde, n_steps=steps))
-        got = plots.scale_visibility(final, tuple(args.scales), seed=args.seed)
-        want = plots.scale_visibility(reference, tuple(args.scales),
-                                      seed=args.seed)
-        print("\nband-pass rms of the samples against real patches")
-        print("1.00 = the right amount of structure at that scale\n")
-        print(f"{'scale':>7} {'samples':>10} {'real':>10} {'ratio':>8}")
-        for sc, a, b in zip(got["scales"], got["signal"], want["signal"]):
-            print(f"{sc:>7} {a:>10.4g} {b:>10.4g} {a / b:>8.2f}")
+        got = plots.scale_visibility(final, tuple(args.scales))
+        want = plots.scale_visibility(reference, tuple(args.scales))
+        print("\nband power of the samples against real patches, per octave")
+        print("1.00 = the right amount of structure at that scale")
+        print("(+- is the statistical error; the largest band is only tens of")
+        print(" modes, so raise --n if it is wider than the effect)\n")
+        print(f"{'scale':>7} {'samples':>10} {'real':>10} {'ratio':>8} "
+              f"{'+-':>7} {'modes':>7}")
+        for i, sc in enumerate(got["scales"]):
+            a, b = got["signal"][i], want["signal"][i]
+            err = (got["rel_error"][i] ** 2 + want["rel_error"][i] ** 2) ** 0.5
+            print(f"{sc:>7} {a:>10.4g} {b:>10.4g} {a / b:>8.2f} "
+                  f"{err * a / b:>7.2f} {got['n_modes'][i]:>7,}")
         print(f"{'all':>7} {np.std(final):>10.4g} {np.std(reference):>10.4g} "
               f"{np.std(final) / np.std(reference):>8.2f}   (total std)")
     print(f"\nwrote {path}")

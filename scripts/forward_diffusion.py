@@ -97,7 +97,7 @@ def main() -> None:
 
     vis = plots.scale_visibility(
         plots.forward_patches(dataset, args.n, args.augment, args.seed),
-        tuple(args.scales), seed=args.seed)
+        tuple(args.scales))
     print(_schedule_note(config, sde, source))
     print(f"{'scale':>7} {'rms signal':>12} {'visible below sigma':>21}  note")
     for scale, sig, s_vis in zip(vis["scales"], vis["signal"],

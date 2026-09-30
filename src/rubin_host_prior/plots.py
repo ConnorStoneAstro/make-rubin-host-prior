@@ -156,69 +156,103 @@ def plot_cutouts(shards, n: int = 100, seed: int = 0, out: Path | None = None):
 # column where they stop resembling each other is the sigma range to suspect.
 
 
-def _box_smooth(x: np.ndarray, k: int) -> np.ndarray:
-    """Separable box filter over the trailing two axes, reflect-padded.
+def band_power(x: np.ndarray, scales, window: bool = True) -> dict:
+    """Variance per octave band, straight off the periodogram.
 
-    Cumulative sums rather than a convolution, so smoothing on a 64 px scale
-    costs what smoothing on a 2 px scale does and the scale sweep below is not
-    dominated by its largest entry.
+    ``scales`` are in pixels; the band for ``l`` is the octave ``|k|`` from
+    ``N/2l`` to ``N/l``, i.e. structure between ``l`` and ``2l`` px.
+
+    **The FFT and not a difference of box filters**, which is what this was.
+    Box filters have sinc sidelobes, so a band leaks badly into its neighbours:
+    measured against a field with a *known* attenuation of 0.40 above 16 px, the
+    box estimator reported 0.76 at 8 px where the truth is 1.00 -- it smeared
+    the deficit a full octave down. The FFT recovered 1.000, 1.000, 0.400,
+    0.400 exactly. It is also the basis the mode-counting argument is made in,
+    so the measurement and the reasoning are about the same object.
+
+    **A Hann window, because the FFT assumes the patch is periodic** and a stamp
+    is not. A gradient across the frame -- a mis-subtracted sky, a bright
+    neighbour just outside -- wraps into a step at the edge, and a step has
+    power at every ``k``: measured, an unwindowed periodogram put **540x** too
+    much power in the 1 px band. The window removes that exactly. What it does
+    not remove, and should not, is genuine large-scale content: a real gradient
+    is real power at 32 px, and if it is in the data but not in the samples it
+    will show up here as a deficit. That is a true statement about the samples
+    and a thing to be aware of when reading one.
+
+    ``n_modes`` and ``rel_error`` come back with it because the largest band is
+    small -- 36 modes on a 128 px grid -- and a ratio quoted from it deserves
+    its error bar.
     """
-    if k <= 1:
-        return np.asarray(x, dtype=np.float64)
-    a = np.asarray(x, dtype=np.float64)
-    lo, hi = k // 2, k - 1 - k // 2
-    for axis in (-2, -1):
-        pad = [(0, 0)] * a.ndim
-        pad[axis] = (lo, hi)
-        c = np.cumsum(np.pad(a, pad, mode="reflect"), axis=axis)
-        zero = np.zeros_like(np.take(c, [0], axis=axis))
-        c = np.concatenate([zero, c], axis=axis)
-        n = c.shape[axis] - k
-        a = (np.take(c, np.arange(k, k + n), axis=axis)
-             - np.take(c, np.arange(0, n), axis=axis)) / k
-    return a
+    x = np.asarray(x, dtype=np.float64)
+    if x.ndim == 4:
+        x = x[:, 0]
+    if x.ndim == 2:
+        x = x[None]
+    h, w = x.shape[-2:]
+    if h != w:
+        raise ValueError(f"expected square patches, got {(h, w)}")
+    n_patches = len(x)
+    # The mean is the k=0 mode and would swamp everything: x is log flux, so the
+    # sky sits near +3 and the DC term is enormous next to the structure.
+    x = x - x.mean(axis=(-2, -1), keepdims=True)
+    if window:
+        win = np.hanning(h)[:, None] * np.hanning(h)[None, :]
+        x = x * (win / np.sqrt((win ** 2).mean()))
+    power = np.abs(np.fft.fft2(x)) ** 2
+    ky, kx = np.meshgrid(np.fft.fftfreq(h) * h, np.fft.fftfreq(h) * h,
+                         indexing="ij")
+    k = np.hypot(ky, kx)
+
+    out = {"scales": tuple(int(s) for s in scales), "rms": [], "n_modes": [],
+           "rel_error": [], "white_rms": []}
+    for scale in out["scales"]:
+        band = (k >= h / (2.0 * scale)) & (k < h / float(scale))
+        m = int(band.sum())
+        var = float(power[..., band].sum(-1).mean()) / h ** 4
+        out["rms"].append(float(np.sqrt(var)))
+        out["n_modes"].append(m)
+        # Real input pairs conjugate modes, so m counts each twice.  The error
+        # on a variance from m/2 independent modes over n patches is
+        # sqrt(2/(m*n)); on the rms it is half that.
+        out["rel_error"].append(
+            float(1.0 / np.sqrt(2.0 * m * n_patches)) if m else float("inf"))
+        # White noise of unit variance is flat, so its share of a band is just
+        # the band's share of the modes.  Exact, and no Monte Carlo draw.
+        out["white_rms"].append(float(np.sqrt(m / h ** 2)))
+    return out
 
 
-def _bandpass_rms(x: np.ndarray, scale: int) -> float:
-    """RMS of the structure at ``scale``: smoothed at it, minus smoothed at 2x.
-
-    A band-pass and not a low-pass, because a low-pass at 32 px still contains
-    everything above 32 px and would report the galaxy's total flux as though it
-    were structure on that scale.
-    """
-    return float(np.std(_box_smooth(x, scale) - _box_smooth(x, 2 * scale)))
-
-
-def scale_visibility(
-    clean: np.ndarray, scales=(1, 2, 4, 8, 16, 32), seed: int = 0
-) -> dict:
+def scale_visibility(clean: np.ndarray, scales=(1, 2, 4, 8, 16, 32),
+                     window: bool = True) -> dict:
     """At which sigma does structure of each spatial scale stop being visible?
 
-    **The question behind "the samples are all stars".**  Band-pass noise scales
-    exactly linearly with sigma, so measuring it once at unit noise gives the
-    signal-to-noise at every sigma for free:
+    **The question behind "the samples are all stars".**  Band-pass noise is
+    flat in ``k``, so a band's share of it is just that band's share of the
+    modes -- exactly, with no draw to average over.  The signal-to-noise at any
+    sigma follows:
 
-        SNR(scale, sigma) = rms_signal(scale) / (sigma * rms_unit_noise(scale))
+        SNR(scale, sigma) = rms(scale) / (sigma * white_rms(scale))
 
     and the crossing ``SNR = 1`` is the noise level above which that scale is
     gone.  Read against the schedule: a scale whose crossing sits above
-    ``sigma_max`` is never resolved by the model at any noise level it trains
-    on, and one whose crossing sits far below ``sigma_min`` is only ever learned
-    in the last few steps of sampling.
+    ``sigma_max`` is never resolved at any noise level the model trains on, and
+    one below ``sigma_min`` is only ever learned in the last few steps.
+
+    A white field gives the same crossing at every scale, and that crossing is
+    its own rms: white data dies all at once.  Anything red outlives it at the
+    large end, and by how much is the whole question.
     """
-    x = np.asarray(clean, dtype=np.float64)
-    if x.ndim == 4:
-        x = x[:, 0]
-    noise = np.random.default_rng(seed).normal(size=x.shape)
-    out = {"scales": tuple(int(s) for s in scales), "signal": [], "noise": [],
-           "sigma_visible": []}
-    for scale in out["scales"]:
-        sig = _bandpass_rms(x, scale)
-        nse = _bandpass_rms(noise, scale)
-        out["signal"].append(sig)
-        out["noise"].append(nse)
-        out["sigma_visible"].append(sig / nse if nse > 0 else np.inf)
-    return out
+    got = band_power(clean, scales, window=window)
+    return {
+        "scales": got["scales"],
+        "signal": got["rms"],
+        "noise": got["white_rms"],
+        "n_modes": got["n_modes"],
+        "rel_error": got["rel_error"],
+        "sigma_visible": [s / n if n > 0 else np.inf
+                          for s, n in zip(got["rms"], got["white_rms"])],
+    }
 
 
 def _sigma_panel(ax, vis, sde, title):
@@ -302,7 +336,7 @@ def plot_forward_diffusion(
                 ax.set_title("clean" if j == 0 else f"{ladder[j - 1]:.3g}",
                              fontsize=7)
 
-    vis = scale_visibility(clean, scales, seed=seed)
+    vis = scale_visibility(clean, scales)
     _sigma_panel(fig.add_subplot(outer[1]), vis, sde,
                  "what survives: SNR per spatial scale against sigma "
                  "(shaded = the trained schedule; dotted = SNR 1)")
@@ -391,10 +425,10 @@ def plot_reverse_trajectory(
     ax.grid(alpha=0.25, which="both")
 
     ax2 = fig.add_subplot(bottom[1])
-    got = scale_visibility(states[-1], scales, seed=seed)
+    got = scale_visibility(states[-1], scales)
     ax2.loglog(got["scales"], got["signal"], "o-", lw=1.6, label="samples")
     if reference is not None:
-        want = scale_visibility(reference, scales, seed=seed)
+        want = scale_visibility(reference, scales)
         ax2.loglog(want["scales"], want["signal"], "s--", lw=1.4, color="k",
                    label="real patches")
         for sc, a, b in zip(got["scales"], got["signal"], want["signal"]):
