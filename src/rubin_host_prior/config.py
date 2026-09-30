@@ -40,8 +40,8 @@ BANDS = ("u", "g", "r", "i", "z", "y")
 #: producing nothing above ~16 px.  Removing the reflection, at R=30 on all-real
 #: sky, finally gave faint elongated structure past 16 px -- the first positive
 #: signal -- which is what this trades resolution of the border for reach.
-DEFAULT_CHANNELS: tuple[int, ...] = (32,) * 10
-DEFAULT_DILATIONS: tuple[int, ...] = (1, 2, 4, 8, 16, 32, 8, 4, 2, 1)
+DEFAULT_CHANNELS: tuple[int, ...] = (64,) * 11
+DEFAULT_DILATIONS: tuple[int, ...] = (1, 2, 4, 8, 16, 32, 16, 8, 4, 2, 1)
 
 #: Said whenever `channels` and `dilations` disagree, because by far the most
 #: likely reason is that only one of them was given.
@@ -99,7 +99,7 @@ class EnergyConfig:
     kernel_size: int = 3
     activation: str = "silu"  # must be C^1; see nn.layers.ACTIVATIONS
     embed_dim: int = 128  # width of the log-sigma embedding MLP
-    n_fourier: int = 32  # random Fourier features of log(sigma)
+    n_fourier: int = 64  # random Fourier features of log(sigma)
     fourier_scale: float = 1.0  # std of the random frequencies
     fourier_seed: int = 0  # fixes the frozen basis; see nn.layers
     head_init_scale: float = 0.01  # small, not zero -- see nn.energy
@@ -197,7 +197,7 @@ class SDEConfig:
     sigma_min: float | None = None
     #: Must dominate the data's own spread, or the ``t = 1`` marginal is not
     #: really Gaussian and sampling starts from the wrong distribution.
-    sigma_max: float | None = None
+    sigma_max: float | None = 20
     #: Mean of ``x`` over the training set.  VE does not move the mean, so the
     #: ``t = 1`` marginal is centred here and ``prior_sample`` has to start from
     #: the same place.  This was implicitly zero while the transform put every
@@ -238,7 +238,7 @@ class TransformConfig:
 
     #: nJy.  Measured by ``prepare_config.py``; None until then.
     softening: float | None = None
-    softening_sigma: float = 2.0  # s = softening_sigma * pooled sky noise
+    softening_sigma: float = 1.0  # s = softening_sigma * pooled sky noise
 
 
 @dataclass

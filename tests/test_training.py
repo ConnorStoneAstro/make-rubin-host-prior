@@ -172,21 +172,41 @@ def test_training_writes_a_log_and_a_final_checkpoint(tmp_path):
 
 
 def test_eval_logs_a_loss_curve_against_sigma(tmp_path):
+    """The curve's length is ``eval_sigmas``, not the batch size.
+
+    It used to be the batch size, because the eval paired example ``i`` with
+    ``sigma[i]`` -- so every point was a different patch as well as a different
+    sigma, and the bumps in the curve were the difference between a blank patch
+    and a bright one.  Every patch now sees every rung, and the batch axis is
+    averaged away.
+    """
     # The cadence is a config field, not a train() argument: a default in the
     # signature would be a second source of truth alongside TrainConfig.
-    config = _config(steps=8, eval_every=4)
+    config = _config(steps=8, eval_every=4, eval_sigmas=6)
     model = ConvEnergyNet(config.energy, key=jax.random.key(0))
     rng = np.random.default_rng(2)
     records = []
+    eval_batch = rng.normal(size=(8, 1, 16, 16)).astype(np.float32)
     train(
         model, _batches(rng), config, out_dir=tmp_path / "run",
-        eval_batch=rng.normal(size=(8, 1, 16, 16)).astype(np.float32),
-        on_log=records.append,
+        eval_batch=eval_batch, on_log=records.append,
     )
     evals = [r for r in records if r.get("event") == "eval"]
     assert evals
-    assert len(evals[0]["loss_by_sigma"]) == 8
-    assert evals[0]["sigma"][0] < evals[0]["sigma"][-1]
+    got = evals[0]
+    assert len(got["sigma"]) == 6 != len(eval_batch)
+    assert len(got["loss_by_sigma"]) == 6
+    assert got["sigma"][0] < got["sigma"][-1]
+    # The error on the mean, so a bump can be told from the scatter of the
+    # patches it was averaged over.
+    assert len(got["loss_by_sigma_err"]) == 6
+    assert all(e > 0 for e in got["loss_by_sigma_err"])
+    # And the bar the curve is read against: what the best Gaussian model of
+    # this batch would score, which falls with sigma whatever the model does.
+    floor = got["gaussian_floor"]
+    assert len(floor) == 6
+    assert all(b < a for a, b in zip(floor, floor[1:])), floor
+    assert all(f <= 1.0 for f in floor)
 
 
 def test_no_out_size_is_too_small_for_the_loss_any_more(tmp_path):
