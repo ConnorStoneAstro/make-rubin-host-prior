@@ -433,12 +433,33 @@ def test_the_total_row_is_the_sum_of_the_bands():
     lines above it, and would not add up."""
     from rubin_host_prior.plots import band_power
 
-    x = np.random.default_rng(0).normal(size=(8, 128, 128))
-    got = band_power(x, (1, 2, 4, 8, 16, 32))
+    n = 128
+    rng = np.random.default_rng(0)
+    scales = (1, 2, 4, 8, 16, 32)
+
+    white = rng.normal(size=(8, n, n))
+    got = band_power(white, scales)
+    assert got["below_scale"] == 64 and got["below_modes"] == 8
     assert got["total_rms"] == pytest.approx(
-        np.sqrt(sum(v ** 2 for v in got["rms"])))
-    # The bands miss only |k| < 2, so they account for nearly all the variance.
-    assert got["total_rms"] == pytest.approx(float(np.std(x)), rel=0.02)
+        np.sqrt(sum(v ** 2 for v in got["rms"]) + got["below_rms"] ** 2))
+    # Against the per-patch variance: band_power removes each patch's own mean,
+    # so a global np.std would also carry the scatter *between* patches.
+    per_patch = float(np.sqrt(np.var(white, axis=(1, 2)).mean()))
+    assert got["total_rms"] == pytest.approx(per_patch, rel=0.01)
+
+    # And the reason it is reported rather than dropped: in a red field those
+    # eight modes are a large share of the variance, not a rounding error.
+    ky, kx = np.meshgrid(np.fft.fftfreq(n) * n, np.fft.fftfreq(n) * n,
+                         indexing="ij")
+    k = np.hypot(ky, kx)
+    k[0, 0] = 1.0
+    red = np.fft.ifft2((rng.normal(size=(8, n, n))
+                        + 1j * rng.normal(size=(8, n, n))) * k ** -2.0).real
+    red_bp = band_power(red, scales)
+    dropped = red_bp["below_rms"] ** 2 / red_bp["total_rms"] ** 2
+    assert dropped > 0.25, dropped
+    assert red_bp["total_rms"] == pytest.approx(
+        float(np.sqrt(np.var(red, axis=(1, 2)).mean())), rel=0.01)
 
 
 def test_the_augmented_reference_is_a_different_distribution(dataset):

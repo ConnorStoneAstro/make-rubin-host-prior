@@ -194,10 +194,14 @@ def band_power(x: np.ndarray, scales, window: bool = False) -> dict:
     small -- 36 modes on a 128 px grid -- and a ratio quoted from it deserves
     its error bar.
 
-    The bands are the octaves ``|k|`` in ``[N/2l, N/l)``, which are disjoint and
-    cover everything except ``|k| < 2`` -- the very largest modes, which no 128
-    px stamp constrains anyway -- so their variances sum to the field's, and
-    ``total_rms`` is that sum rather than a separate ``np.std``.
+    The bands are the octaves ``|k|`` in ``[N/2l, N/l)``, disjoint and covering
+    everything down to the largest scale asked for.  Whatever sits *below* that
+    comes back as ``below_rms``, and is in ``total_rms`` too: on a 128 px grid
+    a scale list ending at 32 leaves only 8 modes uncovered, which sounds
+    negligible and is not -- those are the modes spanning the whole frame, and
+    in a field as red as a galaxy stamp they can hold a large share of the
+    variance.  Silently dropping them would make ``total_rms`` a different
+    number from the field's own, which is how this was found.
     """
     x = np.asarray(x, dtype=np.float64)
     if x.ndim == 4:
@@ -220,7 +224,8 @@ def band_power(x: np.ndarray, scales, window: bool = False) -> dict:
     k = np.hypot(ky, kx)
 
     out = {"scales": tuple(int(s) for s in scales), "rms": [], "n_modes": [],
-           "rel_error": [], "white_rms": [], "total_rms": 0.0}
+           "rel_error": [], "white_rms": [], "total_rms": 0.0,
+           "below_scale": 0, "below_rms": 0.0, "below_modes": 0}
     for scale in out["scales"]:
         band = (k >= h / (2.0 * scale)) & (k < h / float(scale))
         m = int(band.sum())
@@ -235,9 +240,19 @@ def band_power(x: np.ndarray, scales, window: bool = False) -> dict:
         # White noise of unit variance is flat, so its share of a band is just
         # the band's share of the modes.  Exact, and no Monte Carlo draw.
         out["white_rms"].append(float(np.sqrt(m / h ** 2)))
+
+    # Everything larger than the biggest band asked for.  k = 0 is the mean and
+    # was removed above, so this is genuine structure and not an offset.
+    coarsest = max(out["scales"])
+    below = (k > 0) & (k < h / (2.0 * coarsest))
+    out["below_scale"] = int(2 * coarsest)
+    out["below_modes"] = int(below.sum())
+    out["below_rms"] = float(
+        np.sqrt(float(power[..., below].sum(-1).mean()) / h ** 4))
     # Measured the same way as the bands, so the table's last row is the sum of
     # the ones above it rather than a number from a different estimator.
-    out["total_rms"] = float(np.sqrt(sum(v ** 2 for v in out["rms"])))
+    out["total_rms"] = float(
+        np.sqrt(sum(v ** 2 for v in out["rms"]) + out["below_rms"] ** 2))
     return out
 
 
