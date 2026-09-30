@@ -158,7 +158,9 @@ def main() -> None:
         )
 
     transform = LogFluxTransform.from_config(config.transform)
-    dataset = PatchDataset.from_shards(shards, config, transform)
+    # Never cached: this script reads a few hundred patches for the statistics
+    # and exits, so loading the whole set would be minutes of I/O to throw away.
+    dataset = PatchDataset.from_shards(shards, config, transform, in_memory=False)
     stats = dataset.stats(args.n_stats)
     sigma_min, sigma_max = suggest_sigma_range(stats)
     if config.sde.sigma_min is None:

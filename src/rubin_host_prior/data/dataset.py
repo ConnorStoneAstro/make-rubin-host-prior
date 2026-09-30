@@ -44,6 +44,35 @@ class PatchDataset:
         self.shards = shards
         self._native = native
 
+    @property
+    def in_memory(self) -> bool:
+        """Whether batches come from RAM or from the shard files each time.
+
+        **This is a performance cliff, not a preference.**  Cached, a batch is a
+        numpy fancy-index; streaming, it is one HDF5 open per shard the batch
+        touches plus one compressed-chunk read per patch, and a batch of 128
+        random indices touches nearly every shard of a large set.  Measured on
+        NERSC: 0.39 s/step cached against 2.92 s/step streaming, same model,
+        same batch, same four devices -- the only difference being that the set
+        had grown past ``max_in_memory_gb``.  ``storage_note`` is what says so
+        at startup, because crossing this silently is what made that a day.
+        """
+        return self._native is not None
+
+    def storage_note(self, max_in_memory_gb: float | None = None) -> str:
+        """One line on where batches come from and what it costs."""
+        gb = self.shards.nbytes("image") / 1024**3 if self.shards else 0.0
+        if self.in_memory:
+            return f"dataset: {gb:.2f} GiB of stamps cached in RAM"
+        over = (f", over the {max_in_memory_gb:g} GiB cap"
+                if max_in_memory_gb is not None else "")
+        return (
+            f"dataset: {gb:.2f} GiB of stamps STREAMING from "
+            f"{len(self.shards.paths)} shards{over} -- every batch re-reads "
+            f"them, which is several times slower per step than a cached run. "
+            f"Pass --max-in-memory-gb {max(gb + 2, 2):.0f} if the node has the RAM."
+        )
+
     # -- construction -----------------------------------------------------
 
     @classmethod
@@ -63,6 +92,9 @@ class PatchDataset:
         # No per-band check any more: there is one softening scale and
         # ``from_config`` refuses a config without it, so a shard set cannot
         # contain a band the transform has no scale for.
+        # A silent threshold, until it was not: the same config on 2,051
+        # patches cached and on 30,737 streamed, and nothing in the startup
+        # output said which.  ``storage_note`` now does.
         gb = shards.nbytes("image") / 1024**3
         if in_memory == "auto":
             in_memory = gb <= max_in_memory_gb

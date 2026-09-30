@@ -162,6 +162,7 @@ def main() -> None:
 
     model = config.build_model(jax.random.key(config.train.seed))
     print(f"{n_parameters(model):,} parameters | {len(dataset):,} patches")
+    print(dataset.storage_note(args.max_in_memory_gb))
     print(json.dumps(dataset.stats(min(256, len(dataset))), indent=2))
     cl = dataset.correlation_length(min(256, len(dataset)))
     print(reach_advice(cl["xi"], 2 * model.receptive_radius))

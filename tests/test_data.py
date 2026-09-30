@@ -502,6 +502,85 @@ def test_band_counts_reads_the_global_index_not_the_shard_subset(tmp_path):
     assert set(counts) == set(BANDS)
 
 
+def test_gather_never_uses_h5py_fancy_indexing(shard_dir):
+    """Reading rows by a list is a 32x performance trap, so it is not used.
+
+    ``f[key][list_of_rows]`` goes through HDF5 point selection, which on a
+    chunked dataset costs 32 ms per row against 1.0 ms for ``read_direct``
+    row-at-a-time -- measured on a warm local SSD, so it is CPU rather than I/O
+    and it follows the code to whatever filesystem it runs on.  ``gather``
+    therefore walks contiguous runs.  What must not change is the answer, for
+    any index order the caller hands it.
+    """
+    ss = ShardSet.from_dir(shard_dir)
+    whole = ss.load("image")
+    rng = np.random.default_rng(0)
+    cases = {
+        "sorted scatter": np.sort(rng.choice(len(ss), 8, replace=False)),
+        "unsorted": rng.permutation(len(ss))[:8],
+        "one contiguous run": np.arange(3, 11),
+        "runs and singletons": np.array([0, 1, 2, 9, 20, 21, len(ss) - 1]),
+        "duplicates": np.array([5, 5, 2, 5]),
+        "single row": np.array([7]),
+        "every row": np.arange(len(ss)),
+    }
+    for label, idx in cases.items():
+        got = ss.gather(idx, "image")
+        assert got.shape == (len(idx), ss.native_size, ss.native_size), label
+        np.testing.assert_array_equal(got, whole[idx], err_msg=label)
+
+
+def test_caching_is_a_cliff_and_says_so(shard_dir):
+    """The 16 GiB default is a performance cliff, and crossing it was silent.
+
+    Cached, a batch is a numpy fancy-index; streaming, it is one HDF5 open per
+    shard the batch touches plus a compressed-chunk read per patch, and 128
+    random indices touch nearly every shard of a large set.  Measured on NERSC
+    with everything else identical: 0.39 s/step against 2.92 s/step, the only
+    difference being that the set had grown from 2,051 patches (2.0 GiB) to
+    30,737 (30.0 GiB).  Nothing in the startup output said which mode was
+    running, which is the part this pins.
+    """
+    ss = ShardSet.from_dir(shard_dir)
+    config = Config(energy=TINY_ENERGY, patch=PatchConfig(
+        native_size=ss.native_size, out_size=24, pool_factor=3))
+    pooled, _ = pool_shards(ss, config)
+    config.transform.softening = estimate_softening(
+        pooled, config.transform.softening_sigma)
+    transform = LogFluxTransform.from_config(config.transform)
+
+    cached = PatchDataset.from_shards(ss, config, transform, max_in_memory_gb=16.0)
+    streamed = PatchDataset.from_shards(ss, config, transform,
+                                        max_in_memory_gb=1e-9)
+    assert cached.in_memory and not streamed.in_memory
+    assert "cached in RAM" in cached.storage_note(16.0)
+    note = streamed.storage_note(1e-9)
+    assert "STREAMING" in note and "--max-in-memory-gb" in note
+
+    # And the two must be the same data, or the cliff would also be a fork.
+    idx = np.arange(4)
+    np.testing.assert_array_equal(
+        cached.make_batch(idx, rng=None, augment=False),
+        streamed.make_batch(idx, rng=None, augment=False),
+    )
+
+
+def test_load_fills_one_array_rather_than_concatenating(shard_dir):
+    """Peak memory, at the size where someone reaches for caching.
+
+    The list-of-shards form held every shard alive while ``concatenate`` built
+    the copy, so a 30 GiB set needed 60 GiB to load.  ``read_direct`` into a
+    preallocated array needs 30.
+    """
+    ss = ShardSet.from_dir(shard_dir)
+    assert len(ss.paths) > 1, "a single shard would not exercise the fill"
+    whole = ss.load("image")
+    assert whole.shape == (len(ss), ss.native_size, ss.native_size)
+    # Every row is the row gather would have returned for that index.
+    probe = np.array([0, len(ss) // 2, len(ss) - 1])
+    np.testing.assert_array_equal(whole[probe], ss.gather(probe, "image"))
+
+
 def test_gather_returns_rows_in_the_requested_order(shard_dir):
     """Reads are reordered per shard for efficiency; the caller must not see it."""
     ss = ShardSet.from_dir(shard_dir)
