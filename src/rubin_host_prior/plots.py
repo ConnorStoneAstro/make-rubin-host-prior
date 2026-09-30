@@ -292,6 +292,90 @@ def scale_visibility(clean: np.ndarray, scales=(1, 2, 4, 8, 16, 32),
     }
 
 
+def schedule_headroom(clean: np.ndarray, sigma_max: float,
+                      scales=(1, 2, 4, 8, 16, 32), window: bool = False) -> dict:
+    """Is ``sigma_max`` big enough to erase each scale -- and what if it is not?
+
+    **The criterion for sigma_max is per mode, not per pixel.**  A Fourier mode
+    of power ``P`` is still visible at noise ``sigma`` whenever ``P > sigma^2``.
+    So the schedule has to reach above ``sqrt(max_k P_k)``, which for a red
+    field is far above the per-pixel standard deviation: the pixel variance is
+    the *mean* of ``P_k`` over modes, and a red field piles its variance into a
+    handful of them.  ``2 * std`` erases the average mode and leaves the largest
+    scales untouched.  (Song & Ermon 2020's "choose sigma_max to be the maximum
+    pairwise distance between training points" is the same condition with a
+    safety factor: that distance is ``sqrt(2 * D * var)``, and since the P_k sum
+    to ``D * var`` it exceeds ``sqrt(max_k P_k)`` automatically.)
+
+    **What it costs when it is too small**, exactly.  Take one Gaussian mode of
+    power ``P``.  Its true score at noise ``sigma`` is ``-X / (P + sigma^2)``,
+    so the probability-flow ODE ``dX/dsigma = -sigma * score`` is separable and
+    integrates in closed form:
+
+        X(sigma) = X(sigma_max) * sqrt((P + sigma^2) / (P + sigma_max^2))
+
+    For the sample at ``sigma -> 0`` to have variance ``P``, the draw at
+    ``sigma_max`` must have variance ``P + sigma_max^2`` -- the *true* marginal,
+    which is the data plus the noise.  ``VESDE.prior_sample`` draws white noise
+    of variance ``sigma_max^2``, so every mode comes out short by
+
+        rms ratio = 1 / sqrt(1 + P / sigma_max^2)
+
+    **with a perfect score.**  This is a floor under the band table, not a
+    correction to it: no amount of training removes it, because it is the
+    initial condition and not the model.  A band whose ``pflow_ratio`` here is
+    0.3 cannot be measured above 0.3 no matter what the network has learned.
+
+    ``sigma_visible`` is ``sqrt(P)`` for the band -- the noise level at which
+    its typical mode reaches SNR 1 -- and ``headroom`` is ``sigma_max`` over it.
+    Rows run coarse to fine and end with everything coarser than the largest
+    scale asked for, which on a 128 px grid is only eight modes and, in a field
+    this red, a large share of the variance.
+
+    **How large this can get, before measuring anything.**  The ``P_k`` sum to
+    ``N * V`` over all ``N`` modes, so a band of ``m`` modes holding a fraction
+    ``f`` of the variance has ``sigma_visible = sqrt(f * N * V / m)`` and can
+    never exceed ``sqrt(N * V / m)``.  On a 128 px grid with unit variance that
+    ceiling is 21 for the 36-mode 32 px band and 45 for the 8-mode bin above
+    it.  So this mechanism bites hardest where there are fewest modes, it is
+    bounded, and a band suppressed far below its ``pflow_ratio`` here is being
+    suppressed by something else.  Use it to rule the schedule in or out, not
+    to explain an arbitrary deficit.
+    """
+    x = np.asarray(clean, dtype=np.float64)
+    if x.ndim == 4:
+        x = x[:, 0]
+    h = x.shape[-1]
+    got = band_power(x, scales, window=window)
+    # Bands with no modes are dropped, not reported as infinitely persistent.
+    # An octave narrower than the grid's mode spacing is empty -- ``>16`` on a
+    # 16 px grid, say -- and 0/0 there once came out as sigma_visible = inf, a
+    # headroom of 0 and a warning telling you to raise sigma_max to infinity.
+    rows = [(str(scale), rms / np.sqrt(modes / h ** 2), modes)
+            for scale, rms, modes in zip(got["scales"], got["rms"],
+                                         got["n_modes"]) if modes]
+    if got["below_modes"]:
+        rows.append((f">{got['below_scale']}",
+                     got["below_rms"] / np.sqrt(got["below_modes"] / h ** 2),
+                     got["below_modes"]))
+    if not rows:
+        raise ValueError(
+            f"none of the scales {tuple(scales)} contains a Fourier mode on a "
+            f"{h} px grid; the coarsest meaningful scale is {h // 2} px"
+        )
+    rows.sort(key=lambda r: -r[1])  # most persistent scale first
+    out = {"sigma_max": float(sigma_max), "band": [], "sigma_visible": [],
+           "headroom": [], "pflow_ratio": [], "n_modes": []}
+    for name, sigma_visible, modes in rows:
+        out["band"].append(name)
+        out["sigma_visible"].append(float(sigma_visible))
+        out["headroom"].append(float(sigma_max / sigma_visible))
+        out["pflow_ratio"].append(
+            float(1.0 / np.sqrt(1.0 + (sigma_visible / sigma_max) ** 2)))
+        out["n_modes"].append(int(modes))
+    return out
+
+
 def _sigma_panel(ax, vis, sde, title):
     """SNR against sigma, one line per spatial scale, with the schedule marked."""
     sigmas = np.geomspace(sde.sigma_min * 0.5, sde.sigma_max * 2.0, 200)
@@ -429,7 +513,7 @@ def plot_reverse_trajectory(
 
     plt = _plt()
 
-    shape = (n, model.config.in_channels, out_size, out_size)
+    shape = (n, model.in_channels, out_size, out_size)
     states, step_sigmas = pflow_trajectory(
         model, jax.random.key(seed), shape, sde, n_steps=n_steps)
     states = np.asarray(states)[:, :, 0]                  # (steps, n, H, W)
@@ -516,7 +600,9 @@ def plot_training_batch(dataset, n: int = 25, seed: int = 0, out: Path | None = 
     x = dataset.make_batch(idx, rng=rng, augment=True)[:, 0]
     lo, hi = np.percentile(x, (0.5, 99.5))
 
-    margin = dataset.config.energy.loss_margin
+    # The selected architecture's margin: NCSN++ has none, and reading
+    # `energy.loss_margin` would draw a square for a model not in use.
+    margin = dataset.config.model_config.loss_margin
     size = x.shape[-1] - 2 * margin
 
     rows, cols = _grid(n)

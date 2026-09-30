@@ -112,7 +112,10 @@ def test_the_softening_scale_has_one_source_of_truth():
 
     from rubin_host_prior.data.transform import estimate_softening
 
-    assert TransformConfig().softening_sigma == 2.0
+    # The value is Connor's to choose -- it went 1.0 -> 2.0 to suppress the sky
+    # and back to 1.0 -- and this test is about there being exactly one place
+    # that chooses it, so it reads the config rather than restating it.
+    assert isinstance(TransformConfig().softening_sigma, float)
     assert (inspect.signature(estimate_softening)
             .parameters["softening_sigma"].default is inspect.Parameter.empty)
 

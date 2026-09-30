@@ -70,6 +70,11 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("--steps", type=int, default=None)
     p.add_argument("--batch-size", type=int, default=None)
     p.add_argument("--lr", type=float, default=None)
+    p.add_argument("--architecture", default=None,
+                   choices=["energy", "ncsnpp"],
+                   help="override the config's architecture. Both sections are "
+                        "always present in a config, so this switches which one "
+                        "is built without disturbing the other")
     p.add_argument("--n-layers", type=int, default=None,
                    help="override the layer count, keeping the widths pattern")
     p.add_argument("--out-sizes", type=int, nargs="+", default=None,
@@ -140,7 +145,15 @@ def main() -> None:
         config.train.eval_every = args.eval_every
     if args.eval_size is not None:
         config.train.eval_size = args.eval_size
+    if args.architecture is not None:
+        config.architecture = args.architecture
     if args.n_layers:
+        if config.architecture != "energy":
+            raise SystemExit(
+                "--n-layers resizes the energy model's first branch; the "
+                "architecture is 'ncsnpp', whose depth is ch_mult and "
+                "num_blocks in the config."
+            )
         # The first branch only: it is the one whose depth is a free choice.
         # A long-range branch's layer count is set by the reach it has to cover,
         # so resizing it here would silently change R and the loss crop.
@@ -181,7 +194,13 @@ def main() -> None:
     print(dataset.storage_note(args.max_in_memory_gb))
     print(json.dumps(dataset.stats(min(256, len(dataset))), indent=2))
     cl = dataset.correlation_length(min(256, len(dataset)))
-    print(reach_advice(cl["xi"], 2 * model.receptive_radius))
+    # Only the energy model has a reach to compare xi against; the U-Net's
+    # coarsest level sees the whole scene by construction.
+    if config.architecture == "energy":
+        print(reach_advice(cl["xi"], 2 * model.receptive_radius))
+    else:
+        print(f"correlation length xi = {cl['xi']:.1f} px on a "
+              f"{config.patch.out_size} px grid")
     print()
     # train() prints the full valid-convolution geometry, including exactly how
     # much of each patch the loss crop discards.

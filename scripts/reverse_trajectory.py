@@ -107,7 +107,7 @@ def main() -> None:
 
         final = np.asarray(pflow_sample(
             model, jax.random.key(args.seed),
-            (args.n, model.config.in_channels, size, size), sde, n_steps=steps))
+            (args.n, model.in_channels, size, size), sde, n_steps=steps))
         got = plots.scale_visibility(final, tuple(args.scales))
         want = plots.scale_visibility(reference, tuple(args.scales))
         print("\nband power of the samples against real patches, per octave")
@@ -134,6 +134,24 @@ def main() -> None:
         print(f"{'all':>7} {ga['total_rms']:>10.4g} {gb['total_rms']:>10.4g} "
               f"{ga['total_rms'] / gb['total_rms']:>8.2f}"
               f"{'':>8} {sum(ga['n_modes']) + ga['below_modes']:>7,}")
+
+        head = plots.schedule_headroom(reference, sde.sigma_max,
+                                       tuple(args.scales))
+        print(f"\nis sigma_max = {sde.sigma_max:.4g} large enough to erase "
+              f"each scale?")
+        print("sigma_vis is sqrt(P) for the band: the noise level at which its")
+        print("typical mode reaches SNR 1. The schedule has to start above it,")
+        print("or the forward process never destroys that scale and the reverse")
+        print("process starts from a prior that is missing it. 'floor' is what")
+        print("the band table above would read with a PERFECT score --")
+        print("1/sqrt(1 + P/sigma_max^2), measured against the sampler to a few %.\n")
+        print(f"{'scale':>7} {'sigma_vis':>10} {'headroom':>9} {'floor':>7} "
+              f"{'modes':>7}")
+        for i, band in enumerate(head["band"]):
+            flag = "  <-- too small" if head["headroom"][i] < 3.0 else ""
+            print(f"{band:>7} {head['sigma_visible'][i]:>10.4g} "
+                  f"{head['headroom'][i]:>9.1f} {head['pflow_ratio'][i]:>7.3f} "
+                  f"{head['n_modes'][i]:>7,}{flag}")
     print(f"\nwrote {path}")
 
 

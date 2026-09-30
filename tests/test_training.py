@@ -499,7 +499,7 @@ def test_the_default_architecture_is_the_one_that_gets_trained():
     assert c.energy.channels == (DEFAULT_CHANNELS,)
     assert c.energy.dilations == (DEFAULT_DILATIONS,)
     assert c.energy.n_branches == 1 and c.energy.residual
-    assert c.energy.receptive_radius == 78
+    assert c.energy.receptive_radius == 94
     # Same-mode, so nothing is carried around the grid and nothing is cropped
     # off it: the loader feeds 128 and the loss lands on all 128.
     assert c.energy.loss_margin == 0
@@ -513,14 +513,14 @@ def test_the_dilations_rise_through_a_doubling_series_and_come_back_down():
     dilations after it are what mix those lattices back together."""
     from rubin_host_prior.config import DEFAULT_DILATIONS
 
-    assert DEFAULT_DILATIONS == (1, 2, 4, 8, 16, 32, 8, 4, 2, 1)
-    assert sum(DEFAULT_DILATIONS) == 78
+    assert DEFAULT_DILATIONS == (1, 2, 4, 8, 16, 32, 16, 8, 4, 2, 1)
+    assert sum(DEFAULT_DILATIONS) == 94
     peak = DEFAULT_DILATIONS.index(max(DEFAULT_DILATIONS))
     up, down = DEFAULT_DILATIONS[: peak + 1], DEFAULT_DILATIONS[peak + 1 :]
     assert up == (1, 2, 4, 8, 16, 32) and len(set(up)) == len(up)  # no repeats
-    # The tail halves back down, resuming below the peak rather than mirroring
-    # it: (32, 16) are not repeated, so the descent is reversed(up) from 8 on.
-    assert down == tuple(reversed(up))[2:]
+    # A full mirror now: the descent is the ascent reversed with only the peak
+    # itself not repeated.  It used to skip 16 as well.
+    assert down == tuple(reversed(up))[1:]
     assert all(b * 2 == a for a, b in zip(down, down[1:]))
     # Gap-free: after n layers of the ascent the reach is sum(up[:n]), and the
     # next dilation never exceeds 2 * reach + 1, so nothing is skipped over.

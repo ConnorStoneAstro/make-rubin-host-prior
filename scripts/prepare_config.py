@@ -87,6 +87,12 @@ def parser() -> argparse.ArgumentParser:
         "and the flux above which the exponential model map is "
         "accurate. Omit to use the config's own value",
     )
+    p.add_argument("--architecture", default=None,
+                   choices=["energy", "ncsnpp"],
+                   help="which network computes the score. 'energy' "
+                        "differentiates a scalar and is exactly conservative; "
+                        "'ncsnpp' is the U-Net, which predicts sigma*score "
+                        "directly. Omit to use the config's own value")
     p.add_argument("--pool-factor", type=int, default=None,
                    help="omit to use the config's own value")
     p.add_argument("--out-size", type=int, default=None,
@@ -110,6 +116,8 @@ def main() -> None:
     # unconditionally is how this script spent a while resetting out_size to 64
     # and softening_sigma to 1.0 whatever the config said -- the defaults live
     # in config.py, and this script's job is to measure, not to decide.
+    if args.architecture is not None:
+        config.architecture = args.architecture
     if args.pool_factor is not None:
         config.patch.pool_factor = args.pool_factor
     if args.out_size is not None:
@@ -242,35 +250,76 @@ def main() -> None:
     from rubin_host_prior import geometry
 
     lo, hi = config.usable_size_range()
-    margin = config.energy.loss_margin
     size = config.patch.out_size
-    R = config.energy.receptive_radius
-    pad = geometry.padding_fraction(size, config.energy.dilations,
-                                    config.energy.kernel_size)
-    print(
-        f"\nR = {R} ({config.energy.n_branches} branch(es), "
-        f"{config.energy.n_layers} layers), score reach 2R = {2 * R} px"
-    )
-    print(f"  grid {size} ({size * config.patch.pool_factor} of "
-          f"{config.patch.native_size} native px), loss on "
-          f"{size - 2 * margin} px")
-    print(f"  same-mode zero padding: {100 * pad:.0f}% of the mean receptive "
-          f"field is padding, and the input is centred on "
-          f"{config.input_offset:.2f} so those zeros sit at the sky")
+    print(f"\narchitecture: {config.architecture}")
+    if config.architecture == "energy":
+        margin = config.energy.loss_margin
+        R = config.energy.receptive_radius
+        pad = geometry.padding_fraction(size, config.energy.dilations,
+                                        config.energy.kernel_size)
+        print(
+            f"  R = {R} ({config.energy.n_branches} branch(es), "
+            f"{config.energy.n_layers} layers), score reach 2R = {2 * R} px"
+        )
+        print(f"  grid {size} ({size * config.patch.pool_factor} of "
+              f"{config.patch.native_size} native px), loss on "
+              f"{size - 2 * margin} px")
+        print(f"  same-mode zero padding: {100 * pad:.0f}% of the mean "
+              f"receptive field is padding, and the input is centred on "
+              f"{config.input_offset:.2f} so those zeros sit at the sky")
+    else:
+        cfg = config.ncsnpp
+        print(f"  nf {cfg.nf}, ch_mult {tuple(cfg.ch_mult)}, "
+              f"{cfg.num_blocks} blocks/level -> resolutions "
+              f"{[size // 2 ** i for i in range(cfg.n_levels)]}")
+        print(f"  grid {size} ({size * config.patch.pool_factor} of "
+              f"{config.patch.native_size} native px); the coarsest level sees "
+              f"the whole scene, so there is no reach to compare with xi")
+        print(f"  input centred on {config.input_offset:.2f} so the "
+              f"convolutions' zero padding sits at the sky")
     print(f"  sizes this stamp can serve: {lo} .. {hi}; translation room "
           f"+/-{config.patch.max_translate_native // 2} native px")
     for w in config.check_sizes():
         print(f"  WARNING: {w}")
 
+    from rubin_host_prior import plots
+
+    head = plots.schedule_headroom(
+        dataset.validation_batch(min(args.n_stats, len(dataset))),
+        config.sde.sigma_max, (1, 2, 4, 8, 16, 32))
+    print(f"\nsigma_max = {config.sde.sigma_max:.4g} against the scales it has "
+          f"to erase")
+    print("  sigma_vis = sqrt(P) for the band. A mode of power P is still")
+    print("  visible at noise sigma whenever P > sigma^2, so the schedule must")
+    print("  start above the LARGEST sigma_vis -- not above the per-pixel std,")
+    print("  which is the mean of P over modes and says nothing about the few")
+    print("  that hold a red field's variance. 'floor' is the band ratio a")
+    print("  PERFECT score would produce from this sigma_max: 1/sqrt(1+P/s^2).")
+    print(f"\n  {'scale':>7} {'sigma_vis':>10} {'headroom':>9} {'floor':>7}")
+    for i, band in enumerate(head["band"]):
+        flag = "  <-- too small" if head["headroom"][i] < 3.0 else ""
+        print(f"  {band:>7} {head['sigma_visible'][i]:>10.4g} "
+              f"{head['headroom'][i]:>9.1f} {head['pflow_ratio'][i]:>7.3f}{flag}")
+    worst = min(head["pflow_ratio"])
+    if worst < 0.9:
+        print(f"\n  WARNING: even a perfect score would reach only "
+              f"{worst:.2f} of the real power at "
+              f"{head['band'][head['pflow_ratio'].index(worst)]} px. Raise "
+              f"sde.sigma_max to at least 3x the largest sigma_vis "
+              f"({3 * max(head['sigma_visible']):.0f}) and re-measure.")
+
     cl = dataset.correlation_length(args.n_stats)
-    margin = config.energy.loss_margin
     print(f"\ncorrelation length (pooled, log space, over {cl['n_patches']} patches)")
     print(f"  profile: " + " ".join(f"{v:.2f}" for v in cl["profile"][:10]))
     print(
         f"  {cl['noise_fraction']:.0%} of the variance is the zero-lag noise "
         f"delta (excluded from xi)"
     )
-    print(f"  {reach_advice(cl['xi'], 2 * config.energy.receptive_radius)}")
+    if config.architecture == "energy":
+        print(f"  {reach_advice(cl['xi'], 2 * config.energy.receptive_radius)}")
+    else:
+        print(f"  xi = {cl['xi']:.1f} px against a {size} px grid the U-Net "
+              f"sees all of at its coarsest level")
     if cl["truncated"]:
         print(
             "  WARNING: the patches never decorrelate within their own size, so "

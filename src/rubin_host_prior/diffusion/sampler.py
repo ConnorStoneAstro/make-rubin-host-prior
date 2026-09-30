@@ -20,7 +20,7 @@ import jax.numpy as jnp
 import numpy as np
 from jaxtyping import Array, Float, PRNGKeyArray
 
-from ..nn.energy import ConvEnergyNet, batched_score
+from ..nn.score import ScoreModel, batched_score
 from .sde import VESDE
 
 
@@ -54,7 +54,7 @@ def _pflow_scan(model, key, shape, sde, n_steps, heun):
 
 @eqx.filter_jit
 def pflow_sample(
-    model: ConvEnergyNet,
+    model: ScoreModel,
     key: PRNGKeyArray,
     shape: tuple[int, int, int, int],
     sde: VESDE,
@@ -73,7 +73,7 @@ def pflow_sample(
 
 @eqx.filter_jit
 def pflow_trajectory(
-    model: ConvEnergyNet,
+    model: ScoreModel,
     key: PRNGKeyArray,
     shape: tuple[int, int, int, int],
     sde: VESDE,
@@ -106,7 +106,7 @@ def pflow_trajectory(
 
 @eqx.filter_jit
 def reverse_sde_sample(
-    model: ConvEnergyNet,
+    model: ScoreModel,
     key: PRNGKeyArray,
     shape: tuple[int, int, int, int],
     sde: VESDE,
@@ -176,7 +176,7 @@ def reverse_sde_sample(
 
 
 def sample_scene(
-    model: ConvEnergyNet,
+    model: ScoreModel,
     key: PRNGKeyArray,
     out_size: int,
     sde: VESDE,
@@ -197,7 +197,7 @@ def sample_scene(
     defaults are a schedule no trained model has: sampling would run, produce
     plausible-looking noise, and report nothing wrong.
     """
-    shape = (n_samples, model.config.in_channels, out_size, out_size)
+    shape = (n_samples, model.in_channels, out_size, out_size)
     if sampler == "pflow":
         return pflow_sample(model, key, shape, sde, **kwargs)
     if sampler == "sde":

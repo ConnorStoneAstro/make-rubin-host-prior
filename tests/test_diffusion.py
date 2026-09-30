@@ -16,9 +16,10 @@ from rubin_host_prior.diffusion import (
     pflow_trajectory,
     sample_scene,
 )
+from rubin_host_prior.nn import EnergyModel
 
 
-class GaussianEnergy(eqx.Module):
+class GaussianEnergy(EnergyModel):
     """Exact energy for data ``N(0, tau^2 I)``.
 
     ``p_sigma = N(0, (tau^2 + sigma^2) I)``, so the analytic score is
@@ -85,7 +86,7 @@ def test_loss_is_one_for_a_zero_score(tiny_model):
     """
     x = jax.random.normal(jax.random.key(2), (32, 1, 24, 24))
 
-    class Zero(eqx.Module):
+    class Zero(EnergyModel):
         loss_margin: int = eqx.field(static=True, default=4)
 
         def __call__(self, x, sigma):
@@ -103,7 +104,7 @@ def test_analytic_score_beats_a_zero_score():
     x = tau * jax.random.normal(jax.random.key(4), (256, 1, 16, 16))
     good = float(dsm_loss(GaussianEnergy(tau=tau), x, jax.random.key(5), sde, margin=0))
 
-    class Zero(eqx.Module):
+    class Zero(EnergyModel):
         def __call__(self, x, sigma):
             return jnp.asarray(0.0)
 
@@ -263,8 +264,12 @@ def test_a_config_without_a_measured_sigma_range_says_so():
     """
     from rubin_host_prior.config import SDEConfig
 
-    assert (SDEConfig().sigma_min, SDEConfig().sigma_max,
-            SDEConfig().data_mean) == (None, None, None)
+    # sigma_max was given a value in `478e02d config more capacity`, so it is
+    # now chosen rather than measured; the other two are still None and still
+    # refuse to be invented.  `prepare_config.py` reports a set field as "kept
+    # rather than measured", which is what keeps the choice visible.
+    assert SDEConfig().sigma_min is None
+    assert SDEConfig().data_mean is None
     with pytest.raises(ValueError, match="prepare_config"):
         VESDE.from_config(SDEConfig())
     with pytest.raises(ValueError, match="data_mean"):
@@ -332,3 +337,81 @@ def test_the_trajectory_is_the_sampler_with_a_recorder_on_it(tiny_model):
     # float32 fusion differences rather than exactly.
     np.testing.assert_allclose(
         states[0], np.asarray(sde.prior_sample(key, shape)), rtol=1e-5)
+
+
+class ColouredGaussian(EnergyModel):
+    """Exact energy for a stationary Gaussian field of per-mode power ``P_k``.
+
+    ``p_sigma`` is Gaussian with power ``P_k + sigma^2`` in every mode, so this
+    gives the sampler a *red* target whose answer is known mode by mode -- which
+    ``GaussianEnergy`` above, being white, cannot.
+    """
+
+    power: jnp.ndarray
+
+    def __call__(self, x, sigma):
+        h = x.shape[-1]
+        f = jnp.fft.fft2(x[0])
+        return 0.5 * jnp.sum(jnp.abs(f) ** 2 / (self.power + sigma**2)) / h**2
+
+
+def _red_field(h=64, amplitude=40.0, slope=3.0, n=256, seed=0):
+    """A steeply red Gaussian field and the power spectrum it was drawn from."""
+    ky, kx = np.meshgrid(np.fft.fftfreq(h) * h, np.fft.fftfreq(h) * h, indexing="ij")
+    k = np.hypot(ky, kx)
+    k[0, 0] = 1.0
+    power = amplitude * k ** (-slope)
+    power[0, 0] = 0.0  # no DC: the band measurement removes the mean anyway
+    w = jax.random.normal(jax.random.key(seed), (n, h, h))
+    x = jnp.real(jnp.fft.ifft2(jnp.fft.fft2(w) * jnp.sqrt(jnp.asarray(power)) / h)) * h
+    return np.asarray(x)[:, None], power
+
+
+def test_sigma_max_below_a_scales_power_caps_it_even_with_a_perfect_score():
+    """``plots.schedule_headroom``'s closed form, against the actual sampler.
+
+    A Gaussian mode of power ``P`` has true score ``-X / (P + sigma^2)``, so the
+    probability-flow ODE integrates to
+    ``X(sigma) = X(sigma_max) sqrt((P + sigma^2) / (P + sigma_max^2))``.  The
+    draw at ``sigma_max`` therefore has to have variance ``P + sigma_max^2`` --
+    the *true* marginal.  ``prior_sample`` draws white noise of variance
+    ``sigma_max^2``, so every mode comes out short by
+    ``1 / sqrt(1 + P / sigma_max^2)``.
+
+    **This is a floor under the band table, not a model error.**  The score here
+    is exact; the deficit is the initial condition.  It is also the reason
+    ``sigma_max`` cannot be set from the per-pixel standard deviation: that is
+    the *mean* of ``P_k`` over modes, and a red field puts its variance in the
+    few modes the mean says nothing about.  The field below has std 0.29 and
+    needs a sigma_max of 6.3 -- a factor of 22.
+    """
+    from rubin_host_prior import plots
+
+    truth, power = _red_field()
+    assert float(np.std(truth)) < 0.5 < np.sqrt(power.max())  # 0.29 vs 6.3
+    scales = (1, 2, 4, 8, 16)
+
+    for sigma_max in (4.0, 200.0):
+        sde = VESDE(0.01, sigma_max, 0.0)
+        model = ColouredGaussian(jnp.asarray(power))
+        x = np.asarray(pflow_sample(model, jax.random.key(1),
+                                    (256, 1, 64, 64), sde, n_steps=256))
+        got = plots.band_power(x, scales)
+        want = plots.band_power(truth, scales)
+        measured = dict(zip([str(s) for s in scales],
+                            [a / b for a, b in zip(got["rms"], want["rms"])]))
+        measured[f">{got['below_scale']}"] = (
+            got["below_rms"] / want["below_rms"])
+
+        head = plots.schedule_headroom(truth, sigma_max, scales)
+        for band, predicted in zip(head["band"], head["pflow_ratio"]):
+            assert measured[band] == pytest.approx(predicted, abs=0.06), (
+                sigma_max, band, predicted, measured[band])
+
+        if sigma_max == 4.0:
+            # The coarsest band is where it bites: 0.77 of a headroom, so a
+            # perfect score reaches 0.61 of the real power and no more.
+            assert head["headroom"][0] < 1.0
+            assert head["pflow_ratio"][0] == pytest.approx(0.61, abs=0.02)
+        else:
+            assert min(head["pflow_ratio"]) > 0.99

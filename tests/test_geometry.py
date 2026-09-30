@@ -153,8 +153,9 @@ def test_a_model_built_from_the_defaults_scores_its_own_grid():
     from rubin_host_prior.config import Config
 
     c = Config()
+    depth = len(c.energy.dilations[0])
     m = ConvEnergyNet(EnergyConfig(
-        channels=((4,) * 10,), dilations=c.energy.dilations,
+        channels=((4,) * depth,), dilations=c.energy.dilations,
         embed_dim=8, n_fourier=4), key=jax.random.key(0))
     n = c.patch.out_size
     s = score(m, jnp.zeros((1, n, n)), jnp.asarray(1.0))

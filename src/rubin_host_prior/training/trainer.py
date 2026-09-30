@@ -1,13 +1,19 @@
-"""Minimal training loop for the energy-based score model.
+"""Minimal training loop, for whichever architecture computes the score.
 
 Deliberately small: one jitted step, an EMA copy, JSONL logging, periodic
 checkpoints.  Nothing clever, so that a tweak to the loss or the schedule is a
 three-line change rather than an archaeology exercise.
 
-One cost worth knowing about: the score is already a gradient of the network, so
-the loss gradient is a second derivative.  Every step is a
-gradient-of-a-gradient, roughly 2-3x the cost of a conventional score network of
-the same size.  That is the price of an exactly conservative score.
+Nothing here knows which model it is training.  It goes through ``nn.score``,
+asks the model to ``describe`` itself for the header, and is otherwise the same
+loop for an energy and for a U-Net -- which is what makes the two comparable:
+same loss, same schedule, same optimiser, same evaluation.
+
+One cost worth knowing about, and it belongs to one of them: ``ConvEnergyNet``'s
+score is already a gradient of the network, so the loss gradient is a second
+derivative and every step is a gradient-of-a-gradient, roughly 2-3x the cost of
+a conventional score network of the same size.  That is the price of an exactly
+conservative score.  ``NCSNpp`` predicts the score and pays none of it.
 """
 
 from __future__ import annotations
@@ -26,12 +32,11 @@ import numpy as np
 import optax
 from jax.sharding import AxisType, NamedSharding, PartitionSpec
 
-from .. import geometry
 from ..config import Config, TrainConfig
 from ..diffusion.loss import (dsm_loss, dsm_loss_by_sigma,
                               gaussian_loss_floor)
 from ..diffusion.sde import VESDE
-from ..nn.energy import ConvEnergyNet, n_parameters
+from ..nn.score import ScoreModel, n_parameters
 from .checkpoint import load_checkpoint, load_opt_state, save_checkpoint
 from .ema import ema_decay_at, ema_update
 
@@ -160,7 +165,7 @@ def _shardings(n_devices: int | None, batch_size: int, verbose: bool):
 
 
 def train(
-    model: ConvEnergyNet,
+    model: ScoreModel,
     batches: Iterator[np.ndarray],
     config: Config,
     out_dir: str | Path,
@@ -171,7 +176,7 @@ def train(
     resume: str | Path | None = None,
     stop_signals: Sequence[int] = STOP_SIGNALS,
     n_devices: int | None = None,
-) -> tuple[ConvEnergyNet, ConvEnergyNet]:
+) -> tuple[ScoreModel, ScoreModel]:
     """Train and return ``(model, ema_model)``.
 
     ``batches`` is any iterator of ``(B, C, H, W)`` arrays already in the log-space
@@ -226,19 +231,14 @@ def train(
     out.mkdir(parents=True, exist_ok=True)
     config.save(out / "config.json")
 
-    # Reach is a function of the architecture and the loss margin is not, so the
-    # report takes both.  Print it, so that changing the dilations, the kernel
-    # size or the margin announces what it did.
+    # Printed, so that changing the architecture, the dilations or the margin
+    # announces what it did.  The model describes itself: the two architectures
+    # have nothing in common to report, and an isinstance ladder here would grow
+    # a branch for every one added.
     margin = model.loss_margin
     sizes = config.patch.training_sizes
-    setup = geometry.report(sizes, model.config.dilations,
-                            model.config.kernel_size, margin)
     if verbose:
-        print(setup)
-        for size in sizes:
-            print(f"  grid {size} ({size * config.patch.pool_factor} native), "
-                  f"loss on {size - 2 * margin}, host free to move "
-                  f"+/-{config.patch.max_translate_native // 2} native px")
+        print(model.describe(config))
         if len(sizes) > 1:
             print(f"  {len(sizes)} training sizes -> {len(sizes)} jit compilations "
                   f"of the train step, cycled round-robin across batches")
@@ -310,8 +310,8 @@ def train(
             # model is size-locked by its own padding.
             grid = config.patch.out_size
             print(f"  each draws {cfg.n_samples} samples on the {grid}x{grid} "
-                  f"training grid in {2 * cfg.sample_steps} batched backward "
-                  f"passes; --n-samples 0 to skip")
+                  f"training grid in {2 * cfg.sample_steps} batched score "
+                  f"evaluations; --n-samples 0 to skip")
         else:
             print("  no samples (n_samples = 0)")
     log_path = out / "log.jsonl"
@@ -322,28 +322,16 @@ def train(
         header = {
             "event": "start",
             "n_parameters": n_parameters(model),
-            "n_layers": model.n_layers,
-            "n_branches": model.n_branches,
-            "dilations": [list(d) for d in model.config.dilations],
-            "kernel_size": model.config.kernel_size,
-            "receptive_radius": model.receptive_radius,
-            "loss_margin": margin,
             "training_sizes": list(sizes),
-            # What the loss is actually computed on, and how much of the mean
-            # receptive field is zero padding rather than sky -- the two numbers
-            # that describe a same-mode model's geometry.
             "loss_sizes": [s - 2 * margin for s in sizes],
-            "padding_fraction": [
-                round(geometry.padding_fraction(
-                    s, model.config.dilations, model.config.kernel_size), 3)
-                for s in sizes
-            ],
-            "input_offset": round(model.input_offset, 4),
             "sigma_min": sde.sigma_min,
             "sigma_max": sde.sigma_max,
             "start_step": start_step,
             "resumed_from": str(resume) if resume is not None else None,
             "n_devices": n_devices,
+            # Whatever this architecture thinks is worth recording.  Last, so a
+            # field it and the common part both name is the model's own.
+            **model.log_header(config),
         }
         log_file.write(json.dumps(header) + "\n")
         log_file.flush()
@@ -451,7 +439,7 @@ def train(
     return model, ema_model
 
 
-def _resume(directory, config: Config, model: ConvEnergyNet, optimizer,
+def _resume(directory, config: Config, model: ScoreModel, optimizer,
             verbose: bool):
     """Restore weights, EMA, optimiser state and step from a checkpoint.
 
@@ -463,11 +451,16 @@ def _resume(directory, config: Config, model: ConvEnergyNet, optimizer,
     """
     d = Path(directory)
     saved = Config.load(d / "config.json")
-    if saved.energy != config.energy:
+    # The *selected* section, not `energy`: with two architectures in one
+    # config, comparing the wrong one either misses a real mismatch or refuses a
+    # resume over settings the run never used.
+    if (saved.architecture != config.architecture
+            or saved.model_config != config.model_config):
         raise ValueError(
             f"{d} was trained with a different architecture, so its weights do "
-            f"not fit this model:\n  checkpoint: {saved.energy}\n  now:        "
-            f"{config.energy}"
+            f"not fit this model:\n  checkpoint: {saved.architecture} "
+            f"{saved.model_config}\n  now:        {config.architecture} "
+            f"{config.model_config}"
         )
     if saved.train.steps != config.train.steps and verbose:
         print(f"  NOTE: checkpoint had train.steps={saved.train.steps}, now "
@@ -532,13 +525,13 @@ def _write_samples(ema_model, sde, config: Config, out: Path, step: int,
         return {"sample_error": repr(exc)}
 
 
-def _check_batch(batch: jnp.ndarray, model: ConvEnergyNet) -> None:
+def _check_batch(batch: jnp.ndarray, model: ScoreModel) -> None:
     if batch.ndim != 4:
         raise ValueError(f"expected (B, C, H, W) batches, got shape {batch.shape}")
-    if batch.shape[1] != model.config.in_channels:
+    if batch.shape[1] != model.in_channels:
         raise ValueError(
             f"batch has {batch.shape[1]} channels, model expects "
-            f"{model.config.in_channels}"
+            f"{model.in_channels}"
         )
     h, w = batch.shape[-2:]
     need = 2 * model.loss_margin + 1

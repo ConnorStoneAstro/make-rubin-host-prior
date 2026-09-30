@@ -100,7 +100,18 @@ class EnergyConfig:
     activation: str = "silu"  # must be C^1; see nn.layers.ACTIVATIONS
     embed_dim: int = 128  # width of the log-sigma embedding MLP
     n_fourier: int = 64  # random Fourier features of log(sigma)
-    fourier_scale: float = 1.0  # std of the random frequencies
+    #: Standard deviation of the frozen random frequencies, applied to
+    #: **unnormalised** ``log sigma``.  At 1.0 the embedding travels ~37 radians
+    #: -- six revolutions -- across a 6-e-fold schedule, so ``sigma_min`` and
+    #: ``sigma_max`` end up nearly orthogonal in it and adjacent noise levels
+    #: are unrelated: the network can express any function of sigma and has no
+    #: pressure to express a smooth one.  ``NCSNppConfig.fourier_scale`` is 0.02
+    #: on ``t in [0, 1]``, which travels 0.14 radians in total; the same
+    #: smoothness here is ``0.02 / log(sigma_max / sigma_min)``, about 0.003.
+    #: Lu & Song (arXiv:2410.11081) argue the smooth end is the right one.
+    #: Untested on this data -- it is a one-field experiment, and changing it
+    #: starts a fresh run because ``_resume`` compares the whole section.
+    fourier_scale: float = 1.0
     fourier_seed: int = 0  # fixes the frozen basis; see nn.layers
     head_init_scale: float = 0.01  # small, not zero -- see nn.energy
     film_init_scale: float = 0.01  # small, not zero -- see nn.layers.FiLM
@@ -175,6 +186,102 @@ class EnergyConfig:
         return geometry.receptive_radius(self.dilations, self.kernel_size)
 
 
+@dataclass(frozen=True)  # hashable: stored as a static field on the module
+class NCSNppConfig:
+    """The NCSN++ U-Net: the second architecture, and not an energy model.
+
+    It predicts ``sigma * score`` instead of differentiating a scalar, so it
+    gives up the exactly-conservative score in exchange for an output that is
+    O(1) at every noise level and a training step that is one backward pass
+    rather than a gradient of a gradient.  ``nn.ncsnpp`` documents what was
+    ported and what was simplified away; ``nn.score`` documents the trade.
+
+    Defaults are the reference's, except for the two that set the size:
+    ``nf = 64`` and ``ch_mult = (1, 2, 2, 2)`` rather than ``128`` and
+    ``(2, 2, 2, 2)``, which on a 128 px grid is 4 levels of 256 channels and
+    ~100M parameters.  Raise them for a production run.
+    """
+
+    in_channels: int = 1
+    #: Base width.  Every level is ``nf * ch_mult[level]`` channels and the
+    #: noise-level embedding is ``4 * nf``.
+    nf: int = 64
+    #: One entry per resolution; the grid halves between them, so the training
+    #: size must be divisible by ``2 ** (len(ch_mult) - 1)``.
+    ch_mult: tuple[int, ...] = (1, 2, 2, 2)
+    num_blocks: int = 2  # residual blocks per resolution on the way down
+    activation: str = "silu"
+    #: ``1e-2``, so every block's last convolution and every pyramid output
+    #: start near zero and the network starts near its skip path.
+    init_scale: float = 1e-2
+    #: **Small on purpose.**  The embedding is of ``t in [0, 1]``, so
+    #: ``2*pi*w*t`` stays well under a radian and the features are nearly linear
+    #: in ``t``: neighbouring noise levels get neighbouring embeddings and the
+    #: score is smooth in sigma.  Lu & Song (arXiv:2410.11081) is the reference
+    #: for why that matters.  The energy model's ``fourier_scale`` is 1.0 on
+    #: *unnormalised* ``log sigma``, which is ~8 to 24 oscillations across the
+    #: schedule -- a very different conditioning, and one worth comparing.
+    fourier_scale: float = 0.02
+    fourier_seed: int = 0  # fixes the frozen basis; see nn.layers
+    fir: bool = True  # anti-aliased resampling
+    fir_kernel: tuple[int, ...] = (1, 3, 3, 1)
+    skip_rescale: bool = True  # (x + h) / sqrt(2)
+    #: ``"output_skip"`` builds the output as a pyramid: the coarsest level
+    #: emits a map, each finer level upsamples it and adds a correction.  This
+    #: is the direct path from coarse features to the output.  ``"none"`` uses a
+    #: single head at full resolution, i.e. an ordinary U-Net.
+    progressive: str = "output_skip"
+    #: ``"input_skip"`` feeds an FIR-downsampled copy of the scene in at every
+    #: resolution.  ``"none"`` feeds it only at full resolution.
+    progressive_input: str = "input_skip"
+    combine_method: str = "cat"  # how the input pyramid joins the trunk
+    attention: bool = True  # one self-attention block, at the coarsest level
+
+    def __post_init__(self) -> None:
+        if self.progressive not in ("output_skip", "none"):
+            raise ValueError(
+                f"progressive must be 'output_skip' or 'none', got "
+                f"{self.progressive!r}. The reference's 'residual' variant is "
+                f"not ported -- see nn.ncsnpp."
+            )
+        if self.progressive_input not in ("input_skip", "none"):
+            raise ValueError(
+                f"progressive_input must be 'input_skip' or 'none', got "
+                f"{self.progressive_input!r}. The reference's 'residual' "
+                f"variant is not ported -- see nn.ncsnpp."
+            )
+        if self.combine_method not in ("cat", "sum"):
+            raise ValueError(f"combine_method must be 'cat' or 'sum', got "
+                             f"{self.combine_method!r}")
+        if not self.ch_mult:
+            raise ValueError("ch_mult needs at least one resolution")
+        if self.nf % 2:
+            raise ValueError(
+                f"nf must be even: the noise-level embedding uses nf // 2 "
+                f"frequencies for nf sine and cosine features, got {self.nf}"
+            )
+        if self.num_blocks < 1:
+            raise ValueError("num_blocks must be at least 1")
+
+    def check(self) -> None:
+        """Re-run validation on an instance built by other means."""
+        self.__post_init__()
+
+    @property
+    def n_levels(self) -> int:
+        return len(self.ch_mult)
+
+    @property
+    def size_divisor(self) -> int:
+        """The training grid must be a multiple of this."""
+        return 2 ** (self.n_levels - 1)
+
+    @property
+    def loss_margin(self) -> int:
+        """Zero: every pixel is scored, so there is no border to crop."""
+        return 0
+
+
 @dataclass
 class SDEConfig:
     """Variance-exploding SDE, geometric sigma schedule, no preconditioning.
@@ -197,7 +304,7 @@ class SDEConfig:
     sigma_min: float | None = None
     #: Must dominate the data's own spread, or the ``t = 1`` marginal is not
     #: really Gaussian and sampling starts from the wrong distribution.
-    sigma_max: float | None = 20
+    sigma_max: float | None = None
     #: Mean of ``x`` over the training set.  VE does not move the mean, so the
     #: ``t = 1`` marginal is centred here and ``prior_sample`` has to start from
     #: the same place.  This was implicitly zero while the transform put every
@@ -395,7 +502,14 @@ class TrainConfig:
 
 @dataclass
 class Config:
+    #: Which network computes the score: ``"energy"`` differentiates a scalar
+    #: and is exactly conservative, ``"ncsnpp"`` predicts ``sigma * score``
+    #: directly and is not.  Both sections are always present and serialised --
+    #: only the selected one is built -- so switching architectures is one field
+    #: and does not invalidate the other's settings.  ``nn.score`` has the trade.
+    architecture: str = "energy"
     energy: EnergyConfig = field(default_factory=EnergyConfig)
+    ncsnpp: NCSNppConfig = field(default_factory=NCSNppConfig)
     sde: SDEConfig = field(default_factory=SDEConfig)
     transform: TransformConfig = field(default_factory=TransformConfig)
     patch: PatchConfig = field(default_factory=PatchConfig)
@@ -418,19 +532,57 @@ class Config:
         s = self.transform.softening
         return log(s * log(2.0)) if s else 0.0
 
-    def build_model(self, key):
-        """The sanctioned way to construct the energy from a config.
+    ARCHITECTURES = ("energy", "ncsnpp")
 
-        ``ConvEnergyNet`` needs ``input_offset``, which is the transform's sky
-        level and therefore belongs to no single sub-config.  Building the model
-        by hand with ``ConvEnergyNet(config.energy, key=...)`` silently gets an
-        offset of 0, and since a checkpoint's skeleton is rebuilt from the saved
-        config, the reloaded model would then compute different scores from the
-        same weights.  Going through here is what makes those two agree.
+    @property
+    def model_config(self) -> "EnergyConfig | NCSNppConfig":
+        """The section ``architecture`` selects.
+
+        What a resume has to compare, and what a log line should report: the
+        *other* section is carried along unchanged and says nothing about the
+        model that was trained.
         """
-        from .nn.energy import ConvEnergyNet
+        if self.architecture not in self.ARCHITECTURES:
+            raise ValueError(
+                f"unknown architecture {self.architecture!r}; "
+                f"choose from {list(self.ARCHITECTURES)}"
+            )
+        return self.energy if self.architecture == "energy" else self.ncsnpp
 
-        return ConvEnergyNet(self.energy, input_offset=self.input_offset, key=key)
+    def build_model(self, key):
+        """The sanctioned way to construct the score network from a config.
+
+        Both architectures need things that belong to no single sub-config:
+        ``input_offset`` is the transform's sky level, and NCSN++ additionally
+        needs the sigma range, because it conditions on ``t in [0, 1]`` rather
+        than on sigma itself.  Building a model by hand with
+        ``ConvEnergyNet(config.energy, key=...)`` silently gets an offset of 0,
+        and since a checkpoint's skeleton is rebuilt from the saved config, the
+        reloaded model would then compute different scores from the same
+        weights.  Going through here is what makes those two agree.
+        """
+        if self.architecture == "energy":
+            from .nn.energy import ConvEnergyNet
+
+            return ConvEnergyNet(self.energy, input_offset=self.input_offset,
+                                 key=key)
+        if self.architecture == "ncsnpp":
+            from .nn.ncsnpp import NCSNpp
+
+            if self.sde.sigma_min is None or self.sde.sigma_max is None:
+                raise ValueError(
+                    "NCSN++ conditions on t = log(sigma / sigma_min) / "
+                    "log(sigma_max / sigma_min), so it cannot be built before "
+                    "the sigma range is measured. Run "
+                    "scripts/prepare_config.py on the shards."
+                )
+            return NCSNpp(self.ncsnpp, sigma_min=self.sde.sigma_min,
+                          sigma_max=self.sde.sigma_max,
+                          input_offset=self.input_offset, key=key)
+        raise ValueError(
+            f"unknown architecture {self.architecture!r}; "
+            f"choose from {list(self.ARCHITECTURES)}"
+        )
 
     def usable_size_range(self) -> tuple[int, int]:
         """``(smallest, largest)`` training size this config can serve.
@@ -447,9 +599,13 @@ class Config:
     def check_sizes(self) -> list[str]:
         """Warnings about the configured training sizes; empty means fine."""
         _, hi = self.usable_size_range()
+        out = []
+        if self.architecture == "ncsnpp":
+            out += self._ncsnpp_size_warnings()
+            out += self._translate_warning()
+            return out
         margin = self.energy.loss_margin
         R = self.energy.receptive_radius
-        out = []
         # A size that does not fit the stamp cannot get here: PatchConfig
         # rejects it at construction, and dataclasses.replace re-runs that.
         for s in self.patch.training_sizes:
@@ -468,16 +624,31 @@ class Config:
                     f"size {s} has no loss region left after cropping {margin} "
                     f"px from every side. Reduce energy.loss_margin."
                 )
+        return out + self._translate_warning()
+
+    def _translate_warning(self) -> list[str]:
         if self.augment.translate and self.patch.max_translate_native == 0:
-            out.append(
+            return [
                 f"translation augmentation has no room: native_size "
                 f"({self.patch.native_size}) equals out_size * pool_factor. "
                 f"Enlarge native_size or reduce out_size -- translation is exact "
                 f"and free, and with zero-padded convolutions it is also what "
                 f"stops the model learning the host's position instead of its "
                 f"shape."
-            )
-        return out
+            ]
+        return []
+
+    def _ncsnpp_size_warnings(self) -> list[str]:
+        """The U-Net halves the grid once per level; a size that does not divide
+        evenly loses a row and a column at every odd resolution, and the skip
+        concatenation on the way back up then fails on a shape mismatch."""
+        divisor = self.ncsnpp.size_divisor
+        return [
+            f"size {s} is not a multiple of {divisor}, which "
+            f"{self.ncsnpp.n_levels} resolutions of halving require. Use a "
+            f"multiple of {divisor} or shorten ch_mult."
+            for s in self.patch.training_sizes if s % divisor
+        ]
 
     def to_dict(self) -> dict[str, Any]:
         return dataclasses.asdict(self)
@@ -489,13 +660,16 @@ class Config:
     def from_dict(cls, d: dict[str, Any]) -> "Config":
         sections = {
             "energy": (EnergyConfig, _tuples(d.get("energy", {}), ("channels", "dilations"), 2)),
+            "ncsnpp": (NCSNppConfig, _tuples(d.get("ncsnpp", {}), ("ch_mult", "fir_kernel"))),
             "sde": (SDEConfig, d.get("sde", {})),
             "transform": (TransformConfig, d.get("transform", {})),
             "patch": (PatchConfig, _tuples(d.get("patch", {}), ("out_sizes",))),
             "augment": (AugmentConfig, d.get("augment", {})),
             "train": (TrainConfig, d.get("train", {})),
         }
-        return cls(**{name: _section(name, kind, raw) for name, (kind, raw) in sections.items()})
+        built = {name: _section(name, kind, raw)
+                 for name, (kind, raw) in sections.items()}
+        return cls(architecture=d.get("architecture", "energy"), **built)
 
     @classmethod
     def load(cls, path: str | Path) -> "Config":

@@ -481,3 +481,35 @@ def test_the_augmented_reference_is_a_different_distribution(dataset):
     # band is the galaxy and is not.
     assert fine == pytest.approx(1.0, abs=0.08), fine
     assert abs(coarse - 1.0) > abs(fine - 1.0), (coarse, fine)
+
+
+def test_schedule_headroom_drops_bands_with_no_modes():
+    """An octave narrower than the grid's mode spacing is empty, and 0/0 there
+    once came back as sigma_visible = inf, a headroom of 0, and a warning
+    telling you to raise sigma_max to infinity."""
+    x = np.random.default_rng(0).standard_normal((8, 1, 16, 16))
+    head = plots.schedule_headroom(x, 8.0, (1, 2, 4, 8))
+    assert ">" not in "".join(head["band"])  # nothing coarser than 8 px on a 16 grid
+    assert all(m > 0 for m in head["n_modes"])
+    assert all(np.isfinite(v) for v in head["sigma_visible"])
+    with pytest.raises(ValueError, match="coarsest meaningful scale is 8"):
+        plots.schedule_headroom(x, 8.0, (32,))
+
+
+def test_schedule_headroom_orders_by_persistence():
+    """Coarse first: the row that decides whether sigma_max is big enough is
+    the one with the most power per mode, and it should not have to be hunted
+    for at the bottom of the table."""
+    rng = np.random.default_rng(0)
+    h = 32
+    ky, kx = np.meshgrid(np.fft.fftfreq(h) * h, np.fft.fftfreq(h) * h,
+                         indexing="ij")
+    k = np.hypot(ky, kx)
+    k[0, 0] = 1.0
+    x = np.fft.ifft2(np.fft.fft2(rng.standard_normal((16, h, h)))
+                     * k ** -1.5).real[:, None]
+    head = plots.schedule_headroom(x, 4.0, (1, 2, 4, 8))
+    assert head["sigma_visible"] == sorted(head["sigma_visible"], reverse=True)
+    assert head["headroom"] == sorted(head["headroom"])
+    # floor and headroom carry the same ordering, by construction
+    assert head["pflow_ratio"] == sorted(head["pflow_ratio"])

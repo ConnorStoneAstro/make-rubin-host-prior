@@ -32,6 +32,27 @@ from ..config import EnergyConfig
 from .layers import ConvBlock, SigmaEmbedding
 
 
+class EnergyModel(eqx.Module):
+    """A model whose ``__call__`` is a scalar energy ``E(x, sigma)``.
+
+    Supplies ``score`` -- ``-grad_x E`` -- so the derivation lives once and
+    every energy, including the one-line analytic ones used in tests, satisfies
+    the ``nn.score`` interface without restating it.
+    """
+
+    def score(
+        self, x: Float[Array, "c h w"], sigma: Float[Array, ""]
+    ) -> Float[Array, "c h w"]:
+        """``-grad_x E``: the score, as an exact gradient.
+
+        Being a gradient is the whole point of this family -- it costs a
+        gradient-of-a-gradient every training step and buys a conservative
+        vector field: symmetric Jacobian, path-independent log-density,
+        relative log-probabilities of scenes available directly.
+        """
+        return -jax.grad(energy, argnums=1)(self, x, sigma)
+
+
 class EnergyBranch(eqx.Module):
     """One stack of same-mode convolutions ending in a 1x1 head.
 
@@ -103,7 +124,7 @@ class EnergyBranch(eqx.Module):
         return self.head(h)
 
 
-class ConvEnergyNet(eqx.Module):
+class ConvEnergyNet(EnergyModel):
     """Parallel stacks of same-mode convolutions, summed into a scalar energy.
 
     One branch is the ordinary case.  Several still work -- a sum of energies is
@@ -176,6 +197,10 @@ class ConvEnergyNet(eqx.Module):
     def loss_margin(self) -> int:
         return self.config.loss_margin
 
+    @property
+    def in_channels(self) -> int:
+        return self.config.in_channels
+
     # -- forward ----------------------------------------------------------
 
     def energy_map(
@@ -210,6 +235,48 @@ class ConvEnergyNet(eqx.Module):
             e = e / sigma
         return e
 
+    # -- reporting ---------------------------------------------------------
+
+    def describe(self, config) -> str:
+        """The geometry, for the trainer's header and for prepare_config."""
+        from .. import geometry
+        from .score import n_parameters
+
+        sizes = config.patch.training_sizes
+        margin = self.loss_margin
+        lines = [
+            geometry.report(sizes, self.config.dilations,
+                            self.config.kernel_size, margin),
+            f"  {n_parameters(self):,} parameters, "
+            f"{self.n_branches} branch(es) x {self.n_layers} layers",
+        ]
+        for size in sizes:
+            lines.append(
+                f"  grid {size} ({size * config.patch.pool_factor} native), "
+                f"loss on {size - 2 * margin}, host free to move "
+                f"+/-{config.patch.max_translate_native // 2} native px"
+            )
+        return "\n".join(lines)
+
+    def log_header(self, config) -> dict:
+        return {
+            "architecture": "energy",
+            "n_layers": self.n_layers,
+            "n_branches": self.n_branches,
+            "dilations": [list(d) for d in self.config.dilations],
+            "kernel_size": self.config.kernel_size,
+            "receptive_radius": self.receptive_radius,
+            "loss_margin": self.loss_margin,
+            "input_offset": round(self.input_offset, 4),
+            # How much of the mean receptive field is zero padding rather than
+            # sky -- with same-mode convolutions, half the geometry.
+            "padding_fraction": [
+                round(geometry.padding_fraction(
+                    s, self.config.dilations, self.config.kernel_size), 3)
+                for s in config.patch.training_sizes
+            ],
+        }
+
 
 # -- score ----------------------------------------------------------------
 
@@ -220,25 +287,8 @@ def energy(
     return model(x, sigma)
 
 
-def score(
-    model: ConvEnergyNet, x: Float[Array, "c h w"], sigma: Float[Array, ""]
-) -> Float[Array, "c h w"]:
-    """``-grad_x E``, i.e. an estimate of ``grad_x log p_sigma(x)``."""
-    return -jax.grad(energy, argnums=1)(model, x, sigma)
-
-
 def batched_energy(
     model: ConvEnergyNet, x: Float[Array, "b c h w"], sigma: Float[Array, " b"]
 ) -> Float[Array, " b"]:
     return jax.vmap(energy, in_axes=(None, 0, 0))(model, x, sigma)
 
-
-def batched_score(
-    model: ConvEnergyNet, x: Float[Array, "b c h w"], sigma: Float[Array, " b"]
-) -> Float[Array, "b c h w"]:
-    return jax.vmap(score, in_axes=(None, 0, 0))(model, x, sigma)
-
-
-def n_parameters(model: eqx.Module) -> int:
-    leaves = jax.tree_util.tree_leaves(eqx.filter(model, eqx.is_inexact_array))
-    return sum(leaf.size for leaf in leaves)

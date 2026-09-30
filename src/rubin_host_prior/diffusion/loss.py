@@ -1,9 +1,14 @@
-"""Denoising score matching, evaluated only where the score is fully supported.
+"""Denoising score matching, against whichever model computes the score.
 
-The valid-convolution energy attenuates the score within ``2R`` pixels of the
-edge (see ``geometry``).  Training on those pixels would force the network to
-compensate for a structural deficit it cannot fix, corrupting the interior in
-the process, so they are cropped out of the residual.
+Everything here goes through ``nn.score``, so the energy model and the U-Net
+train on exactly the same objective and their losses are comparable numbers.
+
+``margin`` crops the residual to an interior.  It exists because valid-mode
+convolutions attenuated the score within ``2R`` pixels of the edge, and training
+on those pixels forced the network to compensate for a structural deficit it
+could not fix.  Both current architectures are same-mode and zero-padded, so
+every pixel has a score and the margin is 0; it is kept because raising it is
+still the way to ask whether the border is hurting the interior.
 """
 
 from __future__ import annotations
@@ -12,7 +17,7 @@ import jax
 import jax.numpy as jnp
 from jaxtyping import Array, Float, PRNGKeyArray
 
-from ..nn.energy import ConvEnergyNet, batched_score
+from ..nn.score import ScoreModel, batched_score
 from .sde import VESDE
 
 
@@ -29,7 +34,7 @@ def crop_interior(a: Float[Array, "... h w"], margin: int) -> Float[Array, "... 
 
 
 def dsm_loss(
-    model: ConvEnergyNet,
+    model: ScoreModel,
     x: Float[Array, "b c h w"],
     key: PRNGKeyArray,
     sde: VESDE,
@@ -52,7 +57,7 @@ def dsm_loss(
 
 
 def dsm_loss_by_sigma(
-    model: ConvEnergyNet,
+    model: ScoreModel,
     x: Float[Array, "b c h w"],
     sigmas: Float[Array, " n"],
     key: PRNGKeyArray,
@@ -131,7 +136,7 @@ def gaussian_loss_floor(
 
 
 def mean_dsm_loss(
-    model: ConvEnergyNet,
+    model: ScoreModel,
     batches,
     n_batches: int,
     key: PRNGKeyArray,

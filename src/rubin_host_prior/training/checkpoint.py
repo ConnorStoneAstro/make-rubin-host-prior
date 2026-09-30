@@ -15,15 +15,15 @@ import equinox as eqx
 import jax
 
 from ..config import Config
-from ..nn.energy import ConvEnergyNet
+from ..nn.score import ScoreModel
 
 
 def save_checkpoint(
     directory: str | Path,
     step: int,
     config: Config,
-    model: ConvEnergyNet,
-    ema_model: ConvEnergyNet | None = None,
+    model: ScoreModel,
+    ema_model: ScoreModel | None = None,
     opt_state=None,
 ) -> Path:
     d = Path(directory)
@@ -40,7 +40,7 @@ def save_checkpoint(
 
 def load_checkpoint(
     directory: str | Path, which: str = "ema"
-) -> tuple[ConvEnergyNet, Config, int]:
+) -> tuple[ScoreModel, Config, int]:
     """Rebuild a model from a checkpoint directory.
 
     ``which`` selects ``"ema"`` (default, and what you want for inference) or
