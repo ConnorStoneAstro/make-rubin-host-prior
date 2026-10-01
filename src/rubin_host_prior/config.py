@@ -236,6 +236,17 @@ class NCSNppConfig:
     progressive_input: str = "input_skip"
     combine_method: str = "cat"  # how the input pyramid joins the trunk
     attention: bool = True  # one self-attention block, at the coarsest level
+    #: How the output map becomes a scalar energy.  **Read only when
+    #: ``Config.architecture`` is ``"ncsnpp_energy"``**; the plain ``"ncsnpp"``
+    #: uses the map as the score and ignores this.  ``"sum"`` is
+    #: ``sum(h)/sigma``, the direct reading, the more expressive one, and --
+    #: measured -- the faster of the two **from a random init**.  ``"dae"`` is
+    #: ``(sigma_d^2+sigma^2)/(2 sigma^2) * ||h||^2``, Salimans & Ho's
+    #: denoising-autoencoder energy, for which a trained ``"ncsnpp"`` checkpoint
+    #: is already the exact solution on Gaussian data; it is the **warm-start**
+    #: form and starts slowly without one.  ``nn.ncsnpp.NCSNppEnergy`` has the
+    #: derivation, the loss curves, and what each gives up.
+    energy_form: str = "sum"
 
     def __post_init__(self) -> None:
         if self.progressive not in ("output_skip", "none"):
@@ -253,6 +264,9 @@ class NCSNppConfig:
         if self.combine_method not in ("cat", "sum"):
             raise ValueError(f"combine_method must be 'cat' or 'sum', got "
                              f"{self.combine_method!r}")
+        if self.energy_form not in ("sum", "dae"):
+            raise ValueError(f"energy_form must be 'sum' or 'dae', got "
+                             f"{self.energy_form!r}")
         if not self.ch_mult:
             raise ValueError("ch_mult needs at least one resolution")
         if self.nf % 2:
@@ -312,6 +326,12 @@ class SDEConfig:
     #: near +3, and a prior sample centred on zero starts half a ``sigma_max``
     #: away from the distribution it is meant to be drawn from.
     data_mean: float | None = None
+    #: Per-pixel standard deviation of ``x`` over the training set --
+    #: ``sigma_data`` in EDM's sense.  Measured like the rest, and used only by
+    #: the ``"dae"`` energy, whose prefactor is ``(data_std^2 + sigma^2)/sigma^2``
+    #: (see ``nn.ncsnpp.NCSNppEnergy``).  Nothing else reads it, so a config
+    #: that predates it loads fine and only the ``"dae"`` path complains.
+    data_std: float | None = None
 
 
 @dataclass
@@ -502,11 +522,14 @@ class TrainConfig:
 
 @dataclass
 class Config:
-    #: Which network computes the score: ``"energy"`` differentiates a scalar
-    #: and is exactly conservative, ``"ncsnpp"`` predicts ``sigma * score``
-    #: directly and is not.  Both sections are always present and serialised --
-    #: only the selected one is built -- so switching architectures is one field
-    #: and does not invalidate the other's settings.  ``nn.score`` has the trade.
+    #: Which network computes the score.  ``"energy"`` differentiates a scalar
+    #: built from dilated convolutions; ``"ncsnpp"`` is the U-Net, predicting
+    #: ``sigma * score`` directly and **not** conservative; ``"ncsnpp_energy"``
+    #: is the same U-Net read as a scalar energy, conservative again, which is
+    #: what HMC needs -- it requires the potential for its accept/reject step,
+    #: not just the gradient.  All sections are always present and serialised --
+    #: only the selected one is built -- so switching is one field and does not
+    #: invalidate the others.  ``nn.score`` has the trade.
     architecture: str = "energy"
     energy: EnergyConfig = field(default_factory=EnergyConfig)
     ncsnpp: NCSNppConfig = field(default_factory=NCSNppConfig)
@@ -532,7 +555,7 @@ class Config:
         s = self.transform.softening
         return log(s * log(2.0)) if s else 0.0
 
-    ARCHITECTURES = ("energy", "ncsnpp")
+    ARCHITECTURES = ("energy", "ncsnpp", "ncsnpp_energy")
 
     @property
     def model_config(self) -> "EnergyConfig | NCSNppConfig":
@@ -566,8 +589,8 @@ class Config:
 
             return ConvEnergyNet(self.energy, input_offset=self.input_offset,
                                  key=key)
-        if self.architecture == "ncsnpp":
-            from .nn.ncsnpp import NCSNpp
+        if self.architecture in ("ncsnpp", "ncsnpp_energy"):
+            from .nn.ncsnpp import NCSNpp, NCSNppEnergy
 
             if self.sde.sigma_min is None or self.sde.sigma_max is None:
                 raise ValueError(
@@ -576,9 +599,21 @@ class Config:
                     "the sigma range is measured. Run "
                     "scripts/prepare_config.py on the shards."
                 )
-            return NCSNpp(self.ncsnpp, sigma_min=self.sde.sigma_min,
+            common = dict(sigma_min=self.sde.sigma_min,
                           sigma_max=self.sde.sigma_max,
                           input_offset=self.input_offset, key=key)
+            if self.architecture == "ncsnpp":
+                return NCSNpp(self.ncsnpp, **common)
+            if self.ncsnpp.energy_form == "dae" and self.sde.data_std is None:
+                raise ValueError(
+                    "the 'dae' energy's prefactor is "
+                    "(data_std^2 + sigma^2) / sigma^2, so it cannot be built "
+                    "before sde.data_std is measured. Re-run "
+                    "scripts/prepare_config.py, or set energy_form to 'sum', "
+                    "which does not use it."
+                )
+            return NCSNppEnergy(self.ncsnpp, data_std=self.sde.data_std or 1.0,
+                                **common)
         raise ValueError(
             f"unknown architecture {self.architecture!r}; "
             f"choose from {list(self.ARCHITECTURES)}"
@@ -600,7 +635,7 @@ class Config:
         """Warnings about the configured training sizes; empty means fine."""
         _, hi = self.usable_size_range()
         out = []
-        if self.architecture == "ncsnpp":
+        if self.architecture in ("ncsnpp", "ncsnpp_energy"):
             out += self._ncsnpp_size_warnings()
             out += self._translate_warning()
             return out

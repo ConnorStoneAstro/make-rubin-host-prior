@@ -71,7 +71,7 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("--batch-size", type=int, default=None)
     p.add_argument("--lr", type=float, default=None)
     p.add_argument("--architecture", default=None,
-                   choices=["energy", "ncsnpp"],
+                   choices=["energy", "ncsnpp", "ncsnpp_energy"],
                    help="override the config's architecture. Both sections are "
                         "always present in a config, so this switches which one "
                         "is built without disturbing the other")

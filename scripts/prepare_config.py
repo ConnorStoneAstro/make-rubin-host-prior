@@ -88,11 +88,13 @@ def parser() -> argparse.ArgumentParser:
         "accurate. Omit to use the config's own value",
     )
     p.add_argument("--architecture", default=None,
-                   choices=["energy", "ncsnpp"],
-                   help="which network computes the score. 'energy' "
-                        "differentiates a scalar and is exactly conservative; "
-                        "'ncsnpp' is the U-Net, which predicts sigma*score "
-                        "directly. Omit to use the config's own value")
+                   choices=["energy", "ncsnpp", "ncsnpp_energy"],
+                   help="which network computes the score. 'energy' is the "
+                        "dilated-convolution scalar; 'ncsnpp' is the U-Net, "
+                        "which predicts sigma*score directly and is not "
+                        "conservative; 'ncsnpp_energy' is the same U-Net read "
+                        "as a scalar energy, which is what HMC needs. Omit to "
+                        "use the config's own value")
     p.add_argument("--pool-factor", type=int, default=None,
                    help="omit to use the config's own value")
     p.add_argument("--out-size", type=int, default=None,
@@ -182,6 +184,10 @@ def main() -> None:
     # x is absolute log flux, so the data is centred wherever the fluxes put it
     # -- near +3 at DP2 depths, not near zero.  VE keeps the mean, so the t=1
     # marginal is centred here and prior_sample has to start from the same place.
+    if config.sde.data_std is None:
+        config.sde.data_std = round(float(stats["std"]), 4)
+    else:
+        kept.append(f"sde.data_std = {config.sde.data_std}")
     if config.sde.data_mean is None:
         config.sde.data_mean = round(float(stats["mean"]), 4)
     else:
@@ -206,6 +212,7 @@ def main() -> None:
                 "softening_nJy": config.transform.softening,
                 "sigma_min": config.sde.sigma_min,
                 "sigma_max": config.sde.sigma_max,
+                "data_std": config.sde.data_std,
             },
             indent=2,
         )
@@ -269,6 +276,9 @@ def main() -> None:
               f"{config.input_offset:.2f} so those zeros sit at the sky")
     else:
         cfg = config.ncsnpp
+        if config.architecture == "ncsnpp_energy":
+            print(f"  scalar energy by '{cfg.energy_form}'; score is -grad_x E, "
+                  f"so a step is a gradient of a gradient (2-3x, halve the batch)")
         print(f"  nf {cfg.nf}, ch_mult {tuple(cfg.ch_mult)}, "
               f"{cfg.num_blocks} blocks/level -> resolutions "
               f"{[size // 2 ** i for i in range(cfg.n_levels)]}")

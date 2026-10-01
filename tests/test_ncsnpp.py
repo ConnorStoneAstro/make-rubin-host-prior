@@ -334,3 +334,152 @@ def test_a_resume_compares_the_architecture_in_use(tiny_config, tmp_path):
     with pytest.raises(ValueError, match="different architecture"):
         _resume(tmp_path, wider, wider.build_model(jax.random.key(0)), opt,
                 verbose=False)
+
+
+# -- the same U-Net, read as an energy -------------------------------------
+
+
+@pytest.fixture(scope="module")
+def energy_config(tiny_config) -> Config:
+    c = dataclasses.replace(tiny_config, architecture="ncsnpp_energy")
+    c.sde = dataclasses.replace(tiny_config.sde, data_std=0.9)
+    return c
+
+
+def test_the_dae_prefactor_makes_the_epsilon_optimal_net_exact():
+    """The derivation behind ``energy_form="dae"``, pinned.
+
+    For data ``N(0, tau^2)`` the epsilon-optimal network is
+    ``h = -sigma x / (tau^2 + sigma^2)``.  Feed that into
+    ``E = c(sigma) ||h||^2 / 2`` with ``c = (tau^2 + sigma^2) / sigma^2`` and
+    ``-grad_x E`` is the true score ``-x / (tau^2 + sigma^2)`` **exactly**, with
+    the Jacobian term included -- which is what makes a trained ``"ncsnpp"``
+    checkpoint the solution rather than merely a nearby point.
+
+    Drop the prefactor and the score is suppressed by ``sigma^2/(tau^2+sigma^2)``:
+    a factor of 6400 at ``sigma = 0.01``.  That is the dynamic range the epsilon
+    parameterisation exists to remove, reintroduced.
+    """
+    from rubin_host_prior.nn.ncsnpp import scalar_energy
+
+    tau = 0.8
+    optimal = lambda x, s: -s * x / (tau**2 + s**2)
+    x = jax.random.normal(jax.random.key(0), (1, 8, 8))
+
+    for sigma in (0.01, 0.1, 1.0, 10.0):
+        true_score = -x / (tau**2 + sigma**2)
+        got = -jax.grad(lambda xx: scalar_energy(
+            optimal(xx, sigma), sigma, "dae", tau))(x, )
+        np.testing.assert_allclose(np.asarray(got), np.asarray(true_score),
+                                   rtol=1e-5)
+        # ... and what the prefactor is for.
+        naive = -jax.grad(lambda xx: 0.5 * jnp.sum(optimal(xx, sigma) ** 2))(x)
+        ratio = float(jnp.mean(naive / true_score))
+        assert ratio == pytest.approx(sigma**2 / (tau**2 + sigma**2), rel=1e-3)
+
+
+@pytest.mark.parametrize("form", ["sum", "dae"])
+def test_the_energy_score_is_conservative(energy_config, form):
+    """What the whole exercise is for.  A score that is a gradient has a
+    symmetric Jacobian; ``NCSNpp``'s does not (see the test above), and HMC
+    needs more than that -- it needs the potential itself for its accept/reject
+    step, which only an energy supplies."""
+    c = dataclasses.replace(energy_config)
+    c.ncsnpp = dataclasses.replace(energy_config.ncsnpp, nf=8, ch_mult=(1, 2),
+                                   num_blocks=1, attention=False,
+                                   energy_form=form)
+    model = c.build_model(jax.random.key(0))
+    x = jax.random.normal(jax.random.key(5), (1, 8, 8))
+    jac = np.asarray(jax.jacrev(model.score)(x, jnp.float32(1.0))).reshape(64, 64)
+    asymmetry = np.abs(jac - jac.T).max() / np.abs(jac).max()
+    assert asymmetry < 1e-4, asymmetry
+
+
+def test_both_energy_forms_descend_and_sum_descends_faster(energy_config):
+    """Both train; ``"sum"`` gets further from a random init.
+
+    That ordering is the finding, and it is the opposite of what the published
+    argument for ``"dae"`` would suggest in isolation -- its gradient
+    ``-c (grad h)^T h`` is proportional to ``h``, which starts at 0.08 because
+    the pyramid output convolutions are initialised at ``init_scale = 1e-2``.
+    The advantage ``"dae"`` has is conditional on ``h`` already being the right
+    size, which is what warm-starting from a trained ``"ncsnpp"`` provides.
+    See ``NCSNppEnergy`` for the full curves.
+    """
+    import optax
+
+    def descend(form, n=50):
+        c = dataclasses.replace(energy_config)
+        c.ncsnpp = dataclasses.replace(energy_config.ncsnpp, energy_form=form)
+        model = c.build_model(jax.random.key(0))
+        sde = VESDE.from_config(c.sde)
+        x = jnp.asarray(np.random.default_rng(0).standard_normal(
+            (8, 1, SIZE, SIZE)) * 0.7, jnp.float32)
+        opt = optax.adam(3e-3)
+        state = opt.init(eqx.filter(model, eqx.is_inexact_array))
+
+        @eqx.filter_jit
+        def step(model, state, key):
+            loss, grads = eqx.filter_value_and_grad(dsm_loss)(
+                model, x, key, sde, 0)
+            updates, state = opt.update(
+                grads, state, eqx.filter(model, eqx.is_inexact_array))
+            return eqx.apply_updates(model, updates), state, loss
+
+        # The same noise draw every step, so this measures fitting and not the
+        # Monte Carlo scatter of the sigma draw.
+        key = jax.random.fold_in(jax.random.key(7), 0)
+        losses = []
+        for _ in range(n):
+            model, state, loss = step(model, state, key)
+            losses.append(float(loss))
+        return losses
+
+    by_form = {form: descend(form) for form in ("sum", "dae")}
+    for form, losses in by_form.items():
+        assert losses[0] == pytest.approx(1.0, abs=0.15), (form, losses[0])
+        # Modest on purpose: 50 steps of a toy model. The ordering below is
+        # the finding; this only has to show both are learning at all.
+        assert losses[-1] < losses[0] - 0.1, (form, losses[0], losses[-1])
+    assert by_form["sum"][-1] < by_form["dae"][-1]
+
+
+def test_the_energy_wraps_an_unchanged_backbone(energy_config, tiny_config):
+    """``.net`` is byte-for-byte an ``NCSNpp``, so the weights of a trained
+    score model drop straight in.  That is the practical argument for the
+    ``"dae"`` form: its solution for Gaussian data *is* those weights."""
+    score_model = tiny_config.build_model(jax.random.key(0))
+    energy_model = energy_config.build_model(jax.random.key(0))
+    a = jax.tree_util.tree_structure(eqx.filter(score_model, eqx.is_inexact_array))
+    b = jax.tree_util.tree_structure(eqx.filter(energy_model.net,
+                                                eqx.is_inexact_array))
+    assert a == b
+    assert n_parameters(energy_model) == n_parameters(score_model)
+
+
+def test_the_dae_form_refuses_to_build_without_data_std(energy_config):
+    c = dataclasses.replace(energy_config)
+    c.ncsnpp = dataclasses.replace(energy_config.ncsnpp, energy_form="dae")
+    c.sde = dataclasses.replace(energy_config.sde, data_std=None)
+    with pytest.raises(ValueError, match="data_std"):
+        c.build_model(jax.random.key(0))
+    # 'sum' does not use it, so it builds.
+    c.ncsnpp = dataclasses.replace(energy_config.ncsnpp, energy_form="sum")
+    assert c.build_model(jax.random.key(0)) is not None
+
+
+def test_an_unknown_energy_form_is_rejected():
+    with pytest.raises(ValueError, match="energy_form"):
+        NCSNppConfig(energy_form="scalar_head")
+
+
+def test_the_energy_config_round_trips(energy_config):
+    import json
+
+    c = dataclasses.replace(energy_config)
+    c.ncsnpp = dataclasses.replace(energy_config.ncsnpp, energy_form="dae")
+    back = Config.from_dict(json.loads(json.dumps(c.to_dict())))
+    assert back == c
+    assert back.architecture == "ncsnpp_energy"
+    assert back.ncsnpp.energy_form == "dae"
+    assert back.sde.data_std == 0.9

@@ -84,6 +84,7 @@ import numpy as np
 from jaxtyping import Array, Float, PRNGKeyArray
 
 from ..config import NCSNppConfig
+from .energy import EnergyModel
 from .layers import FourierFeatures, get_activation
 
 SQRT2 = np.sqrt(2.0)
@@ -592,3 +593,161 @@ class NCSNpp(eqx.Module):
             "fourier_scale": cfg.fourier_scale,
             "loss_margin": 0,
         }
+
+
+def scalar_energy(
+    h: Float[Array, "c h w"], sigma: Float[Array, ""], form: str,
+    data_std: float,
+) -> Float[Array, ""]:
+    """Turn an NCSN++ output map into a scalar energy.
+
+    Separated from the module so the two formulas can be checked against
+    analytic cases without a network in the way -- which is how the ``"dae"``
+    prefactor is pinned (see ``NCSNppEnergy``).
+    """
+    sigma = jnp.asarray(sigma)
+    if form == "sum":
+        return jnp.sum(h) / sigma
+    if form == "dae":
+        return 0.5 * (data_std**2 + sigma**2) / sigma**2 * jnp.sum(h**2)
+    raise ValueError(f"energy_form must be 'sum' or 'dae', got {form!r}")
+
+
+class NCSNppEnergy(EnergyModel):
+    """The same U-Net, read as a scalar energy instead of as a score.
+
+    Wraps an ``NCSNpp`` rather than subclassing it, so the backbone is byte for
+    byte the one that was validated against the reference and a trained
+    ``NCSNpp`` checkpoint's weights live at ``.net`` unchanged.  ``score`` comes
+    from ``EnergyModel``: ``-grad_x E``, an exact gradient, which is the whole
+    point -- **HMC needs the potential itself** for its accept/reject step, not
+    just its gradient, and a score network supplies only the gradient.
+
+    The cost is the one the energy model always paid: the loss gradient is a
+    gradient of a gradient, so a step is 2-3x an ``NCSNpp`` step and holds more
+    activations.  Expect to halve the batch.
+
+    Two ways to make the scalar, ``NCSNppConfig.energy_form``:
+
+    ``"sum"`` -- ``E = sum(h) / sigma``, the network's output map summed over
+    the grid, with the same inverse-sigma scaling ``ConvEnergyNet`` uses so that
+    ``grad E~`` is O(1) at every noise level.  The most direct reading of the
+    network as an energy density, and the most expressive: ``E`` is an
+    unconstrained scalar function.  It is also the parameterisation Salimans &
+    Ho (2021) found to optimise *worse* than an unconstrained score model --
+    nothing in ``-grad_x E`` contains the feed-forward output, so every bit of
+    the score has to come back through the whole network.
+
+    ``"dae"`` -- ``E = c(sigma) * ||h||^2 / 2`` with
+    ``c(sigma) = (sigma_data^2 + sigma^2) / sigma^2``.  This is Salimans & Ho's
+    denoising-autoencoder energy ``||x - s(x)||^2 / 2`` in disguise: Tweedie
+    gives the denoiser ``s = x + sigma * h``, so ``x - s = -sigma * h`` and the
+    two differ only by the prefactor.  Its gradient is
+
+        -grad E = -c (grad h)^T h
+
+    whose leading term, where ``grad h ~ -I / sigma``, is ``c h / sigma`` --
+    **the feed-forward output itself**.  That is the paper's argument for it:
+    the score does not have to be reconstructed through the whole network, so
+    optimisation behaves like the unconstrained model, and they report it
+    performing near-identically to plain epsilon-prediction while admitting an
+    explicit energy.
+
+    **The prefactor is not decoration.**  Without it the required ``h`` blows up
+    as ``1/sigma``, which is exactly the dynamic range the epsilon
+    parameterisation exists to remove.  ``c = (sigma_data^2 + sigma^2)/sigma^2``
+    is fixed by demanding that for Gaussian data the *standard* epsilon-optimal
+    network be the exact solution: with ``h = -sigma x / (tau^2 + sigma^2)`` and
+    ``grad h = -(I - grad D)/sigma``, ``-grad E = -c x sigma^2/(tau^2+sigma^2)^2``,
+    which equals the true score ``-x/(tau^2+sigma^2)`` precisely when
+    ``c = (tau^2+sigma^2)/sigma^2``.  ``tests/test_ncsnpp.py`` pins that
+    identity to machine precision.
+
+    The practical consequence: **the weights of a trained ``NCSNpp`` are
+    already the answer** for Gaussian data, and a well-founded starting point
+    for anything else.  Real stamps are not Gaussian, so it is an
+    initialisation and not a solution -- but one that starts from a model known
+    to produce the right spectrum rather than from noise.
+
+    **Measured, and it does not favour ``"dae"`` from scratch.**  150 Adam steps
+    on a fixed batch, random init, identical everything else::
+
+        ncsnpp (score)         1.073 -> 0.791 -> 0.591 -> 0.329 -> 0.096
+        ncsnpp_energy / sum    0.970 -> 0.819 -> 0.610 -> 0.505 -> 0.311
+        ncsnpp_energy / dae    1.013 -> 0.978 -> 0.661 -> 0.590 -> 0.463
+                        (steps     1      12      50      100      150)
+
+    A toy problem and too few steps to call a converged result, but the
+    ordering is consistent: making the score a gradient costs something, and
+    ``"dae"`` costs more again from a *random* init, where ``h`` starts at 0.08
+    and its gradient ``-c (grad h)^T h`` is proportional to it.  Raising
+    ``init_scale`` does not rescue it -- at 1.0 the score starts at 9.0 against
+    a target near 1, with a parameter-gradient norm of 2e4.
+
+    So: **``"sum"`` is the from-scratch form and ``"dae"`` is the warm-start
+    form.**  ``"dae"``'s advantage is conditional on ``h`` already being the
+    right size, which is exactly what a trained ``"ncsnpp"`` checkpoint
+    provides, and exactly the case the exactness result above covers.
+
+    What ``"dae"`` gives up either way: ``E >= 0``, so the highest-probability
+    states are exactly where the network predicts zero noise.  A sensible
+    inductive bias, and still a restriction ``"sum"`` does not have.
+    """
+
+    net: NCSNpp
+    #: ``sigma_data``, the per-pixel spread of ``x`` over the training set.
+    #: Used only by ``"dae"``; see the prefactor above.
+    data_std: float = eqx.field(static=True)
+
+    def __init__(self, config: NCSNppConfig, *, sigma_min: float,
+                 sigma_max: float, data_std: float = 1.0,
+                 input_offset: float = 0.0, key: PRNGKeyArray):
+        if config.energy_form not in ("sum", "dae"):
+            raise ValueError(
+                f"energy_form must be 'sum' or 'dae', got {config.energy_form!r}")
+        if config.energy_form == "dae" and not data_std > 0:
+            raise ValueError(
+                f"the 'dae' energy needs a positive data_std (it sets the "
+                f"prefactor (sigma_data^2 + sigma^2)/sigma^2), got {data_std}"
+            )
+        self.net = NCSNpp(config, sigma_min=sigma_min, sigma_max=sigma_max,
+                          input_offset=input_offset, key=key)
+        self.data_std = float(data_std)
+
+    def __call__(
+        self, x: Float[Array, "c h w"], sigma: Float[Array, ""]
+    ) -> Float[Array, ""]:
+        return scalar_energy(self.net(x, sigma), sigma,
+                             self.net.config.energy_form, self.data_std)
+
+    # -- interface ---------------------------------------------------------
+
+    @property
+    def in_channels(self) -> int:
+        return self.net.in_channels
+
+    @property
+    def loss_margin(self) -> int:
+        return self.net.loss_margin
+
+    @property
+    def config(self) -> NCSNppConfig:
+        return self.net.config
+
+    def describe(self, config) -> str:
+        form = self.net.config.energy_form
+        how = ("E = sum(h) / sigma" if form == "sum"
+               else f"E = (sigma_d^2 + sigma^2)/(2 sigma^2) * ||h||^2, "
+                    f"sigma_d = {self.data_std:.3g}")
+        return "\n".join([
+            self.net.describe(config).replace("NCSN++:", "NCSN++ energy:", 1),
+            f"  scalar energy by '{form}': {how}",
+            "  score is -grad_x E, so a training step is a gradient of a "
+            "gradient (2-3x an NCSN++ step; halve the batch)",
+        ])
+
+    def log_header(self, config) -> dict:
+        return {**self.net.log_header(config),
+                "architecture": "ncsnpp_energy",
+                "energy_form": self.net.config.energy_form,
+                "data_std": self.data_std}
