@@ -106,14 +106,22 @@ _TINY = 1e-300
 SKY_SLOPE = 0.5 / log(2.0)
 
 
-def expected_sky_scatter(softening_sigma: float) -> float:
-    """Predicted spread of ``x`` for sky pixels, ``0.721 / softening_sigma``.
+def expected_sky_scatter(softening_sigma: float, floor_sigma: float = 0.0) -> float:
+    """Predicted spread of ``x`` for sky pixels.
 
-    **Unfloored.**  This is the ``c = 0`` relation, where the softening alone
-    decides how flat the sky is.  With a sky floor the floor decides instead --
-    that is what it is for -- and the scatter is roughly ``1/k`` times smaller:
-    measured, 0.18 at ``k = 1``, 0.084 at 1.5, 0.037 at 2.  Use this to check
-    the *softening*, not to predict a floored set.
+    Without a floor this is ``0.721 / softening_sigma``: the slope of the map
+    at zero flux, which is where the sky sits.
+
+    With one it is computed by quadrature over the sky's own Gaussian, because
+    there is no tidy closed form -- the residual scatter is the upper tail of
+    the sky poking above the floor, not the slope at any one point.  Both the
+    sky noise and the two scales are proportional to sigma, which cancels in
+    the logarithm, so the answer depends only on ``floor_sigma`` (``k``) and
+    ``softening_sigma``.  Measured at ``softening_sigma = 1/3``: 0.18 at
+    ``k = 1``, 0.084 at 1.5, 0.037 at 2.
+
+    ``floor_sigma = 0`` returns the closed form unchanged, so every caller and
+    test written against the unfloored transform still means what it said.
 
     Exact for a band at the noise level the single scale was measured from, and
     proportionally wider or narrower for a band deeper or shallower than that:
@@ -121,7 +129,18 @@ def expected_sky_scatter(softening_sigma: float) -> float:
     which is what ``PatchDataset.stats()["sky_scatter"]`` measures across the
     whole set.  A large disagreement means the softening scale is wrong.
     """
-    return SKY_SLOPE / softening_sigma
+    if floor_sigma <= 0:
+        return SKY_SLOPE / softening_sigma
+    # Gauss-Hermite would need fewer points, but the integrand is a logarithm of
+    # a softplus and the tail is what matters here, so a wide uniform grid over
+    # the sky's own distribution is both simpler and easier to check.
+    u = np.linspace(-8.0, 8.0, 20001)
+    weight = np.exp(-0.5 * u ** 2)
+    weight /= weight.sum()
+    x = np.log(floor_sigma + softening_sigma
+               * softplus((u - floor_sigma) / softening_sigma, np))
+    mean = float((weight * x).sum())
+    return float(np.sqrt((weight * (x - mean) ** 2).sum()))
 
 
 def _xp(a):

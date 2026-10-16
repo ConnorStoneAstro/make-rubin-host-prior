@@ -218,6 +218,31 @@ class PatchDataset:
             )
         return out
 
+    def to_log_space(
+        self,
+        pooled: np.ndarray,
+        sky_noise: np.ndarray | None,
+        rng: np.random.Generator | None,
+        augment: bool,
+    ) -> tuple[np.ndarray, np.ndarray | float]:
+        """Pooled flux -> ``x``, and the floor that was used.  ``(x, floor)``.
+
+        **The one place the floor is applied.**  Everything that needs to show
+        or reproduce the training representation goes through here -- the
+        loader and ``plots.plot_transform`` both -- because a figure that
+        reimplemented the chain is exactly how the transform figure came to be
+        drawing an unfloored map of a floored dataset.
+
+        The ``k`` draw is an *augmentation*, so it follows ``augment`` and not
+        merely whether an rng exists: ``validation_batch`` and the diagnostic
+        figures pass an rng with augmentation off and have to be reproducible.
+        Each stamp still floors at its own level either way -- that comes from
+        its own sky noise -- it is only the jitter on ``k`` that freezes.
+        """
+        floor = (0.0 if sky_noise is None
+                 else self.sky_floor(sky_noise, rng if augment else None))
+        return self.transform.forward(pooled, floor), floor
+
     def batch_from_stamps(
         self,
         stamps: np.ndarray,
@@ -242,16 +267,7 @@ class PatchDataset:
             scale_jitter=aug.scale_jitter if augment else 0.0,
             out_size=out_size,
         )
-        # Pool in flux, THEN take the log, with the floor this cutout gets.
-        #
-        # The ``k`` draw is an *augmentation*, so it follows ``augment`` and not
-        # merely whether an rng exists: ``validation_batch`` and the diagnostic
-        # figures pass an rng with augmentation off and have to be reproducible.
-        # Each stamp still floors at its own level either way -- that comes from
-        # its own sky noise -- it is only the jitter on ``k`` that freezes.
-        floor = (0.0 if sky_noise is None
-                 else self.sky_floor(sky_noise, rng if augment else None))
-        x = self.transform.forward(x, floor)
+        x, _ = self.to_log_space(x, sky_noise, rng, augment)
         if augment and aug.dihedral:
             if rng is None:
                 raise ValueError("dihedral augmentation requires an rng")

@@ -433,11 +433,11 @@ class TransformConfig:
     softening_sigma: float = 1.0 / 3.0
     #: The sky floor in units of each cutout's own pooled sky noise, drawn
     #: uniformly per stamp.  Higher floors flatten harder: measured sky scatter
-    #: in x is 0.18 at k = 1, 0.084 at 1.5, 0.037 at 2.  Equal values disable
-    #: the jitter without disabling the floor; both zero disable it entirely
-    #: and recover the pre-floor transform exactly.
-    floor_sigma_lo: float = 0.0
-    floor_sigma_hi: float = 0.5
+    #: in x is 0.72 at k = 0.25, 0.40 at 0.5, 0.26 at 0.75, 0.18 at 1, 0.084 at
+    #: 1.5.  Equal values disable the jitter without disabling the floor; both
+    #: zero disable it entirely and recover the pre-floor transform exactly.
+    floor_sigma_lo: float = 0.25
+    floor_sigma_hi: float = 0.75
     #: Pooled sky noise over ``sky_noise / pool_factor``.  **Measured**, because
     #: it is not 1: coaddition warps exposures onto the skymap grid, so
     #: neighbouring pixels share flux and averaging ``P**2`` of them reduces the

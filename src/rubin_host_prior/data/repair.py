@@ -80,13 +80,19 @@ def fill_no_data(
         out[y0:y1, x0:x1] = sub
         return out.astype(stamp.dtype), n
     sub[m] = float(sub[known].mean())  # a sane start; the sweeps refine it
+    # Only cells with four neighbours inside the box get relaxed.  A masked
+    # cell on the box border has none above or left of it, so `nb` there is the
+    # zero it was initialised with -- and writing that back would put an exact
+    # zero into the output, which is the very thing being repaired.  Reachable
+    # whenever the hole runs to the stamp edge and `pad` cannot step outside
+    # it; those cells keep their seeded value instead.
+    relax = np.zeros_like(m)
+    relax[1:-1, 1:-1] = m[1:-1, 1:-1]
     for _ in range(iterations):
         nb = np.zeros_like(sub)
         nb[1:-1, 1:-1] = 0.25 * (sub[:-2, 1:-1] + sub[2:, 1:-1]
                                  + sub[1:-1, :-2] + sub[1:-1, 2:])
-        # Edge cells of the box keep their seeded value rather than relaxing
-        # towards zero; `pad` normally puts real pixels there anyway.
-        sub[m] = np.where(m, nb, sub)[m]
+        sub[relax] = nb[relax]
     out = np.array(stamp)
     out[y0:y1, x0:x1] = sub
     return out.astype(stamp.dtype), n
@@ -115,4 +121,110 @@ def fill_batch(stamps: np.ndarray, iterations: int = 24) -> tuple[np.ndarray, di
         "n_stamps_filled": int(len(touched)),
         "n_pixels_filled": int(counts.sum()),
         "largest_hole_px": int(counts.max()) if len(counts) else 0,
+    }
+
+
+def _directional_max(a: np.ndarray, r: int) -> np.ndarray:
+    """``(4, H, W)``: the maximum within ``r`` pixels left, right, up and down.
+
+    Four one-sided maxima rather than one square window, because that is what
+    separates a hole from an edge.  A dead core has bright flux on *every* side;
+    sky just outside a bright star has it on one.  Shifts fill with ``-inf``
+    rather than wrapping, so the stamp border cannot manufacture a surround.
+    """
+    out = np.full((4,) + a.shape, -np.inf)
+    for k in range(1, r + 1):
+        out[0, :, k:] = np.maximum(out[0, :, k:], a[:, :-k])      # bright to the left
+        out[1, :, :-k] = np.maximum(out[1, :, :-k], a[:, k:])     # to the right
+        out[2, k:, :] = np.maximum(out[2, k:, :], a[:-k, :])      # above
+        out[3, :-k, :] = np.maximum(out[3, :-k, :], a[k:, :])     # below
+    return out
+
+
+def dark_inside_bright(
+    stamp: np.ndarray, sky_noise: float, radius: int = 12,
+    dark_sigma: float = 3.0, bright_sigma: float = 50.0,
+) -> np.ndarray:
+    """Pixels consistent with sky that are *surrounded* by something very bright.
+
+    The hole signature, independent of what value the pipeline wrote: a real
+    scene is non-negative up to noise, so a pixel at sky level with 50-sigma
+    flux on all four sides within ``radius`` is neither sky nor source.
+
+    **Surrounded, not merely near.**  Requiring brightness in one square window
+    flagged the entire ring of sky around every bright star -- 778 pixels
+    against a 69-pixel hole -- because sky a few pixels outside a star does have
+    a bright neighbour.  It does not have one in all four directions.
+
+    Unlike ``no_data_mask`` this needs the stamp's sky noise and two thresholds,
+    which is why it is a diagnostic and not the detector: use it to find out
+    what the cores are, then decide what the detector should look for.
+    """
+    a = np.asarray(stamp, dtype=np.float64)
+    s = sky_noise if np.isfinite(sky_noise) and sky_noise > 0 else 1.0
+    with np.errstate(invalid="ignore"):
+        dark = ~(a > dark_sigma * s)          # non-finite counts as dark
+        sides = _directional_max(np.where(np.isfinite(a), a, -np.inf), radius)
+    return dark & np.all(sides > bright_sigma * s, axis=0)
+
+
+def describe_dark_cores(
+    stamps: np.ndarray, sky_noise: np.ndarray, radius: int = 8, n_report: int = 10
+) -> dict:
+    """What the dark cores in a set of stamps actually are.
+
+    The repair detects a hole as exactly ``0.0`` or non-finite, which is what
+    DP2 was understood to write.  If a hole survives the repair then that
+    premise is wrong for some stamps, and guessing a replacement rule is how
+    you end up with a detector that silently catches the wrong thing.  This
+    reports the evidence instead.
+
+    ``dark_inside_bright`` finds the hole *signature* -- sky-level pixels with
+    a very bright neighbour -- without caring what value was written, and this
+    subtracts what the current detector already sees.  **``n_pixels_missed`` is
+    the number that matters**, and ``missed_value_sigma`` says what to widen the
+    detector to: exactly zero means something else is wrong, a small negative
+    means the pipeline wrote one rather than a zero, and a scatter about zero
+    means it wrote noise.
+
+    Thresholds are the diagnostic's, not the repair's, and deliberately
+    conservative: 50 sigma for "bright" is a genuinely saturated star, not a
+    galaxy core.
+    """
+    stamps = np.asarray(stamps)
+    sigma = np.asarray(sky_noise, dtype=np.float64)
+    rows = []
+    for i in range(len(stamps)):
+        a = np.asarray(stamps[i], dtype=np.float64)
+        s = (sigma[i] if i < len(sigma) and np.isfinite(sigma[i]) and sigma[i] > 0
+             else 1.0)
+        suspect = dark_inside_bright(stamps[i], s, radius=radius)
+        detected = no_data_mask(stamps[i])
+        missed = suspect & ~detected
+        vals = a[missed]
+        rows.append({
+            "n_suspect": int(suspect.sum()),
+            "n_detected": int(detected.sum()),
+            "n_missed": int(missed.sum()),
+            # what the detector cannot see, in units of this cutout's sky noise
+            "missed_min_sigma": float(np.nanmin(vals) / s) if vals.size else None,
+            "missed_max_sigma": float(np.nanmax(vals) / s) if vals.size else None,
+            "missed_median_sigma": float(np.nanmedian(vals) / s) if vals.size else None,
+            "missed_exactly_zero": int((vals == 0.0).sum()) if vals.size else 0,
+        })
+    missed_rows = [r for r in rows if r["n_missed"]]
+    return {
+        "n_stamps": len(rows),
+        "n_with_detected_holes": sum(1 for r in rows if r["n_detected"]),
+        "n_pixels_detected": sum(r["n_detected"] for r in rows),
+        # the number that decides whether the detector needs widening
+        "n_with_missed_holes": len(missed_rows),
+        "n_pixels_missed": sum(r["n_missed"] for r in rows),
+        "missed_value_sigma": {
+            "min": round(min(r["missed_min_sigma"] for r in missed_rows), 4),
+            "median": round(float(np.median([r["missed_median_sigma"]
+                                             for r in missed_rows])), 4),
+            "max": round(max(r["missed_max_sigma"] for r in missed_rows), 4),
+        } if missed_rows else None,
+        "worst": sorted(missed_rows, key=lambda r: -r["n_missed"])[:n_report],
     }

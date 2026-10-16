@@ -1280,3 +1280,41 @@ def test_the_floor_refuses_to_guess_the_pooled_noise_ratio(shard_dir):
             ds.make_batch(np.arange(4), rng=np.random.default_rng(0))
     finally:
         ds.close()
+
+
+def test_the_transform_defaults_are_the_ones_that_were_asked_for():
+    """Pinned because they silently were not.
+
+    The floor shipped as ``[0.0, 0.5]`` for a while against an intended
+    ``[1.0, 1.5]`` -- with a lower bound of zero some stamps drew essentially no
+    floor at all, and the midpoint prediction was 0.64 against the 0.12 the
+    docstring two lines above it claimed.  A default nobody reads is exactly the
+    kind of thing that stays wrong, so it is asserted rather than described.
+    """
+    from rubin_host_prior.config import TransformConfig
+    from rubin_host_prior.data import expected_sky_scatter
+
+    t = TransformConfig()
+    assert (t.floor_sigma_lo, t.floor_sigma_hi) == (0.25, 0.75)
+    assert t.softening_sigma == pytest.approx(1.0 / 3.0)
+    assert t.fill_no_data is True
+    # every stamp gets a real floor, not merely most of them
+    assert t.floor_sigma_lo > 0
+    # and the flattening is the order of magnitude the docstring claims
+    k = 0.5 * (t.floor_sigma_lo + t.floor_sigma_hi)
+    assert expected_sky_scatter(t.softening_sigma, k) == pytest.approx(0.40,
+                                                                      abs=0.02)
+    assert expected_sky_scatter(t.softening_sigma, 1.5) == pytest.approx(0.084,
+                                                                        abs=0.005)
+
+
+def test_expected_sky_scatter_is_unchanged_without_a_floor():
+    """The closed form is what every pre-floor caller and test means."""
+    from rubin_host_prior.data import expected_sky_scatter
+    from rubin_host_prior.data.transform import SKY_SLOPE
+
+    for ss in (0.25, 1.0, 2.0, 5.0):
+        assert expected_sky_scatter(ss) == pytest.approx(SKY_SLOPE / ss)
+        assert expected_sky_scatter(ss, 0.0) == pytest.approx(SKY_SLOPE / ss)
+    # and a floor always tightens it
+    assert expected_sky_scatter(1 / 3, 1.5) < expected_sky_scatter(1 / 3)

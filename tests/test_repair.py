@@ -90,12 +90,34 @@ def test_the_batch_report_is_the_guard_against_a_silent_no_op():
     assert clean_report["n_stamps_filled"] == 0
 
 
+def test_a_hole_at_the_edge_is_filled_and_not_re_zeroed():
+    """The relaxation used to write zeros back.
+
+    A masked cell on the border of the bounding box has no neighbour above or
+    left of it, so the Jacobi stencil there was the zero it was initialised
+    with -- and assigning that put an exact 0.0 into the output, which is the
+    very thing being repaired.  Only reachable when the hole runs to the stamp
+    edge and the pad cannot step outside it, which is why it survived a test
+    that only checked the result was finite.
+    """
+    img = (100.0 + np.random.default_rng(0).normal(0, 1, (32, 32))).astype(np.float32)
+    img[:6, :6] = 0.0
+    filled, n = fill_no_data(img)
+    assert n == 36
+    assert np.all(np.isfinite(filled))
+    # nothing the detector would pick up a second time
+    assert not no_data_mask(filled).any()
+    # and the fill sits at the surrounding level, not at zero
+    assert filled[:6, :6].min() > 50.0
+
+
 def test_a_hole_at_the_edge_does_not_crash():
     img, _ = _star()
     img[:3, :3] = 0.0
     filled, n = fill_no_data(img)
     assert n == 9
     assert np.all(np.isfinite(filled))
+    assert not no_data_mask(filled).any()
 
 
 def test_a_hole_filling_its_whole_box_falls_back_to_the_median():
@@ -106,3 +128,54 @@ def test_a_hole_filling_its_whole_box_falls_back_to_the_median():
     filled, n = fill_no_data(img)
     assert n == 256
     assert np.all(np.isfinite(filled))
+
+
+# -- the diagnostic, for when a hole survives the repair --------------------
+
+
+def test_dark_inside_bright_finds_a_hole_whatever_value_was_written():
+    """``no_data_mask`` knows two fill values.  This knows none, and asks the
+    geometric question instead -- so it can say whether a surviving hole is a
+    hole the detector cannot see, or not a hole at all."""
+    from rubin_host_prior.data.repair import dark_inside_bright
+
+    img, hole = _star(peak=4000.0)
+    n = int(hole.sum())
+    for value in (0.0, -0.4, np.nan, "noise"):
+        a = img.copy()
+        a[hole] = (np.random.default_rng(1).normal(0, 1, n) if value == "noise"
+                   else value)
+        found = int(dark_inside_bright(a, 1.0).sum())
+        assert found > 0.6 * n, (value, found, n)
+
+
+def test_dark_inside_bright_does_not_flag_sky_beside_a_star():
+    """The reason it tests four directions and not one window.
+
+    Sky a few pixels outside a bright star does have a bright neighbour, so a
+    single square window flagged the whole ring around every star -- 778 pixels
+    against a 69-pixel hole.  It does not have a bright neighbour in all four
+    directions.
+    """
+    from rubin_host_prior.data.repair import dark_inside_bright
+
+    img, _ = _star(peak=4000.0)                      # a star with no hole
+    assert dark_inside_bright(img, 1.0).sum() == 0
+    rng = np.random.default_rng(0)
+    assert dark_inside_bright(rng.normal(0, 1, (64, 64)), 1.0).sum() == 0
+
+
+def test_describe_dark_cores_separates_seen_from_unseen():
+    from rubin_host_prior.data.repair import describe_dark_cores
+
+    img, hole = _star(peak=4000.0)
+    seen = img.copy(); seen[hole] = 0.0              # the detector sees this
+    unseen = img.copy(); unseen[hole] = -0.4         # it does not see this
+    report = describe_dark_cores(np.stack([seen, unseen, img]), np.ones(3))
+
+    assert report["n_stamps"] == 3
+    assert report["n_with_detected_holes"] == 1
+    assert report["n_with_missed_holes"] == 1
+    assert report["n_pixels_missed"] > 0
+    # and it says what to widen the detector to
+    assert report["missed_value_sigma"]["max"] < 0

@@ -13,7 +13,7 @@ no flag for it.
 It writes a config and prints the diagnostics you should look at before
 training:
 
-* ``sky_scatter`` should match ``expected_sky_scatter(softening_sigma)``.  If it
+* ``sky_scatter`` should match ``expected_sky_scatter(softening_sigma, k)``.  If it
   does not, the softening scale is wrong.  It is a check on a *typical* width:
   one scale serves every band, so a band deeper or shallower than the scale was
   measured from scatters proportionally less or more.
@@ -232,12 +232,26 @@ def main() -> None:
     # actually sees.  This is the authoritative version -- the one in the
     # extraction summary is native-resolution flux and is contaminated by the PSF.
     t = LogFluxTransform.from_config(config.transform)
-    ss = config.transform.softening_sigma
-    print(f"\nlog transform:  x = log(s*softplus(f/s)),  model map f = exp(x)")
-    print(f"  softening s = {t.softening:.1f} nJy ({ss:.2f} x pooled sky noise)")
+    tc = config.transform
+    ss = tc.softening_sigma
+    # The *typical* floor: k at the midpoint of its per-stamp draw, times the
+    # pooled sky noise, which `softening / softening_sigma` recovers.  Every
+    # number below is quoted for that, because quoting the unfloored ones for a
+    # floored dataset is how the transform figure came to be wrong.
+    k_mid = 0.5 * (tc.floor_sigma_lo + tc.floor_sigma_hi) if tc.floors_enabled else 0.0
+    floor = k_mid * (t.softening / ss) if (k_mid and ss) else 0.0
+    print(f"\nlog transform:  x = log(c + s*softplus((f-c)/s)),  model map f = exp(x)")
+    print(f"  softening s = {t.softening:.1f} nJy ({ss:.2f} x pooled sky noise)"
+          f" -- how sharp the knee is")
+    if floor:
+        print(f"  sky floor   c = {floor:.1f} nJy (k = {tc.floor_sigma_lo:.2f}"
+              f"..{tc.floor_sigma_hi:.2f} x each cutout's own pooled sky noise,"
+              f" drawn per stamp)")
+    else:
+        print(f"  sky floor   none (floor_sigma_hi = 0): the pre-floor transform")
     print(f"  bright flux passes through as log(f), the same x in every band")
-    print(f"  sky sits at log(s*log2) = {t.sky_level:.2f}, also the same in "
-          f"every band")
+    print(f"  sky sits at log(c + s*log2) = {float(t.sky_level_at(floor)):.2f} "
+          f"for a typical cutout; each one floors at its own level")
     print(
         f"  data mean x = {config.sde.data_mean:.3f}, which is where " f"prior_sample starts from"
     )
@@ -252,16 +266,20 @@ def main() -> None:
     )
     print(
         f"  deepest measured pixel: {stats['deepest_flux_sigma']:.1f} sigma "
-        f"-> representable (softplus has no floor)"
+        + ("-> floored, as anything below c is" if floor
+           else "-> representable (softplus has no floor)")
     )
-    predicted = expected_sky_scatter(ss)
+    predicted = expected_sky_scatter(ss, k_mid)
     print(
-        f"  sky scatter in x: {stats['sky_scatter']:.3f} measured vs " f"{predicted:.3f} predicted"
+        f"  sky scatter in x: {stats['sky_scatter']:.3f} measured vs "
+        f"{predicted:.3f} predicted"
+        + (f" at k = {k_mid:.2f}" if k_mid else " (unfloored)")
     )
     if not 0.5 * predicted < stats["sky_scatter"] < 2.0 * predicted:
         print(
             "  WARNING: measured sky scatter is far from prediction -- the "
-            "softening scale is probably wrong."
+            + ("floor or the softening scale is probably wrong." if floor
+               else "softening scale is probably wrong.")
         )
 
     from rubin_host_prior import geometry

@@ -110,19 +110,77 @@ def test_training_batch_marks_a_loss_margin_when_there_is_one(dataset, tmp_path)
         dataset.config.energy = original
 
 
-def test_transform_figure_marks_the_predicted_sky_position(dataset, tmp_path):
+def test_the_transform_figure_shows_exactly_what_the_loader_produces(dataset,
+                                                                     tmp_path):
+    """The guard that matters.
+
+    This figure's whole job is to say whether the transform is set up right, so
+    a figure drawing a *different* transform from the one in use is worse than
+    no figure.  It did: it called ``transform.forward(pooled)`` with no floor
+    and went on labelling ``log(s*softplus(f/s))`` for a dataset that had been
+    floored for a week.  Comparing the rendered pixels against a real batch is
+    what makes that impossible to repeat -- anything the loader does to the
+    representation has to show up here too, or this fails.
+    """
+    rng = np.random.default_rng(0)
+    n = 3
+    idx = np.sort(rng.choice(len(dataset), size=n, replace=False))
+
+    fig, _ = plots.plot_transform(dataset, n=n, seed=0, out=tmp_path)
+    try:
+        # column 3 of each row is the log-space panel
+        panels = [ax.images[0].get_array() for ax in fig.axes if ax.images]
+        assert len(panels) == 3 * n
+        drawn = np.array([np.asarray(panels[3 * k + 2]) for k in range(n)])
+    finally:
+        plt.close(fig)
+
+    # the figure picks its own indices from the same seed
+    want = dataset.make_batch(idx, rng=None, augment=False)[:, 0]
+    # float32 tolerance: the loader casts its batch down at the end and the
+    # figure keeps float64, which is the only difference there should be.
+    np.testing.assert_allclose(drawn, want, rtol=1e-6, atol=1e-6)
+
+
+def test_transform_figure_marks_the_floored_sky_position(dataset, tmp_path):
+    """The red marks have to describe the floored sky, not the unfloored one.
+
+    With a per-stamp floor the sky level is a *spread*, so there is a band over
+    the floors in the sample as well as a line at the median -- and that spread
+    is the point, since it is what stops the prior memorising one sky value.
+    """
     from rubin_host_prior.data import expected_sky_scatter
 
     fig, path = plots.plot_transform(dataset, n=2, out=tmp_path)
-    assert path.exists()
-    assert sum(1 for ax in fig.axes if ax.images) == 6  # 2 rows x 3 stages
-    hist_ax = [ax for ax in fig.axes if ax.patches and not ax.images][0]
-    # One line, at log(s*log2): a single softening scale puts every band's sky
-    # in the same place.
-    marked = [ln.get_xdata()[0] for ln in hist_ax.lines]
-    assert marked == pytest.approx([dataset.transform.sky_level])
-    assert expected_sky_scatter(dataset.config.transform.softening_sigma) > 0
-    plt.close(fig)
+    try:
+        assert path.exists()
+        assert sum(1 for ax in fig.axes if ax.images) == 6  # 2 rows x 3 stages
+        hist_ax = [ax for ax in fig.axes if ax.patches and not ax.images][0]
+        marked = [ln.get_xdata()[0] for ln in hist_ax.lines]
+        assert len(marked) == 1
+
+        t = dataset.config.transform
+        rng = np.random.default_rng(0)
+        hist_idx = np.sort(rng.choice(len(dataset),
+                                      size=min(256, len(dataset)), replace=False))
+        # plot_transform draws its row sample first, so advance the stream the
+        # same way before asking for the histogram's indices.
+        rng = np.random.default_rng(0)
+        rng.choice(len(dataset), size=min(2, len(dataset)), replace=False)
+        hist_idx = np.sort(rng.choice(len(dataset),
+                                      size=min(256, len(dataset)), replace=False))
+        levels = np.atleast_1d(np.asarray(dataset.transform.sky_level_at(
+            dataset.sky_floor(dataset._sky_noise(hist_idx), None)))).ravel()
+
+        assert marked[0] == pytest.approx(float(np.median(levels)))
+        # and it is NOT the unfloored level, which is what it used to draw
+        assert abs(marked[0] - dataset.transform.sky_level) > 0.1
+        # the predicted scatter is the floored one, which is far tighter
+        k = 0.5 * (t.floor_sigma_lo + t.floor_sigma_hi)
+        floored = expected_sky_scatter(t.softening_sigma, k)
+        assert 0 < floored < 0.25 * expected_sky_scatter(t.softening_sigma)
+    finally:
+        plt.close(fig)
 
 
 def test_hosts_figure_uses_the_catalogue_when_present(shards, extracted, tmp_path):

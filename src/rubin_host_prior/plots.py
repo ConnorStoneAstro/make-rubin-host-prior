@@ -653,10 +653,18 @@ def plot_transform(dataset, n: int = 4, seed: int = 0, out: Path | None = None):
     """The chain from native flux to the training representation, plus the
     pixel-value histogram that says whether the transform is set up right.
 
-    ``x`` is absolute log flux and there is one softening scale, so every band's
-    sky sits at the same ``log(s * log 2)``.  The sky should pile up on that line
-    with a spread near ``expected_sky_scatter``, and sources should sit clearly
-    above it.
+    ``x`` is absolute log flux, so the sky sits at ``log(c + s * log 2)`` with
+    ``c`` that cutout's own sky floor.  The sky should pile up inside the red
+    band -- which spans the floors in this sample, because they differ per
+    stamp -- with a spread near ``expected_sky_scatter``, and sources should sit
+    clearly above it.
+
+    **It goes through the loader's own code path.**  ``to_log_space`` is the one
+    place the floor is applied, and this calls it rather than repeating it.  It
+    did repeat it once, and went on drawing ``log(s * softplus(f/s))`` for a
+    dataset that had been floored for a week -- a figure whose whole job is to
+    say whether the transform is set up right, quietly showing a different
+    transform from the one in use.
     """
     plt = _plt()
     from .data.transform import expected_sky_scatter
@@ -665,10 +673,15 @@ def plot_transform(dataset, n: int = 4, seed: int = 0, out: Path | None = None):
     n = min(n, len(dataset))
     idx = np.sort(rng.choice(len(dataset), size=n, replace=False))
     native = dataset._native_stamps(idx)
+    # `_pool_stamps` fills the no-data holes before pooling, so the pooled panel
+    # shows a repaired stamp where the native one still has the hole.  That is
+    # the loader's behaviour and the figure reports it below rather than
+    # leaving the reader to wonder where the dead core went.
     pooled = dataset._pool_stamps(native, rng=None, translate=False,
                                   scale_jitter=0.0)
-    logged = dataset.transform.forward(pooled)
-    noise = np.asarray(dataset.shards.meta["sky_noise"])[idx]
+    fill = dict(dataset._last_fill)
+    noise = dataset._sky_noise(idx)
+    logged, _ = dataset.to_log_space(pooled, noise, rng=None, augment=False)
 
     fig = plt.figure(figsize=(10.5, 2.4 * n + 2.6))
     gs = fig.add_gridspec(n + 1, 3, height_ratios=[1] * n + [1.25])
@@ -683,7 +696,8 @@ def plot_transform(dataset, n: int = 4, seed: int = 0, out: Path | None = None):
                     True,
                 ),
                 (np.arcsinh(pooled[k] / sigma), "pooled flux (asinh)", "magma", True),
-                (logged[k], "x = log(s\u00b7softplus(f/s))", "viridis", False),
+                (logged[k],
+                 "x = log(c + s\u00b7softplus((f−c)/s))", "viridis", False),
             )
         ):
             ax = fig.add_subplot(gs[k, col])
@@ -697,28 +711,41 @@ def plot_transform(dataset, n: int = 4, seed: int = 0, out: Path | None = None):
                 ax.set_title(title, fontsize=9)
 
     ax = fig.add_subplot(gs[n, :])
-    allx = dataset.make_batch(
-        np.sort(rng.choice(len(dataset), size=min(256, len(dataset)), replace=False)),
-        rng=None,
-        augment=False,
-    )[:, 0].ravel()
+    hist_idx = np.sort(
+        rng.choice(len(dataset), size=min(256, len(dataset)), replace=False))
+    allx = dataset.make_batch(hist_idx, rng=None, augment=False)[:, 0].ravel()
     ax.hist(allx, bins=200, color="0.3")
-    scatter = expected_sky_scatter(dataset.config.transform.softening_sigma)
-    # One line: a single softening scale puts every band's sky at the same
-    # log(s * log 2).  The predicted width is a typical one, since a band deeper
-    # or shallower than the scale was measured from scatters proportionally
-    # less or more about that shared level.
-    sky = dataset.transform.sky_level
-    ax.axvline(sky, color="crimson", lw=1.2,
-               label=f"zero flux: x = log(s log 2) = {sky:.2f}")
-    ax.axvspan(sky - scatter, sky + scatter, color="crimson", alpha=0.15,
-               label=f"typical sky scatter $\\pm${scatter:.2f}")
+
+    t = dataset.config.transform
+    # Where zero flux lands, for the same patches the histogram is drawn from.
+    # Not one line any more: the floor is a multiple of each cutout's own sky
+    # noise, so the sky level is a spread, and that spread is deliberate -- it
+    # is what stops the prior memorising a single sky value.
+    hist_floor = dataset.sky_floor(dataset._sky_noise(hist_idx), None)
+    sky_levels = np.atleast_1d(
+        np.asarray(dataset.transform.sky_level_at(hist_floor), dtype=float)).ravel()
+    k_mid = 0.5 * (t.floor_sigma_lo + t.floor_sigma_hi) if t.floors_enabled else 0.0
+    scatter = expected_sky_scatter(t.softening_sigma, k_mid)
+    lo, hi = float(sky_levels.min()), float(sky_levels.max())
+    mid = float(np.median(sky_levels))
+    if hi > lo:
+        ax.axvspan(lo, hi, color="crimson", alpha=0.10,
+                   label=f"zero flux, per stamp: x = {lo:.2f} .. {hi:.2f}")
+    ax.axvline(mid, color="crimson", lw=1.2,
+               label=f"median zero flux: x = log(c + s log 2) = {mid:.2f}")
+    ax.axvspan(mid - scatter, mid + scatter, color="crimson", alpha=0.15,
+               label=(f"predicted sky scatter $\\pm${scatter:.3f}"
+                      + (f" at k = {k_mid:.2f}" if k_mid else " (no floor)")))
     ax.set_yscale("log")
     ax.set_xlabel("x (log space)")
     ax.set_ylabel("pixels")
     ax.legend(fontsize=8)
     ax.set_title("pixel-value distribution: sky should sit in the red band", fontsize=9)
-    fig.suptitle("transform chain: native flux -> pooled -> log space", fontsize=10)
+    filled = (f"; no-data fill touched {fill['n_stamps_filled']} of "
+              f"{fill['n_stamps']} stamps ({fill['n_pixels_filled']:,} px)"
+              if fill.get("n_stamps_filled") else "")
+    fig.suptitle(f"transform chain: native flux -> pooled -> log space{filled}",
+                 fontsize=10)
     fig.tight_layout()
     return fig, _save(fig, out, "transform")
 
