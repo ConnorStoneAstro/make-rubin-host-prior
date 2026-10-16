@@ -430,7 +430,7 @@ class TransformConfig:
     #: flattening, ``s`` only has to be small enough to put the knee below the
     #: faintest source worth keeping, and 1/3 sigma leaves a 3-sigma source
     #: wrong by 0.1% where 1.0 sigma leaves it wrong by 6.5%.
-    softening_sigma: float = 1.0 / 3.0
+    softening_sigma: float = 1.0
     #: The sky floor in units of each cutout's own pooled sky noise, drawn
     #: uniformly per stamp.  Higher floors flatten harder: measured sky scatter
     #: in x is 0.72 at k = 0.25, 0.40 at 0.5, 0.26 at 0.75, 0.18 at 1, 0.084 at
