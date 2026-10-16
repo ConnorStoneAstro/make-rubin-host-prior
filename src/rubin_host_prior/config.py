@@ -299,11 +299,11 @@ class NCSNppConfig:
                 f"variant is not ported -- see nn.ncsnpp."
             )
         if self.combine_method not in ("cat", "sum"):
-            raise ValueError(f"combine_method must be 'cat' or 'sum', got "
-                             f"{self.combine_method!r}")
+            raise ValueError(
+                f"combine_method must be 'cat' or 'sum', got " f"{self.combine_method!r}"
+            )
         if self.energy_form not in ("sum", "dae"):
-            raise ValueError(f"energy_form must be 'sum' or 'dae', got "
-                             f"{self.energy_form!r}")
+            raise ValueError(f"energy_form must be 'sum' or 'dae', got " f"{self.energy_form!r}")
         if not self.ch_mult:
             raise ValueError("ch_mult needs at least one resolution")
         if self.nf % 2:
@@ -436,8 +436,8 @@ class TransformConfig:
     #: in x is 0.18 at k = 1, 0.084 at 1.5, 0.037 at 2.  Equal values disable
     #: the jitter without disabling the floor; both zero disable it entirely
     #: and recover the pre-floor transform exactly.
-    floor_sigma_lo: float = 1.0
-    floor_sigma_hi: float = 1.5
+    floor_sigma_lo: float = 0.0
+    floor_sigma_hi: float = 0.5
     #: Pooled sky noise over ``sky_noise / pool_factor``.  **Measured**, because
     #: it is not 1: coaddition warps exposures onto the skymap grid, so
     #: neighbouring pixels share flux and averaging ``P**2`` of them reduces the
@@ -696,8 +696,7 @@ class Config:
         if self.architecture == "energy":
             from .nn.energy import ConvEnergyNet
 
-            return ConvEnergyNet(self.energy, input_offset=self.input_offset,
-                                 key=key)
+            return ConvEnergyNet(self.energy, input_offset=self.input_offset, key=key)
         if self.architecture in ("ncsnpp", "ncsnpp_energy"):
             from .nn.ncsnpp import NCSNpp, NCSNppEnergy
 
@@ -708,9 +707,12 @@ class Config:
                     "the sigma range is measured. Run "
                     "scripts/prepare_config.py on the shards."
                 )
-            common = dict(sigma_min=self.sde.sigma_min,
-                          sigma_max=self.sde.sigma_max,
-                          input_offset=self.input_offset, key=key)
+            common = dict(
+                sigma_min=self.sde.sigma_min,
+                sigma_max=self.sde.sigma_max,
+                input_offset=self.input_offset,
+                key=key,
+            )
             if self.architecture == "ncsnpp":
                 return NCSNpp(self.ncsnpp, **common)
             if self.ncsnpp.energy_form == "dae" and self.sde.data_std is None:
@@ -721,8 +723,7 @@ class Config:
                     "scripts/prepare_config.py, or set energy_form to 'sum', "
                     "which does not use it."
                 )
-            return NCSNppEnergy(self.ncsnpp, data_std=self.sde.data_std or 1.0,
-                                **common)
+            return NCSNppEnergy(self.ncsnpp, data_std=self.sde.data_std or 1.0, **common)
         raise ValueError(
             f"unknown architecture {self.architecture!r}; "
             f"choose from {list(self.ARCHITECTURES)}"
@@ -791,7 +792,8 @@ class Config:
             f"size {s} is not a multiple of {divisor}, which "
             f"{self.ncsnpp.n_levels} resolutions of halving require. Use a "
             f"multiple of {divisor} or shorten ch_mult."
-            for s in self.patch.training_sizes if s % divisor
+            for s in self.patch.training_sizes
+            if s % divisor
         ]
 
     def to_dict(self) -> dict[str, Any]:
@@ -811,8 +813,7 @@ class Config:
             "augment": (AugmentConfig, d.get("augment", {})),
             "train": (TrainConfig, d.get("train", {})),
         }
-        built = {name: _section(name, kind, raw)
-                 for name, (kind, raw) in sections.items()}
+        built = {name: _section(name, kind, raw) for name, (kind, raw) in sections.items()}
         return cls(architecture=d.get("architecture", "energy"), **built)
 
     @classmethod
