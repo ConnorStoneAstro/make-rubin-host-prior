@@ -430,7 +430,7 @@ class TransformConfig:
     #: flattening, ``s`` only has to be small enough to put the knee below the
     #: faintest source worth keeping, and 1/3 sigma leaves a 3-sigma source
     #: wrong by 0.1% where 1.0 sigma leaves it wrong by 6.5%.
-    softening_sigma: float = 1.0
+    softening_sigma: float = 1.0 / 3.0
     #: The sky floor in units of each cutout's own pooled sky noise, drawn
     #: uniformly per stamp.  Higher floors flatten harder: measured sky scatter
     #: in x is 0.72 at k = 0.25, 0.40 at 0.5, 0.26 at 0.75, 0.18 at 1, 0.084 at
@@ -446,8 +446,23 @@ class TransformConfig:
     #: the floor needs -- keeping each cutout's own variation, fixing the shared
     #: scale from a measurement.
     pooled_noise_ratio: float | None = None
-    #: Fill the holes DP2 leaves in saturated star cores; see ``data.repair``.
-    fill_no_data: bool = True
+    #: Inpaint no-data pixels instead of rejecting the stamp; see
+    #: ``data.repair``.
+    #:
+    #: **Off, because on DP2 it finds nothing.**  It detects a hole as exactly
+    #: ``0.0`` or non-finite, and measured over 512 random stamps -- of which
+    #: ~17 carry no-data by the manifest -- that rule matched a single pixel.
+    #: DP2 writes no sentinel: the values there are ordinary negatives between
+    #: -5 and -18 sigma, overlapping the real sky's own tail, so no threshold
+    #: on the pixels can separate them.  ``patch.max_no_data`` rejects those
+    #: stamps from the metadata instead, which is exact.
+    #:
+    #: Kept rather than deleted: the machinery is right if a future release
+    #: does write a sentinel, and ``data.repair``'s diagnostics are what
+    #: established that this one does not.  Leaving it *on* cost 13-24% of the
+    #: pooling time to find nothing, and read as reassurance that holes were
+    #: being handled.
+    fill_no_data: bool = False
 
     def __post_init__(self) -> None:
         if not 0 <= self.floor_sigma_lo <= self.floor_sigma_hi:
@@ -485,6 +500,19 @@ class PatchConfig:
     give every pixel a score, so the loader feeds exactly ``out_size``.
     """
 
+    #: Reject a stamp whose ``frac_no_data`` exceeds this.  **A loader cut, not
+    #: an extraction one**: the shards already carry the fraction per stamp, so
+    #: a set collected under a looser gate can be tightened without
+    #: re-extracting.  ``SelectionConfig.max_no_data`` is the matching gate for
+    #: future runs; this is the one that applies to shards you already have.
+    #:
+    #: Zero because there is nothing to detect these pixels by.  DP2 writes no
+    #: sentinel at a no-data pixel -- measured over 1093 flagged stamps, not one
+    #: is exactly zero or non-finite, and the values are ordinary negatives
+    #: between -5 and -18 sigma, overlapping the real sky's own tail.  Nothing
+    #: in the image distinguishes them, so the metadata is the only honest
+    #: handle and the cut is all-or-nothing.  It costs 3.3% of the set.
+    max_no_data: float = 0.0
     native_size: int = 512  # pixels cut from the coadd
     out_size: int = 128  # the training grid, in pooled pixels
     pool_factor: int = 2

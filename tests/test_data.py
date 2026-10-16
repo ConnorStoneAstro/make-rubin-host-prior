@@ -1318,3 +1318,122 @@ def test_expected_sky_scatter_is_unchanged_without_a_floor():
         assert expected_sky_scatter(ss, 0.0) == pytest.approx(SKY_SLOPE / ss)
     # and a floor always tightens it
     assert expected_sky_scatter(1 / 3, 1.5) < expected_sky_scatter(1 / 3)
+
+
+# -- the no-data cut -------------------------------------------------------
+
+
+def _flag_rows(shard_dir, every=4, frac=0.01):
+    """Mark every ``every``-th shard row as carrying no-data."""
+    import h5py
+
+    flagged = []
+    base = 0
+    for path in sorted(Path(shard_dir).glob("*.h5")):
+        with h5py.File(path, "r+") as f:
+            v = f["meta"]["frac_no_data"][:]
+            v[:] = 0.0
+            v[::every] = frac
+            f["meta"]["frac_no_data"][:] = v
+            flagged += [base + i for i in range(0, len(v), every)]
+            base += len(v)
+    return set(flagged)
+
+
+def test_the_no_data_cut_removes_exactly_the_flagged_rows(tmp_path):
+    """The metadata is the only handle on these, so the cut has to be exact.
+
+    DP2 writes no sentinel at a no-data pixel -- not one of 1093 flagged stamps
+    has an exact zero or a non-finite, and the values there are ordinary
+    negatives overlapping the sky's own tail.  Nothing in the image separates
+    them, which is why this is a cut on ``frac_no_data`` and not a detector.
+    """
+    import dataclasses
+
+    d = tmp_path / "shards"
+    write_synthetic_shards(d, n_patches=64, native_size=72, patches_per_shard=16,
+                           seed=0)
+    flagged = _flag_rows(d)
+    ss = ShardSet.from_dir(d)
+    config = Config(energy=TINY_ENERGY,
+                    patch=PatchConfig(native_size=72, out_size=24, pool_factor=3))
+    pooled, _ = pool_shards(ss, config)
+    _m = measure_transform(ss, config, pooled)
+    config.transform.softening = _m["softening"]
+    config.transform.pooled_noise_ratio = _m["pooled_noise_ratio"]
+    transform = LogFluxTransform.from_config(config.transform)
+
+    ds = PatchDataset.from_shards(ss, config, transform, max_in_memory_gb=16.0)
+    try:
+        assert len(ds) == len(ss) - len(flagged)
+        assert ds.n_rejected == len(flagged)
+        # band_idx was cut with it, or every index would be out by the count
+        assert len(ds.band_idx) == len(ds)
+        # and the rows it does present are the clean ones, in order
+        assert set(ds._rows.tolist()) == set(range(len(ss))) - flagged
+    finally:
+        ds.close()
+
+    off = dataclasses.replace(config)
+    off.patch = dataclasses.replace(config.patch, max_no_data=-1.0)
+    ds = PatchDataset.from_shards(ss, off, transform, max_in_memory_gb=16.0)
+    try:
+        assert len(ds) == len(ss) and ds.n_rejected == 0
+    finally:
+        ds.close()
+
+
+def test_the_pool_also_applies_the_cut(tmp_path):
+    """It holds whole shards and draws rows out of them, so it never sees the
+    dataset's index map -- without its own filter it would quietly serve the
+    rows the dataset thinks it removed."""
+    d = tmp_path / "shards"
+    write_synthetic_shards(d, n_patches=64, native_size=72, patches_per_shard=16,
+                           seed=0)
+    flagged = _flag_rows(d)
+    ss = ShardSet.from_dir(d)
+    config = Config(energy=TINY_ENERGY,
+                    patch=PatchConfig(native_size=72, out_size=24, pool_factor=3))
+    pooled, _ = pool_shards(ss, config)
+    _m = measure_transform(ss, config, pooled)
+    config.transform.softening = _m["softening"]
+    config.transform.pooled_noise_ratio = _m["pooled_noise_ratio"]
+
+    ds = PatchDataset.from_shards(
+        ss, config, LogFluxTransform.from_config(config.transform),
+        max_in_memory_gb=1e-9, pool_shards=4, pool_refill_every=10**6)
+    try:
+        pool = ds.pool()
+        assert pool.resident_rows == 4 * 16 * 3 // 4      # a quarter flagged
+        whole = ss.load("image")
+        rng = np.random.default_rng(0)
+        served = set()
+        for _ in range(30):
+            stamps, _noise = pool.draw(rng, 8)
+            for a in stamps:
+                served.add(int(np.argmin(np.abs(whole - a).sum(axis=(1, 2)))))
+        assert not (served & flagged), sorted(served & flagged)
+    finally:
+        ds.close()
+
+
+def test_shards_without_the_column_are_refused_rather_than_passed(tmp_path):
+    """An older schema fills a missing column with -1.  Treating that as a pass
+    would make the cut silently do nothing, which is the opposite of the point."""
+    import h5py
+
+    d = tmp_path / "shards"
+    write_synthetic_shards(d, n_patches=32, native_size=72, patches_per_shard=16,
+                           seed=0)
+    for path in sorted(Path(d).glob("*.h5")):
+        with h5py.File(path, "r+") as f:
+            f["meta"]["frac_no_data"][:] = -1.0
+    ss = ShardSet.from_dir(d)
+    config = Config(energy=TINY_ENERGY,
+                    patch=PatchConfig(native_size=72, out_size=24, pool_factor=3))
+    config.transform.softening = 1.0
+    config.transform.pooled_noise_ratio = 2.0
+    with pytest.raises(ValueError, match="frac_no_data"):
+        PatchDataset.from_shards(
+            ss, config, LogFluxTransform.from_config(config.transform),
+            max_in_memory_gb=16.0)

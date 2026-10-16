@@ -190,7 +190,16 @@ class PatchCuts:
     inner_fraction: float = 0.34
 
     #: Pixels with no coverage, measured from the inf-variance plane.
-    max_no_data: float = 0.02
+    #:
+    #: **Zero**, raised back from 0.02 once it was clear nothing downstream can
+    #: repair these.  The tolerance existed so a stamp clipping a ragged survey
+    #: edge was not thrown away for it, and it also admitted saturated cores:
+    #: one number doing two jobs.  DP2 writes no sentinel at a no-data pixel --
+    #: no zeros, no non-finites, just ordinary negatives that overlap the sky's
+    #: own tail -- so they cannot be found in the image and cannot be filled.
+    #: Rejecting at the gate is the only exact cut, and on a 32,785-stamp set
+    #: it costs 3.3%.
+    max_no_data: float = 0.0
     max_inner_no_data: float = 0.0
 
     #: Depth uniformity.  ``cell_depth_ratio`` is exact, from the coadd

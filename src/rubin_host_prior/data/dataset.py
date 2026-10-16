@@ -28,6 +28,43 @@ from .shards import ShardSet
 from .transform import LogFluxTransform
 
 
+def usable_rows(shards: ShardSet, config: Config) -> np.ndarray:
+    """Shard rows that survive the no-data cut: ``frac_no_data <= max_no_data``.
+
+    **The metadata is the only honest handle on these.**  A no-data pixel in
+    DP2 carries no sentinel -- measured across 1093 flagged stamps, not one is
+    exactly zero or non-finite, and the values are ordinary negatives between
+    -5 and -18 sigma that overlap the real sky's own tail.  Nothing in the
+    image separates them, so there is nothing to detect and nothing to repair;
+    what there is, is a per-stamp fraction recorded at extraction, and a cut on
+    it is exact.
+
+    Note what this does **not** catch.  ``frac_no_data`` comes from the
+    inf-variance plane, which marks pixels where *zero* exposures contributed.
+    A star that saturates in only some exposures still has the rest, so its
+    variance is finite and its ``frac_no_data`` is zero -- while its core is
+    built from the subset that did not saturate, which is the worse-seeing one,
+    so the peak reads low.  That is a different defect with a different flag:
+    ``SATURATED``, which extraction records as ``diag_frac_SATURATED`` in
+    ``manifest.parquet`` and not in the shards.
+    """
+    frac = np.asarray(shards.meta["frac_no_data"], dtype=float)
+    if config.patch.max_no_data < 0:
+        return np.arange(len(frac))
+    # -1 is the fill for a column an older shard schema never wrote.  Treated
+    # as unknown rather than as a pass: the point of this cut is exactness, and
+    # a silent pass would be the opposite.
+    unknown = ~np.isfinite(frac) | (frac < 0)
+    if unknown.any():
+        raise ValueError(
+            f"{int(unknown.sum())} of {len(frac)} shard rows carry no "
+            f"frac_no_data, so the no-data cut cannot be applied to them. "
+            f"These shards predate the column: re-extract them, or set "
+            f"patch.max_no_data below zero to disable the cut."
+        )
+    return np.flatnonzero(frac <= config.patch.max_no_data)
+
+
 class PatchDataset:
     def __init__(
         self,
@@ -54,6 +91,11 @@ class PatchDataset:
         self.pool_refill_every = pool_refill_every
         self.prefetch_depth = prefetch_depth
         self._shard_pool = None
+        #: Global shard rows this dataset presents, after the no-data cut.  All
+        #: indexing goes through here, so a dataset index is a position in this
+        #: array and never a raw shard row -- which is what keeps the cut from
+        #: having to be repeated at every call site.
+        self._rows = usable_rows(shards, config) if shards is not None else None
         #: What the last batch's no-data fill touched.  A report rather than
         #: state: if a future release writes its holes with a value the
         #: detector does not know, every count here stays zero, and that is
@@ -127,7 +169,10 @@ class PatchDataset:
         return cls(
             config=config,
             transform=transform,
-            band_idx=shards.meta["band_idx"],
+            # Cut to match: `band_idx` is indexed by *dataset* position and
+            # `__len__` reads its length, so handing over the uncut array would
+            # put every index out by however many rows the cut removed.
+            band_idx=np.asarray(shards.meta["band_idx"])[usable_rows(shards, config)],
             shards=shards,
             native=native,
             pool_shards=pool_shards,
@@ -138,16 +183,31 @@ class PatchDataset:
     def __len__(self) -> int:
         return len(self.band_idx)
 
+    @property
+    def n_rejected(self) -> int:
+        """Shard rows the no-data cut removed.  Reported, never silent."""
+        if self._rows is None or self.shards is None:
+            return 0
+        return len(self.shards.meta["band_idx"]) - len(self._rows)
+
     # -- batch construction ----------------------------------------------
 
+    def _rows_for(self, indices: np.ndarray) -> np.ndarray:
+        """Dataset indices -> shard rows, through the no-data cut."""
+        if self._rows is None:
+            return np.asarray(indices)
+        return self._rows[np.asarray(indices)]
+
     def _native_stamps(self, indices: np.ndarray) -> np.ndarray:
+        rows = self._rows_for(indices)
         if self._native is not None:
-            return self._native[indices]
-        return self.shards.gather(indices, "image")
+            return self._native[rows]
+        return self.shards.gather(rows, "image")
 
     def _sky_noise(self, indices: np.ndarray) -> np.ndarray:
         """Per-stamp native sky noise, nJy, for the rows named by ``indices``."""
-        return np.asarray(self.shards.meta["sky_noise"], dtype=np.float32)[indices]
+        return np.asarray(self.shards.meta["sky_noise"],
+                          dtype=np.float32)[self._rows_for(indices)]
 
     def sky_floor(
         self, sky_noise: np.ndarray, rng: np.random.Generator | None
@@ -309,6 +369,7 @@ class PatchDataset:
                 n_resident=self.pool_shards,
                 refill_every=self.pool_refill_every,
                 seed=self.config.train.seed,
+                max_no_data=self.config.patch.max_no_data,
             )
         return self._shard_pool
 

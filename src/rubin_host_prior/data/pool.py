@@ -114,6 +114,7 @@ class ShardPool:
         refill_every: int = 64,
         seed: int = 0,
         key: str = "image",
+        max_no_data: float = 0.0,
     ):
         n_files = len(shards.paths)
         if n_resident < 1 or refill_every < 1:
@@ -123,6 +124,12 @@ class ShardPool:
             )
         self.shards = shards
         self.key = key
+        #: The no-data cut, applied here as well as in ``PatchDataset``.  The
+        #: pool holds whole shards and draws rows out of them, so it never sees
+        #: the dataset's index map and has to do its own filtering or it would
+        #: quietly serve the rows the dataset thinks it removed.  Negative
+        #: disables it.
+        self.max_no_data = max_no_data
         #: Clamped rather than refused: a set with fewer shards than the pool
         #: wants is simply held whole, which is the right answer for it.
         self.n_resident = min(n_resident, n_files)
@@ -131,6 +138,7 @@ class ShardPool:
         self._cycle: list[int] = []
         self._slots: list[np.ndarray] = []
         self._slot_noise: list[np.ndarray] = []
+        self._slot_keep: list[np.ndarray] = []
         self._slot_shard: list[int] = []
         self._next_slot = 0
         self._since_refill = 0
@@ -143,9 +151,10 @@ class ShardPool:
         # fraction of the shards it is meant to mix.
         for _ in range(self.n_resident):
             i = self._next_index()
-            pixels, noise = self._read(i)
+            pixels, noise, keep = self._read(i)
             self._slots.append(pixels)
             self._slot_noise.append(noise)
+            self._slot_keep.append(keep)
             self._slot_shard.append(i)
 
         self._reader = threading.Thread(
@@ -178,7 +187,15 @@ class ShardPool:
             out = np.empty(d.shape, dtype=d.dtype)
             d.read_direct(out)
             noise = np.asarray(f["meta"]["sky_noise"][:], dtype=np.float32)
-        return out, noise
+            frac = np.asarray(f["meta"]["frac_no_data"][:], dtype=np.float32)
+        return out, noise, self._keep(frac)
+
+    def _keep(self, frac: np.ndarray) -> np.ndarray:
+        """Row indices within one shard that survive the no-data cut."""
+        if self.max_no_data < 0:
+            return np.arange(len(frac))
+        return np.flatnonzero(np.isfinite(frac) & (frac >= 0)
+                              & (frac <= self.max_no_data))
 
     def _read_ahead(self) -> None:
         """Keep exactly one shard staged.  The queue's size of 1 is the throttle."""
@@ -202,7 +219,8 @@ class ShardPool:
             i, arr = self._inbox.get_nowait()
         except queue.Empty:
             return  # reader still working; try again next batch rather than block
-        self._slots[self._next_slot], self._slot_noise[self._next_slot] = arr
+        (self._slots[self._next_slot], self._slot_noise[self._next_slot],
+         self._slot_keep[self._next_slot]) = arr
         self._slot_shard[self._next_slot] = i
         self._next_slot = (self._next_slot + 1) % self.n_resident
         self._since_refill = 0
@@ -211,7 +229,8 @@ class ShardPool:
 
     @property
     def resident_rows(self) -> int:
-        return sum(len(s) for s in self._slots)
+        """Rows available to draw, i.e. after the no-data cut."""
+        return sum(len(k) for k in self._slot_keep)
 
     @property
     def resident_bytes(self) -> int:
@@ -231,7 +250,10 @@ class ShardPool:
                 f"Raise n_resident (now {self.n_resident} shards) or lower the "
                 f"batch size."
             )
-        sizes = np.array([len(s) for s in self._slots])
+        # Over *kept* rows, not over the shards' full length: the cut has to
+        # happen here too, because the pool holds whole shards and never sees
+        # the dataset's index map.
+        sizes = np.array([len(k) for k in self._slot_keep])
         offsets = np.concatenate([[0], np.cumsum(sizes)])
         flat = rng.choice(total, size=n, replace=False)
         slot_of = np.searchsorted(offsets, flat, side="right") - 1
@@ -239,7 +261,7 @@ class ShardPool:
         noise = np.empty(n, dtype=np.float32)
         for s in np.unique(slot_of):
             sel = np.where(slot_of == s)[0]
-            rows = flat[sel] - offsets[s]
+            rows = self._slot_keep[s][flat[sel] - offsets[s]]
             out[sel] = self._slots[s][rows]
             noise[sel] = self._slot_noise[s][rows]
         self._since_refill += 1
