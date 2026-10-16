@@ -130,6 +130,7 @@ class ShardPool:
         self._rng = np.random.default_rng(seed)
         self._cycle: list[int] = []
         self._slots: list[np.ndarray] = []
+        self._slot_noise: list[np.ndarray] = []
         self._slot_shard: list[int] = []
         self._next_slot = 0
         self._since_refill = 0
@@ -142,7 +143,9 @@ class ShardPool:
         # fraction of the shards it is meant to mix.
         for _ in range(self.n_resident):
             i = self._next_index()
-            self._slots.append(self._read(i))
+            pixels, noise = self._read(i)
+            self._slots.append(pixels)
+            self._slot_noise.append(noise)
             self._slot_shard.append(i)
 
         self._reader = threading.Thread(
@@ -162,13 +165,20 @@ class ShardPool:
             self._cycle = list(self._rng.permutation(len(self.shards.paths)))
         return int(self._cycle.pop())
 
-    def _read(self, i: int) -> np.ndarray:
-        """One whole shard, in a single sequential pass."""
+    def _read(self, i: int) -> tuple[np.ndarray, np.ndarray]:
+        """One whole shard's pixels and its per-row sky noise, in one pass.
+
+        The sky noise comes along because the sky floor is *per stamp* and the
+        pool has no global index to look it up by later -- it holds whole
+        shards and draws rows out of them.  It costs nothing: one float per
+        row, so 8 KB against the ~1.4 GB of images in a 2048-row shard.
+        """
         with h5py.File(self.shards.paths[i], "r") as f:
             d = f[self.key]
             out = np.empty(d.shape, dtype=d.dtype)
             d.read_direct(out)
-        return out
+            noise = np.asarray(f["meta"]["sky_noise"][:], dtype=np.float32)
+        return out, noise
 
     def _read_ahead(self) -> None:
         """Keep exactly one shard staged.  The queue's size of 1 is the throttle."""
@@ -192,7 +202,7 @@ class ShardPool:
             i, arr = self._inbox.get_nowait()
         except queue.Empty:
             return  # reader still working; try again next batch rather than block
-        self._slots[self._next_slot] = arr
+        self._slots[self._next_slot], self._slot_noise[self._next_slot] = arr
         self._slot_shard[self._next_slot] = i
         self._next_slot = (self._next_slot + 1) % self.n_resident
         self._since_refill = 0
@@ -207,8 +217,9 @@ class ShardPool:
     def resident_bytes(self) -> int:
         return sum(s.nbytes for s in self._slots)
 
-    def draw(self, rng: np.random.Generator, n: int) -> np.ndarray:
-        """``n`` stamps drawn uniformly from every resident shard at once."""
+    def draw(self, rng: np.random.Generator,
+             n: int) -> tuple[np.ndarray, np.ndarray]:
+        """``(stamps, sky_noise)`` drawn uniformly from every resident shard."""
         if self._error is not None:
             raise RuntimeError(
                 f"the pool's shard reader failed: {self._error!r}"
@@ -225,12 +236,15 @@ class ShardPool:
         flat = rng.choice(total, size=n, replace=False)
         slot_of = np.searchsorted(offsets, flat, side="right") - 1
         out = np.empty((n,) + self._slots[0].shape[1:], dtype=self._slots[0].dtype)
+        noise = np.empty(n, dtype=np.float32)
         for s in np.unique(slot_of):
             sel = np.where(slot_of == s)[0]
-            out[sel] = self._slots[s][flat[sel] - offsets[s]]
+            rows = flat[sel] - offsets[s]
+            out[sel] = self._slots[s][rows]
+            noise[sel] = self._slot_noise[s][rows]
         self._since_refill += 1
         self._maybe_refill()
-        return out
+        return out, noise
 
     # -- lifecycle --------------------------------------------------------
 

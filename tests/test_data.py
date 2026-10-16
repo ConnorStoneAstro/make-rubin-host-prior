@@ -14,6 +14,7 @@ from rubin_host_prior.data import (
     block_mean,
     dihedral,
     estimate_softening,
+    measure_transform,
     log_softplus,
     soften,
     softplus,
@@ -524,8 +525,9 @@ def _pool_dataset(tmp_path, n_patches=120, per_shard=10, **kw):
     config = Config(energy=TINY_ENERGY,
                     patch=PatchConfig(native_size=64, out_size=16, pool_factor=2))
     pooled, _ = pool_shards(ss, config)
-    config.transform.softening = estimate_softening(
-        pooled, config.transform.softening_sigma)
+    _m = measure_transform(ss, config, pooled)
+    config.transform.softening = _m["softening"]
+    config.transform.pooled_noise_ratio = _m["pooled_noise_ratio"]
     kw.setdefault("max_in_memory_gb", 1e-9)
     kw.setdefault("pool_shards", 3)
     kw.setdefault("pool_refill_every", 2)
@@ -565,7 +567,9 @@ def test_the_pool_mixes_across_every_resident_shard(tmp_path):
         assert pool.resident_rows == 40          # 4 shards of 10
         rng = np.random.default_rng(0)
         # Every resident shard must be represented across a few draws.
-        rows = np.concatenate([pool.draw(rng, 8) for _ in range(5)])
+        # draw now returns (stamps, sky_noise): the floor is per stamp and
+        # the pool is the only thing that knows which row each came from.
+        rows = np.concatenate([pool.draw(rng, 8)[0] for _ in range(5)])
         whole = ss.load("image")
         which = {int(np.argmin(np.abs(whole - r).sum(axis=(1, 2)))) // 10
                  for r in rows}
@@ -701,8 +705,9 @@ def test_the_storage_mode_is_announced_either_way(shard_dir):
     config = Config(energy=TINY_ENERGY, patch=PatchConfig(
         native_size=ss.native_size, out_size=24, pool_factor=3))
     pooled, _ = pool_shards(ss, config)
-    config.transform.softening = estimate_softening(
-        pooled, config.transform.softening_sigma)
+    _m = measure_transform(ss, config, pooled)
+    config.transform.softening = _m["softening"]
+    config.transform.pooled_noise_ratio = _m["pooled_noise_ratio"]
     transform = LogFluxTransform.from_config(config.transform)
 
     cached = PatchDataset.from_shards(ss, config, transform, max_in_memory_gb=16.0)
@@ -772,9 +777,9 @@ def _dataset(shard_dir, out_size=24):
         )
     )
     pooled, pooled_bands = pool_shards(ss, config)
-    config.transform.softening = estimate_softening(
-        pooled, config.transform.softening_sigma
-    )
+    _m = measure_transform(ss, config, pooled)
+    config.transform.softening = _m["softening"]
+    config.transform.pooled_noise_ratio = _m["pooled_noise_ratio"]
     return ss, config, PatchDataset.from_shards(
         ss, config, LogFluxTransform.from_config(config.transform)
     )
@@ -939,9 +944,9 @@ def _varsize_dataset(shard_dir, out_sizes):
     config = Config(energy=TINY_ENERGY, patch=PatchConfig(native_size=ss.native_size, out_size=24, pool_factor=3,
                                       out_sizes=out_sizes))
     pooled, pooled_bands = pool_shards(ss, config)
-    config.transform.softening = estimate_softening(
-        pooled, config.transform.softening_sigma
-    )
+    _m = measure_transform(ss, config, pooled)
+    config.transform.softening = _m["softening"]
+    config.transform.pooled_noise_ratio = _m["pooled_noise_ratio"]
     return ss, config, PatchDataset.from_shards(
         ss, config, LogFluxTransform.from_config(config.transform)
     )
@@ -1065,6 +1070,12 @@ def test_sky_scatter_matches_the_prediction(shard_dir):
                                           out_size=32,
                                           pool_factor=3))
         config.transform.softening_sigma = ss_val
+        # Unfloored: `expected_sky_scatter` is 0.721 / softening_sigma, which is
+        # the c = 0 relation.  With a floor the sky scatter is set by the floor
+        # instead -- that is the whole point of having one -- so this check is
+        # about the softening and has to switch the floor off to see it.
+        config.transform.floor_sigma_lo = 0.0
+        config.transform.floor_sigma_hi = 0.0
         pooled, pooled_bands = pool_shards(ss, config)
         config.transform.softening = estimate_softening(pooled, ss_val)
         ds = PatchDataset.from_shards(
@@ -1147,3 +1158,125 @@ def test_softplus_comes_from_the_library_and_agrees_across_backends():
     assert np.allclose(np.asarray(softplus(jnp.asarray(u))), got, atol=1e-4)
     # log(softplus(u)) -> u far negative, where softplus itself underflows.
     assert log_softplus(u)[0] == pytest.approx(-800.0)
+
+
+# -- the per-stamp sky floor -----------------------------------------------
+
+
+def test_the_floor_is_a_strict_generalisation_of_the_softening():
+    """``floor = 0`` has to reproduce the old one-parameter map *exactly*, or
+    every band table and every trained checkpoint predating the floor would
+    quietly mean something else."""
+    from rubin_host_prior.data.transform import LogFluxTransform, log_softplus
+
+    t = LogFluxTransform(softening=5.0)
+    f = np.array([-1e6, -1e4, -3725.0, -100.0, -5.0, 0.0, 1.0, 5.0, 50.0, 1e6])
+    old = log_softplus(f / 5.0) + np.log(5.0)
+    np.testing.assert_allclose(t.forward(f), old, rtol=0, atol=1e-12)
+    np.testing.assert_allclose(t.forward(f, floor=0.0), old, rtol=0, atol=1e-12)
+    assert np.all(np.isfinite(t.forward(f)))
+
+
+def test_the_floor_bounds_x_below_and_leaves_bright_flux_alone():
+    from rubin_host_prior.data.transform import LogFluxTransform
+
+    t = LogFluxTransform(softening=1.0)
+    f = np.array([-1e4, -10.0, 0.0, 1.0, 10.0, 1e5])
+    for c in (1.0, 3.0, 12.0):
+        x = t.forward(f, floor=c)
+        assert np.all(x >= np.log(c))              # never below the floor
+        assert np.all(np.isfinite(x))
+        # a bright source is untouched: log(f), not log(f + something)
+        assert t.forward(np.array([1e5]), floor=c)[0] == pytest.approx(
+            np.log(1e5), rel=1e-9)
+
+
+def test_the_floor_round_trips_above_itself_and_is_lossy_below():
+    """Lossy below the floor is the point -- a pinned pixel has no original
+    value left.  Above it the map must still be exactly invertible, because
+    that is what says the floor touched nothing it should not have."""
+    from rubin_host_prior.data.transform import LogFluxTransform
+
+    t = LogFluxTransform(softening=2.0)
+    c = 4.0
+    above = np.linspace(c + 1e-3, c + 500.0, 500)
+    back = t.inverse_exact(t.forward(above, floor=c), floor=c)
+    np.testing.assert_allclose(back, above, rtol=1e-9, atol=1e-9)
+
+    pinned = np.array([c - 200.0])
+    assert t.inverse_exact(t.forward(pinned, floor=c), floor=c)[0] < pinned[0]
+
+
+def test_a_per_stamp_floor_broadcasts_over_a_batch():
+    from rubin_host_prior.data.transform import LogFluxTransform
+
+    t = LogFluxTransform(softening=1.0)
+    f = np.random.default_rng(0).normal(0.0, 3.0, (4, 8, 8))
+    c = np.array([1.0, 2.0, 3.0, 4.0])[:, None, None]
+    x = t.forward(f, floor=c)
+    assert x.shape == f.shape
+    for i in range(4):
+        assert x[i].min() >= np.log(c[i, 0, 0])
+    np.testing.assert_allclose(t.inverse_exact(x, floor=c), f, atol=1e-9)
+
+
+def _floored_config(shard_dir):
+    """A config with everything the floor needs measured, like prepare_config."""
+    ss = ShardSet.from_dir(shard_dir)
+    config = Config(energy=TINY_ENERGY,
+                    patch=PatchConfig(native_size=ss.native_size, out_size=24,
+                                      pool_factor=3))
+    pooled, _ = pool_shards(ss, config)
+    _m = measure_transform(ss, config, pooled)
+    config.transform.softening = _m["softening"]
+    config.transform.pooled_noise_ratio = _m["pooled_noise_ratio"]
+    return ss, config
+
+
+def test_the_loader_flattens_the_sky_and_varies_the_floor_per_stamp(shard_dir):
+    """End to end, which is the claim that matters: the sky stops being noisy
+    and every cutout floors somewhere slightly different."""
+    import dataclasses
+
+    ss, config = _floored_config(shard_dir)
+    transform = LogFluxTransform.from_config(config.transform)
+    n = min(24, len(ss))
+
+    def measure(cfg):
+        ds = PatchDataset.from_shards(ss, cfg, transform, max_in_memory_gb=16.0)
+        try:
+            b = ds.make_batch(np.arange(n), rng=np.random.default_rng(0),
+                              augment=False)
+        finally:
+            ds.close()
+        faint = np.percentile(b, 40, axis=(1, 2, 3))
+        return (float(np.mean([p[p <= f].std() for p, f in zip(b, faint)])),
+                b.reshape(len(b), -1).min(axis=1))
+
+    off = dataclasses.replace(config)
+    off.transform = dataclasses.replace(config.transform, floor_sigma_lo=0.0,
+                                        floor_sigma_hi=0.0)
+    scatter_off, _ = measure(off)
+    scatter_on, mins = measure(config)
+
+    # the sky goes from a wide wobble to a narrow one
+    assert scatter_on < 0.5 * scatter_off, (scatter_off, scatter_on)
+    # bounded below, and not all at the same place: each cutout floors at a
+    # multiple of its own sky noise, with k drawn per stamp
+    assert mins.std() > 0.005, mins
+
+
+def test_the_floor_refuses_to_guess_the_pooled_noise_ratio(shard_dir):
+    """It is measured, not 1: coadd noise is correlated, so pooling reduces it
+    by less than ``pool_factor`` and an assumed 1 would put every floor too
+    low.  Better to refuse than to silently floor in the wrong place."""
+    ss, config = _floored_config(shard_dir)
+    config.transform.pooled_noise_ratio = None
+    ds = PatchDataset.from_shards(
+        ss, config, LogFluxTransform.from_config(config.transform),
+        max_in_memory_gb=16.0)
+    try:
+        with pytest.raises(ValueError, match="pooled_noise_ratio"):
+            ds.make_batch(np.arange(4), rng=np.random.default_rng(0))
+    finally:
+        ds.close()

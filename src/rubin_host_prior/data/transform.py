@@ -96,6 +96,9 @@ _LINEAR_BELOW = -20.0
 #: ``log(expm1(v)) == v`` to double precision anyway.
 _EXPM1_ABOVE = 30.0
 
+#: Smallest positive double; stands in for a zero whose logarithm is wanted.
+_TINY = 1e-300
+
 
 #: ``d x / d f`` at zero flux is ``0.5 / log(2) / s`` -- the softplus slope
 #: (1/2) divided by softplus(0) (log 2).  The ``log(s)`` that ``forward`` adds is
@@ -105,6 +108,12 @@ SKY_SLOPE = 0.5 / log(2.0)
 
 def expected_sky_scatter(softening_sigma: float) -> float:
     """Predicted spread of ``x`` for sky pixels, ``0.721 / softening_sigma``.
+
+    **Unfloored.**  This is the ``c = 0`` relation, where the softening alone
+    decides how flat the sky is.  With a sky floor the floor decides instead --
+    that is what it is for -- and the scatter is roughly ``1/k`` times smaller:
+    measured, 0.18 at ``k = 1``, 0.084 at 1.5, 0.037 at 2.  Use this to check
+    the *softening*, not to predict a floored set.
 
     Exact for a band at the noise level the single scale was measured from, and
     proportionally wider or narrower for a band deeper or shallower than that:
@@ -139,17 +148,32 @@ def softplus(u, xp=None):
     return np.logaddexp(0.0, u)
 
 
-def soften(flux, scale, xp=None):
-    """``scale * softplus(flux / scale)``: nJy in, nJy out.
+def soften(flux, scale, xp=None, floor=0.0):
+    """``floor + scale * softplus((flux - floor) / scale)``: nJy in, nJy out.
 
-    The scale is the only parameter, and it is a flux.  Above it the map is the
-    identity -- ``softplus(u) -> u`` exponentially fast, so bright pixels pass
-    through with the adjustment confined to the low and negative regime, which
-    is the whole point of writing it this way.  Below it the map bends over and
-    approaches zero from above without ever reaching it.
+    Two parameters, both fluxes, and they do different jobs:
+
+    * ``floor`` is **where** the map bends over -- the flux the output
+      approaches from above and never goes below.  At ``floor = 0`` this is the
+      original one-parameter softening exactly, which is why adding it broke
+      nothing.
+    * ``scale`` is **how sharp** the bend is.  Above ``floor + a few scale`` the
+      map is the identity, since ``softplus(u) -> u`` exponentially fast.
+
+    Separating them is the point.  With one parameter the only way to flatten
+    the sky was to raise the knee, which dragged faint *sources* into the
+    compressed regime with it: measured, pushing ``softening_sigma`` to 5 gets
+    the sky scatter down to 0.14 in x but reports a 3-sigma source 73% too
+    bright, and at 10 it is 2.8x too bright.  With the knee at ``floor = 1.5``
+    sky sigma and ``scale = sigma/3``, the sky scatter is 0.084 and a 3-sigma
+    source is wrong by 0.1%.
+
+    ``floor`` is meant to be **per stamp** -- a multiple of that cutout's own
+    sky noise -- so the sky sits at its own level in each one and the prior
+    gets a range of sky levels rather than a single memorised value.
     """
     xp = _xp(flux) if xp is None else xp
-    return scale * softplus(flux / scale, xp)
+    return floor + scale * softplus((flux - floor) / scale, xp)
 
 
 def log_softplus(u, xp=None):
@@ -186,29 +210,53 @@ class LogFluxTransform:
             )
         return cls(softening=float(s))
 
-    def soften(self, flux):
-        """``s * softplus(flux / s)``: nJy in, nJy out.
+    def soften(self, flux, floor=0.0):
+        """``floor + s * softplus((flux - floor) / s)``: nJy in, nJy out.
 
         The definition the other maps are built from.  ``forward`` is
         ``log(soften(f))`` and ``inverse`` is exactly this composed with it, so
-        this is the one place the softening is stated and the only shape the
-        model can express.
+        this is the one place the shape is stated and the only shape the model
+        can express.  ``floor`` may be an array, one entry per stamp.
         """
-        return soften(flux, self.softening, _xp(flux))
+        return soften(flux, self.softening, _xp(flux), floor)
 
     # -- the two maps ------------------------------------------------------
 
-    def forward(self, flux):
-        """nJy -> log space: ``log(soften(f))``, which tends to ``log(f)``.
+    def forward(self, flux, floor=0.0):
+        """nJy -> log space: ``log(soften(f, floor))``, which tends to ``log(f)``.
 
-        Takes no band.  Defined and finite for every real input.  Written as
-        ``log_softplus(f/s) + log(s)`` rather than by composing ``soften`` and
-        taking a logarithm, which are algebraically the same thing: below
-        ``f/s = -745`` the softened flux underflows to zero in float64 and its
-        log is ``-inf``, where ``log_softplus`` returns the exact limit instead.
-        A test pins the two forms together.
+        Takes no band.  Defined and finite for every real input, at any floor.
+        ``floor`` may be an array broadcasting over the leading axes, which is
+        how a per-stamp sky floor is applied.
+
+        **Two regimes, because only one of them can underflow.**  With a
+        positive floor the softened flux is at least ``floor``, so a plain
+        logarithm is exact and cannot reach zero.  At ``floor = 0`` it can:
+        below ``f/s = -745`` the softened flux underflows in float64 and its log
+        is ``-inf``, so that case falls back to ``log_softplus(f/s) + log(s)``,
+        which returns the exact limit.  A test pins the two against each other
+        where they overlap.
         """
-        return log_softplus(flux / self.softening, _xp(flux)) + log(self.softening)
+        xp = _xp(flux)
+        s = self.softening
+        u = (flux - floor) / s
+        val = self.soften(flux, floor)
+        # ``log_softplus(u) + log(s)``: the exact limit, used wherever the
+        # direct form loses it.  Below u = -20 softplus is subnormal and
+        # ``log(s * softplus(u))`` drifts -- half a nat at u = -745 -- while
+        # ``u`` itself is exact to 1e-9 there; below u = -745 it underflows to
+        # zero outright and the direct form is -inf.
+        #
+        # Only reachable at ``floor == 0``.  A positive floor keeps ``val`` at
+        # or above it, so nothing underflows and the direct branch is exact.
+        limit = u + log(s)
+        direct = val > 0
+        if xp is not np:
+            degenerate = (xp.asarray(floor) == 0) & (u < _LINEAR_BELOW)
+        else:
+            degenerate = (np.asarray(floor) == 0) & (u < _LINEAR_BELOW)
+        direct = direct & ~degenerate
+        return xp.where(direct, xp.log(xp.where(direct, val, 1.0)), limit)
 
     def inverse(self, x):
         """log space -> nJy: ``exp(x)``.  **This is what a forward model calls.**
@@ -231,28 +279,42 @@ class LogFluxTransform:
         """
         return _xp(x).exp(x)
 
-    def inverse_exact(self, x):
-        """The true inverse of ``forward``: ``s * log(expm1(exp(x) / s))``.
+    def inverse_exact(self, x, floor=0.0):
+        """The true inverse of ``forward``: ``floor + s * log(expm1(v))`` with
+        ``v = (exp(x) - floor) / s``.
 
-        For round-trip checks and for recovering the measured flux, including its
-        negative values.  Agrees with ``inverse`` to double precision wherever
-        the flux is more than ~10 s.
+        For round-trip checks and for recovering the measured flux, including
+        its negative values.  Pass the same ``floor`` the forward map was given,
+        or the round trip is not one.  Agrees with ``inverse`` to double
+        precision wherever the flux is more than ~10 s above the floor.
         """
         xp = _xp(x)
         s = self.softening
-        # ``u = log(softplus(f/s))`` -- x with the scale's constant removed,
-        # which is the quantity the three regimes below are expressed in.
-        cx = x - log(s)
-        v = xp.exp(cx)
+        # ``v = softplus((f - floor)/s)``: the quantity the three regimes below
+        # are expressed in, and ``cx = log(v)``.  At ``floor == 0`` that log is
+        # ``x - log(s)`` in closed form, which stays exact where ``exp(x)``
+        # itself has long underflowed; with a positive floor ``x`` is bounded
+        # below by ``log(floor)`` so there is nothing to underflow.
+        zero_floor = xp.asarray(floor) == 0
+        v = xp.where(zero_floor, xp.exp(x - log(s)),
+                     (xp.exp(xp.where(zero_floor, 0.0, x)) - floor) / s)
+        # A pixel sitting exactly at the floor has ``v == 0``: its original flux
+        # was minus infinity, and the floor threw it away.  Substituting the
+        # smallest positive double rather than 1.0 keeps ``cx`` hugely negative,
+        # so the ``small`` branch below fires and returns it, instead of
+        # landing on ``log(1) == 0`` and taking ``log(expm1(0)) == -inf`` with a
+        # divide-by-zero warning on the way.
+        cx = xp.where(zero_floor, x - log(s),
+                      xp.log(xp.where(v > 0, v, _TINY)))
         # Three regimes.  Large v: log(expm1(v)) == v to double precision, and
         # expm1 would overflow.  Very negative cx: v underflows towards zero,
         # expm1(v) ~ v, so log(expm1(v)) ~ cx -- computing it directly would give
         # log(0) = -inf.  In between, the direct expression is fine.
         big = v > _EXPM1_ABOVE  # expm1 would overflow; log(expm1(v)) == v
-        small = cx < _LINEAR_BELOW  # expm1(v) ~ v; log(expm1(v)) == c*x
+        small = cx < _LINEAR_BELOW  # expm1(v) ~ v; log(expm1(v)) == cx
         mid = xp.where(big | small, 1.0, v)
         direct = xp.log(xp.expm1(mid))
-        return s * xp.where(big, v, xp.where(small, cx, direct))
+        return floor + s * xp.where(big, v, xp.where(small, cx, direct))
 
     def jacobian(self, x):
         """``df/dx`` for the model map, which is simply ``f`` itself."""
@@ -260,13 +322,21 @@ class LogFluxTransform:
 
     # -- analytic diagnostics ---------------------------------------------
 
+    def sky_level_at(self, floor=0.0):
+        """``x`` at zero flux: ``log(floor + s * log 2)``.  Where the sky sits.
+
+        With a per-stamp floor this is per stamp too, which is the point --
+        each cutout's sky sits at its own level, so the prior sees a range of
+        them rather than one memorised value.
+        """
+        return _xp(floor).log(floor + self.softening * log(2.0))
+
     @property
     def sky_level(self) -> float:
-        """``x`` at zero flux: ``log(s * log 2)``.  Where the sky sits.
+        """``sky_level_at(0)``: where the sky sits with no floor.
 
-        The same in every band, because there is one scale.  What differs is the
-        *width* about it -- a deep band scatters less than a shallow one, which
-        is a real difference rather than one the transform should erase.
+        Kept as a property because it is what the unfloored transform means and
+        what every diagnostic written against it reads.
         """
         return log(self.softening * log(2.0))
 
@@ -339,6 +409,38 @@ def measure_pooled_sky_noise(pooled: np.ndarray) -> float:
             "or all masked"
         )
     return float(np.median(per_patch[good]))
+
+
+def measure_transform(shards, config, pooled: np.ndarray) -> dict[str, float]:
+    """Measure ``softening`` and ``pooled_noise_ratio`` together, from one sample.
+
+    They belong together: both describe the pooled sky noise, both come off the
+    same patches, and setting one without the other leaves the transform half
+    configured -- which it then refuses to run with, rather than flooring in the
+    wrong place.  Returns what it measured; it does not mutate the config, so a
+    caller can see the numbers before adopting them.
+
+    The ratio is pooled sky noise over the naive ``native sky_noise /
+    pool_factor``.  It is not 1: coaddition warps exposures onto the skymap
+    grid, so neighbouring pixels share flux and averaging ``P**2`` of them
+    reduces the noise by less than ``P``.  The shards carry a *native* per-stamp
+    ``sky_noise``, so this is what turns it into the pooled sigma the floor
+    needs -- keeping each cutout's own variation and fixing the shared scale
+    from a measurement.
+    """
+    measured = measure_pooled_sky_noise(pooled)
+    naive = float(np.median(np.asarray(shards.meta["sky_noise"], dtype=np.float64)))
+    naive /= config.patch.pool_factor
+    if not naive > 0:
+        raise ValueError(
+            "the shards' sky_noise is not positive, so the pooled/native ratio "
+            "cannot be formed. These shards predate the metadata or were "
+            "written without it."
+        )
+    return {
+        "softening": estimate_softening(pooled, config.transform.softening_sigma),
+        "pooled_noise_ratio": float(measured / naive),
+    }
 
 
 def estimate_softening(pooled: np.ndarray, softening_sigma: float) -> float:

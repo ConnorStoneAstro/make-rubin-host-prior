@@ -23,6 +23,7 @@ from ..config import Config
 from .augment import random_dihedral
 from .diagnostics import correlation_length
 from .pooling import pool_to_training_grid
+from .repair import fill_batch
 from .shards import ShardSet
 from .transform import LogFluxTransform
 
@@ -53,6 +54,12 @@ class PatchDataset:
         self.pool_refill_every = pool_refill_every
         self.prefetch_depth = prefetch_depth
         self._shard_pool = None
+        #: What the last batch's no-data fill touched.  A report rather than
+        #: state: if a future release writes its holes with a value the
+        #: detector does not know, every count here stays zero, and that is
+        #: visible instead of invisible.
+        self._last_fill: dict = {"n_stamps": 0, "n_stamps_filled": 0,
+                                 "n_pixels_filled": 0, "largest_hole_px": 0}
 
     @property
     def in_memory(self) -> bool:
@@ -138,6 +145,45 @@ class PatchDataset:
             return self._native[indices]
         return self.shards.gather(indices, "image")
 
+    def _sky_noise(self, indices: np.ndarray) -> np.ndarray:
+        """Per-stamp native sky noise, nJy, for the rows named by ``indices``."""
+        return np.asarray(self.shards.meta["sky_noise"], dtype=np.float32)[indices]
+
+    def sky_floor(
+        self, sky_noise: np.ndarray, rng: np.random.Generator | None
+    ) -> np.ndarray | float:
+        """The per-stamp floor in nJy: ``k * pooled sigma``, ``k`` drawn per stamp.
+
+        ``sky_noise`` is the native-resolution number the shards carry, so it is
+        divided by ``pool_factor`` and corrected by the measured
+        ``pooled_noise_ratio`` -- coadd noise is correlated, so pooling reduces
+        it by less than ``pool_factor`` and the uncorrected figure would put the
+        floor too low.
+
+        Returns ``0.0`` when floors are switched off, which is exactly the
+        pre-floor transform.  Without an rng -- the unaugmented path, which has
+        to be reproducible -- ``k`` is the midpoint rather than a draw, and the
+        per-stamp variation comes from each cutout's own sky noise alone.
+        """
+        t = self.config.transform
+        if not t.floors_enabled:
+            return 0.0
+        ratio = t.pooled_noise_ratio
+        if ratio is None:
+            raise ValueError(
+                "the config has no transform.pooled_noise_ratio, so a native "
+                "sky_noise cannot be turned into the pooled one the floor "
+                "needs. Run scripts/prepare_config.py on the shards; it "
+                "measures the pooled noise and the ratio together."
+            )
+        sigma = np.asarray(sky_noise, dtype=np.float64) / self.config.patch.pool_factor
+        sigma = sigma * float(ratio)
+        if rng is None or t.floor_sigma_hi == t.floor_sigma_lo:
+            k = 0.5 * (t.floor_sigma_lo + t.floor_sigma_hi)
+        else:
+            k = rng.uniform(t.floor_sigma_lo, t.floor_sigma_hi, size=sigma.shape)
+        return (k * sigma)[:, None, None]
+
     def _pool_stamps(
         self,
         stamps: np.ndarray,
@@ -154,6 +200,11 @@ class PatchDataset:
         """
         p = self.config.patch
         out_size = p.out_size if out_size is None else out_size
+        if self.config.transform.fill_no_data:
+            # Before pooling, not after: a dead pixel averaged into its
+            # neighbours would smear the hole over the whole pooled cell rather
+            # than being replaced by what belongs there.
+            stamps, self._last_fill = fill_batch(stamps)
         out = np.empty((len(stamps), out_size, out_size), dtype=np.float32)
         for i in range(len(stamps)):
             out[i] = pool_to_training_grid(
@@ -173,6 +224,7 @@ class PatchDataset:
         rng: np.random.Generator | None = None,
         augment: bool = True,
         out_size: int | None = None,
+        sky_noise: np.ndarray | None = None,
     ) -> np.ndarray:
         """``(B, 1, S, S)`` float32 in the log representation, from raw stamps.
 
@@ -190,8 +242,16 @@ class PatchDataset:
             scale_jitter=aug.scale_jitter if augment else 0.0,
             out_size=out_size,
         )
-        # Pool in flux, THEN take the log.
-        x = self.transform.forward(x)
+        # Pool in flux, THEN take the log, with the floor this cutout gets.
+        #
+        # The ``k`` draw is an *augmentation*, so it follows ``augment`` and not
+        # merely whether an rng exists: ``validation_batch`` and the diagnostic
+        # figures pass an rng with augmentation off and have to be reproducible.
+        # Each stamp still floors at its own level either way -- that comes from
+        # its own sky noise -- it is only the jitter on ``k`` that freezes.
+        floor = (0.0 if sky_noise is None
+                 else self.sky_floor(sky_noise, rng if augment else None))
+        x = self.transform.forward(x, floor)
         if augment and aug.dihedral:
             if rng is None:
                 raise ValueError("dihedral augmentation requires an rng")
@@ -213,7 +273,8 @@ class PatchDataset:
         many and does not care which.  ``batches`` uses the pool instead.
         """
         return self.batch_from_stamps(
-            self._native_stamps(indices), rng, augment, out_size)
+            self._native_stamps(indices), rng, augment, out_size,
+            sky_noise=self._sky_noise(indices))
 
     def pool(self) -> "ShardPool":
         """The resident-shard pool, built on first use.
@@ -250,9 +311,10 @@ class PatchDataset:
             # filesystem.  There is no epoch here -- residency is the shuffle.
             pool = self.pool()
             while True:
+                stamps, noise = pool.draw(rng, batch_size)
                 yield self.batch_from_stamps(
-                    pool.draw(rng, batch_size), rng,
-                    out_size=sizes[k % len(sizes)])
+                    stamps, rng, out_size=sizes[k % len(sizes)],
+                    sky_noise=noise)
                 k += 1
         n = len(self)
         if n < batch_size:

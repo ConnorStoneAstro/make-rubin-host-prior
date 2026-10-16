@@ -196,19 +196,56 @@ class NCSNppConfig:
     rather than a gradient of a gradient.  ``nn.ncsnpp`` documents what was
     ported and what was simplified away; ``nn.score`` documents the trade.
 
-    Defaults are the reference's, except for the two that set the size:
-    ``nf = 64`` and ``ch_mult = (1, 2, 2, 2)`` rather than ``128`` and
-    ``(2, 2, 2, 2)``, which on a 128 px grid is 4 levels of 256 channels and
-    ~100M parameters.  Raise them for a production run.
+    Defaults are the reference's except for the two that set the size, which
+    are chosen for **inference cost**: this prior is evaluated inside an HMC
+    inner loop, where one ``score`` call is a gradient of the network and
+    therefore 2.03x its forward pass.
+
+    ``nf = 32`` with ``ch_mult = (1, 2, 4, 4)`` rather than the reference's
+    ``128`` and ``(2, 2, 2, 2)`` (four levels of 256 channels, ~100M
+    parameters), and rather than this file's previous ``64`` / ``(1, 2, 2, 2)``
+    (10.5M parameters, 112.9 GFLOP per score on a 128 px grid).  It is
+    **2.64x cheaper at 7.2M parameters** -- against 2.6M for a flat ``nf = 32``
+    at the same four levels.
+
+    The shape follows from where the work is.  On a 128 px grid the FLOPs sit
+    almost entirely at the two finest levels -- 50.5% at 128 px and 35.4% at
+    64 px, against 11.0% and 3.1% at 32 and 16 px (an analytic walk over the
+    convolutions lands within 0.2% of XLA's measured total, so that attribution
+    is the whole cost).  Capacity at the coarse levels is therefore nearly free
+    and capacity at the fine ones is not: halving ``nf`` cuts the expensive
+    levels, and raising the multiplier to 4 buys most of the parameters back
+    where they cost little.
+
+    What that trades away is fine-scale *capacity* -- the finest level is 32
+    channels, not 64 -- which is the half of the model doing texture.  That was
+    the deliberate choice: in posterior sampling the likelihood fixes the
+    large-scale structure and the prior mostly supplies texture, so this keeps
+    total capacity high while paying for the speedup at the fine levels.  Check
+    it the way everything else here is checked: train it, run
+    ``reverse_trajectory.py``, and compare the band table's 1-4 px rows against
+    the wider model's.
+
+    Things that look cuttable and are not, all measured: dropping the coarsest
+    level is **1.00x** (the bottleneck moves up and the work there grows to
+    match), attention is 1.00x, and either progressive pyramid is 1.04x.
+
+    ``nf`` is constrained: GroupNorm uses ``max(min(C // 4, 32), 1)`` groups and
+    they must divide every channel count in the network, including the skip
+    concatenations on the way up.  48 fails on a 144-channel concatenation
+    against 32 groups; 8, 16, 32, 64, 96, 128 and 160 all build.
     """
 
     in_channels: int = 1
     #: Base width.  Every level is ``nf * ch_mult[level]`` channels and the
-    #: noise-level embedding is ``4 * nf``.
-    nf: int = 64
+    #: noise-level embedding is ``4 * nf``.  See the class docstring for which
+    #: values build at all.
+    nf: int = 32
     #: One entry per resolution; the grid halves between them, so the training
-    #: size must be divisible by ``2 ** (len(ch_mult) - 1)``.
-    ch_mult: tuple[int, ...] = (1, 2, 2, 2)
+    #: size must be divisible by ``2 ** (len(ch_mult) - 1)``.  Rising, because
+    #: 86% of the arithmetic is at the two finest levels and almost none of it
+    #: at the two coarsest.
+    ch_mult: tuple[int, ...] = (1, 2, 4, 4)
     num_blocks: int = 2  # residual blocks per resolution on the way down
     activation: str = "silu"
     #: ``1e-2``, so every block's last convolution and every pyramid output
@@ -351,21 +388,77 @@ class TransformConfig:
     flux goes negative wherever noise takes it below the subtracted sky, and
     those pixels are smoothly carried towards zero instead.
 
-    ``s = softening_sigma * pooled sky noise`` sets where the softening turns
-    over, and is the knob that decides how hard the sky is flattened.  At 2.0
-    the pedestal sits at 1.39 sigma and pixels within the noise are compressed
-    towards it: the prior describes the galaxy rather than this realisation of
-    the sky, which is what the likelihood is for.
+    **The map has two parameters and they do different jobs.**
+
+        x = log(c + s * softplus((f - c) / s))        f = exp(x)
+
+    ``c`` is the **sky floor**, per stamp: ``k * that cutout's pooled sky
+    noise``, with ``k`` drawn per stamp from ``[floor_sigma_lo,
+    floor_sigma_hi]``.  It is where the map bends over, hence the flux the sky
+    is carried towards and never goes below.  ``s = softening_sigma * pooled
+    sky noise`` is how *sharp* that bend is.  At ``c = 0`` this is the original
+    one-parameter softening exactly.
+
+    **Why both.**  With one parameter the only way to flatten the sky was to
+    raise the knee, which dragged faint sources into the compressed regime with
+    it.  Measured: at ``softening_sigma = 1`` the sky scatters 0.717 in x -- a
+    **factor of 2 in flux**, which is the noisy sky that shows up in posterior
+    samples -- and getting it down to 0.14 costs a 3-sigma source 73% of its
+    flux.  With ``c = 1.5 sigma`` and ``s = sigma/3`` the sky scatters 0.084
+    and a 3-sigma source is wrong by 0.1%.
+
+    ``k`` is **drawn per stamp, and so is the sky noise it multiplies**, so no
+    two cutouts floor at the same flux.  A single shared floor would put an
+    atom in the data distribution; the prior would then insist on one exact sky
+    value with curvature limited only by ``sigma_min``, which in posterior
+    sampling is a stiff direction and costs HMC its step size.  Randomising the
+    level alone does not fix that -- within one scene every sky pixel would
+    still be exactly equal, which is thousands of exact constraints and still a
+    singular distribution.  What fixes it is the *soft* floor, which leaves a
+    real per-pixel spread.
 
     **One scale, for every band.**  It used to be a dict per band, which bought
     the transform nothing once ``forward`` became ``log(f_s)`` -- see
-    ``data.transform``.  With one scale the sky lands at ``log(s * log 2)``
+    ``data.transform``.  With one scale the sky lands at ``log(c + s * log 2)``
     everywhere, and the bands differ only in how wide the sky is about it.
     """
 
     #: nJy.  Measured by ``prepare_config.py``; None until then.
     softening: float | None = None
-    softening_sigma: float = 1.0  # s = softening_sigma * pooled sky noise
+    #: ``s`` in units of the pooled sky noise -- the *sharpness* of the knee.
+    #: Lowered from 1.0 when the floor arrived: with a floor doing the
+    #: flattening, ``s`` only has to be small enough to put the knee below the
+    #: faintest source worth keeping, and 1/3 sigma leaves a 3-sigma source
+    #: wrong by 0.1% where 1.0 sigma leaves it wrong by 6.5%.
+    softening_sigma: float = 1.0 / 3.0
+    #: The sky floor in units of each cutout's own pooled sky noise, drawn
+    #: uniformly per stamp.  Higher floors flatten harder: measured sky scatter
+    #: in x is 0.18 at k = 1, 0.084 at 1.5, 0.037 at 2.  Equal values disable
+    #: the jitter without disabling the floor; both zero disable it entirely
+    #: and recover the pre-floor transform exactly.
+    floor_sigma_lo: float = 1.0
+    floor_sigma_hi: float = 1.5
+    #: Pooled sky noise over ``sky_noise / pool_factor``.  **Measured**, because
+    #: it is not 1: coaddition warps exposures onto the skymap grid, so
+    #: neighbouring pixels share flux and averaging ``P**2`` of them reduces the
+    #: noise by less than ``P``.  The per-stamp ``sky_noise`` in the shards is a
+    #: native-resolution number, so this is what turns it into the pooled one
+    #: the floor needs -- keeping each cutout's own variation, fixing the shared
+    #: scale from a measurement.
+    pooled_noise_ratio: float | None = None
+    #: Fill the holes DP2 leaves in saturated star cores; see ``data.repair``.
+    fill_no_data: bool = True
+
+    def __post_init__(self) -> None:
+        if not 0 <= self.floor_sigma_lo <= self.floor_sigma_hi:
+            raise ValueError(
+                f"need 0 <= floor_sigma_lo <= floor_sigma_hi, got "
+                f"{self.floor_sigma_lo} and {self.floor_sigma_hi}"
+            )
+
+    @property
+    def floors_enabled(self) -> bool:
+        return self.floor_sigma_hi > 0
 
 
 @dataclass
@@ -541,19 +634,35 @@ class Config:
 
     @property
     def input_offset(self) -> float:
-        """The sky level in ``x``: ``log(softening * log 2)``.
+        """The typical sky level in ``x``: ``log(c + s * log 2)``.
 
         Subtracted from the scene before the first layer so the zeros the
         convolutions pad with sit at the sky rather than 5-10 sigma below it.
-        Computed from the softening the config already stores rather than being
-        a field of its own, so there is no second number to drift.  Zero when
-        the softening has not been measured yet, which is the honest answer:
+
+        ``c`` is the *typical* sky floor -- the midpoint of the per-stamp draw
+        times the pooled sky noise -- because the actual floor varies from
+        cutout to cutout and the padding needs one number.  The pooled noise is
+        recovered as ``softening / softening_sigma`` rather than stored again,
+        so there is no second copy to drift; at ``floor_sigma_hi = 0`` the whole
+        term vanishes and this is the pre-floor ``log(s * log 2)`` exactly.
+
+        **The floor moves this, and by a lot.**  With a floor at 1.25 sigma and
+        ``s = sigma/3``, ``c + s*log2`` is about 1.5 sigma where it used to be
+        0.23 sigma -- six times higher in flux, 1.9 in x.  Leaving the old
+        expression here would put the padding well below the sky the model now
+        sees.  Zero when the softening has not been measured, which is honest:
         there is no sky level until there is a transform.
         """
         from math import log
 
-        s = self.transform.softening
-        return log(s * log(2.0)) if s else 0.0
+        t = self.transform
+        if not t.softening:
+            return 0.0
+        c = 0.0
+        if t.floors_enabled and t.softening_sigma > 0:
+            pooled_sigma = t.softening / t.softening_sigma
+            c = 0.5 * (t.floor_sigma_lo + t.floor_sigma_hi) * pooled_sigma
+        return log(c + t.softening * log(2.0))
 
     ARCHITECTURES = ("energy", "ncsnpp", "ncsnpp_energy")
 

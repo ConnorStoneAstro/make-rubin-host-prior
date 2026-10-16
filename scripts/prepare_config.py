@@ -36,7 +36,7 @@ from rubin_host_prior.data import (
     LogFluxTransform,
     PatchDataset,
     ShardSet,
-    estimate_softening,
+    estimate_softening, measure_transform,
     expected_sky_scatter,
     pool_shards,
     reach_advice,
@@ -147,10 +147,19 @@ def main() -> None:
     # a number means someone chose it, and choosing one is the only way to
     # override the heuristic -- there is deliberately no flag for that.
     kept: list[str] = []
+    # Measured together, from the same patches: both describe the pooled sky
+    # noise, and a config carrying one without the other is half configured.
+    measured = measure_transform(shards, config, pooled)
     if config.transform.softening is None:
-        config.transform.softening = estimate_softening(pooled, softening_sigma)
+        config.transform.softening = measured["softening"]
     else:
         kept.append(f"transform.softening = {config.transform.softening}")
+    if config.transform.pooled_noise_ratio is None:
+        config.transform.pooled_noise_ratio = round(
+            measured["pooled_noise_ratio"], 4)
+    else:
+        kept.append(
+            f"transform.pooled_noise_ratio = {config.transform.pooled_noise_ratio}")
 
     # One scale for every band, so the band counts are reported and nothing
     # more: a band with no patches no longer leaves a hole in the transform.
@@ -213,6 +222,7 @@ def main() -> None:
                 "sigma_min": config.sde.sigma_min,
                 "sigma_max": config.sde.sigma_max,
                 "data_std": config.sde.data_std,
+                "pooled_noise_ratio": config.transform.pooled_noise_ratio,
             },
             indent=2,
         )
