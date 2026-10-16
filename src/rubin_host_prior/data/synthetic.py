@@ -157,9 +157,18 @@ def write_synthetic_shards(
     sky_noise_by_band: dict[str, float] | None = None,
     noise_correlation: float = 0.8,
     no_data_fraction: float = 0.0005,
+    no_data_rate: float = 0.0,
     seed: int = 0,
 ) -> list[Path]:
-    """Write shards that look like the real thing to the loader."""
+    """Write shards that look like the real thing to the loader.
+
+    ``no_data_rate`` is the fraction of *stamps* that carry any no-data at all;
+    ``no_data_fraction`` is how much of one of those stamps it covers.  Real
+    DP2 is about 3% of stamps at a few hundredths of a percent each, so the two
+    are separate knobs and the rate defaults to zero -- a fixture where every
+    stamp is flagged is one the production cut empties entirely, which makes it
+    useless for everything except testing the cut.
+    """
     rng = np.random.default_rng(seed)
     # Rough per-band sky noise in nJy per native pixel; u is the worst.
     noise = sky_noise_by_band or {
@@ -180,10 +189,14 @@ def write_synthetic_shards(
         for i in range(n_patches):
             band_idx = int(rng.integers(len(BANDS)))
             band = BANDS[band_idx]
+            # Per stamp, so a set has a realistic *mix* of clean and flagged
+            # rather than being uniformly one or the other.
+            bad = no_data_rate > 0 and rng.random() < no_data_rate
+            frac = no_data_fraction if bad else 0.0
             p = synthetic_patch(
                 rng, size=native_size, sky_noise=noise[band],
                 noise_correlation=noise_correlation,
-                no_data_fraction=no_data_fraction,
+                no_data_fraction=frac,
             )
             hosts.append(
                 {
@@ -219,7 +232,7 @@ def write_synthetic_shards(
                     "n_visits_max": int(rng.integers(32, 40)),
                     "cell_depth_ratio": float(rng.uniform(1.0, 1.4)),
                     "variance_step": float(rng.uniform(1.0, 1.4)),
-                    "frac_no_data": float(no_data_fraction),
+                    "frac_no_data": float(frac),
                     "frac_inexact_psf": 0.3,
                     "frac_rejected": float(rng.uniform(0, 0.4)),
                 },

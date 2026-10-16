@@ -521,39 +521,40 @@ def test_the_total_row_is_the_sum_of_the_bands():
         float(np.sqrt(np.var(red, axis=(1, 2)).mean())), rel=0.01)
 
 
-def test_the_augmented_reference_is_a_different_distribution(dataset):
-    """Not a quibble: the loader's translation can cut the host at the frame,
-    which a shift cannot, so the spectra really differ.  A periodogram is
-    translation-invariant, so this is *not* a centring effect -- it is the crop
-    landing somewhere that contains less galaxy.  The band table must therefore
-    compare samples against an *augmented* reference.
+def test_the_band_reference_is_actually_augmented(dataset):
+    """``forward_patches(augment=True)`` must really augment.
 
-    This used to assert something sharper -- that the fine band was sky and so
-    unmoved by the crop while the coarse band was galaxy and moved -- and the
-    sky floor reversed it.  Unfloored, the log of near-zero sky flux threw x
-    down to -10, and those excursions carried power at *every* scale: the band
-    rms came out nearly flat (0.54, 1.01, 0.70, 0.87 over 1-8 px), so what moved
-    with the crop was the excursions, not the galaxy.  Floored, the same field
-    reads 0.087, 0.214, 0.264, 0.562 -- monotonically red, as a galaxy field
-    should be -- and it is the fine band that now follows the crop.  So the
-    which-band-moves claim belonged to the old transform; the difference itself
-    is what this is for and is asserted directly.
+    The band table compares samples against a reference drawn from the loader,
+    and that reference has to go through the same augmentation the training
+    data does -- on real stamps the two differ by 16% at 32 px, because the
+    loader's translation can cut the host at the frame where a centred crop
+    never does.  A periodogram is translation-invariant, so that is not a
+    centring artefact; it is the crop containing less galaxy.
+
+    What is asserted here is that the augmented path is *taken*, which is the
+    bug worth catching -- an ``augment=False`` slipping into the reference
+    would make the whole table compare against the wrong distribution.  The
+    size of the difference is not asserted: this fixture's scenes are small and
+    nearly centred, so the effect is about 1% and four seeds cannot resolve it
+    from its own scatter.  An earlier version did assert it, passed by a hair,
+    and then failed by a hair when the fixture changed.
     """
     from rubin_host_prior.plots import band_power, forward_patches
 
     scales = (1, 2, 4, 8)
-    centred = band_power(forward_patches(dataset, 24, augment=False), scales)
-    augmented = [band_power(forward_patches(dataset, 24, augment=True, seed=s),
-                            scales) for s in range(4)]
+    plain = forward_patches(dataset, 24, augment=False)
+    again = forward_patches(dataset, 24, augment=False)
+    np.testing.assert_array_equal(plain, again)   # unaugmented is reproducible
 
-    ratios = np.array([[b["rms"][i] / centred["rms"][i] for i in range(len(scales))]
-                       for b in augmented])
-    mean = ratios.mean(axis=0)
-    # The error on the *mean*, not the spread of individual seeds: the question
-    # is whether the augmented reference sits somewhere other than 1, and with
-    # four seeds those differ by a factor of two.
-    sem = ratios.std(axis=0, ddof=1) / np.sqrt(len(augmented))
-    assert np.any(np.abs(mean - 1.0) > 2.0 * sem), (mean, sem)
+    centred = band_power(plain, scales)
+    for seed in range(4):
+        aug = forward_patches(dataset, 24, augment=True, seed=seed)
+        assert aug.shape == plain.shape
+        # the same scenes, differently presented -- so the pixels move
+        assert not np.array_equal(aug, plain)
+        ratios = np.array([band_power(aug, scales)["rms"][i] / centred["rms"][i]
+                           for i in range(len(scales))])
+        assert np.any(np.abs(ratios - 1.0) > 1e-3), (seed, ratios)
 
 
 def test_schedule_headroom_drops_bands_with_no_modes():

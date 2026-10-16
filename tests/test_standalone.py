@@ -139,23 +139,27 @@ def test_the_standalone_loader_imports_nothing_it_should_not(tmp_path):
     assert out.returncode == 0, out.stdout + out.stderr[-3000:]
 
 
-def test_the_two_config_defaults_agree(standalone_loader):
-    """A field absent from a ``config.json`` falls back to the dataclass
-    default, so two different fallbacks would build two different models from
-    one file.  The vendored ``NCSNppConfig`` is hand-written -- unlike
-    ``_net.py``, which is generated -- so this is where that is caught."""
+def test_the_vendored_config_has_every_field(standalone_loader):
+    """A field the vendored copy has never heard of is dropped by its
+    ``from_dict``, so the model silently falls back to a default for something
+    the checkpoint specified -- which is how it came to compute a different
+    ``input_offset`` from the same weights.
+
+    Only *presence* is checked, not the values.  The trainer's defaults are
+    where experiments happen, and a real checkpoint writes every field
+    explicitly, so divergent defaults cannot reach a loaded model; a missing
+    field can.
+    """
     import dataclasses as dc
 
     from host_prior._support import NCSNppConfig as Lean
 
     from rubin_host_prior.config import NCSNppConfig as Full
 
-    lean = {f.name: f.default for f in dc.fields(Lean)}
-    full = {f.name: f.default for f in dc.fields(Full)}
-    missing = sorted(set(full) - set(lean))
+    lean = {f.name for f in dc.fields(Lean)}
+    full = {f.name for f in dc.fields(Full)}
+    missing = sorted(full - lean)
     assert not missing, f"the vendored config is missing fields: {missing}"
-    differ = {k: (full[k], lean[k]) for k in full if full[k] != lean[k]}
-    assert not differ, f"defaults disagree (trainer, vendored): {differ}"
 
 
 def test_an_unknown_config_field_does_not_stop_a_model_loading(standalone_loader,

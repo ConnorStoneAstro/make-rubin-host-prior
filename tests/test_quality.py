@@ -161,15 +161,41 @@ def test_cosmic_rays_are_tolerated_where_interpolation_is_not():
                for r in _gate(_scene(), _flagged("COSMIC_RAY", 400))[0])
 
 
-def test_no_data_is_measured_not_treated_as_corruption():
+def test_no_data_is_measured_and_now_rejected_outright():
     """DP2 marks no coverage with inf variance, including saturated cores.
-    Rejecting on its mere presence would discard every stamp with a bright
-    neighbour."""
-    variance = np.full((SIZE, SIZE), SKY**2)
-    variance[:2, :2] = np.inf
-    assert _gate(_scene(), variance=variance)[0] == []
 
-    variance = np.full((SIZE, SIZE), SKY**2)
+    This used to pass a stamp with a few such pixels, on the grounds that
+    rejecting on mere presence would discard every stamp with a bright
+    neighbour.  The tolerance was 2%, and it was doing two jobs: it let a stamp
+    clipping a ragged survey edge through, and it also let saturated cores
+    through.
+
+    It is zero now, because nothing downstream can deal with what it admits.
+    DP2 writes no sentinel at a no-data pixel -- measured over 1093 flagged
+    stamps, not one is exactly zero or non-finite, and the values there are
+    ordinary negatives between -5 and -18 sigma that overlap the real sky's own
+    tail.  So they cannot be found in the image and cannot be inpainted, which
+    leaves rejecting as the only exact cut.  On a 32,785-stamp set it costs
+    3.3%.
+
+    The *measurement* is the half that survives: ``frac_no_data`` is reported
+    whatever the tolerance, which is what lets the same cut be made later from
+    the shard metadata on a set collected under a looser gate.
+    """
+    clean = np.full((SIZE, SIZE), SKY**2)
+    assert _gate(_scene(), variance=clean)[0] == []
+
+    variance = clean.copy()
+    variance[:2, :2] = np.inf
+    reasons, diag = _gate(_scene(), variance=variance)
+    assert any(r.startswith("no_data") for r in reasons), reasons
+    assert diag["frac_no_data"] == pytest.approx(4 / SIZE**2)
+
+    # and the tolerance is still a tolerance, not a plane: raise it and the
+    # same stamp passes, which is what `patch.max_no_data` relies on
+    assert _gate(_scene(), variance=variance, max_no_data=0.01)[0] == []
+
+    variance = clean.copy()
     variance[: SIZE // 2] = np.inf
     reasons, diag = _gate(_scene(), variance=variance)
     assert any(r.startswith("no_data") for r in reasons)
