@@ -395,6 +395,62 @@ def test_the_energy_score_is_conservative(energy_config, form):
     assert asymmetry < 1e-4, asymmetry
 
 
+@pytest.mark.parametrize("form", ["sum", "dae"])
+def test_a_pixel_offset_moves_the_constant_and_nothing_else(form):
+    """``E(x, sigma, k) == E(x, sigma, 0) - N k``, exactly, and the score is
+    blind to it.  That is the whole contract: ``k`` depends on sigma alone, so
+    at a fixed sigma it shifts every scene by the same amount -- the gauge
+    freedom an unnormalised energy has anyway."""
+    from rubin_host_prior.nn.ncsnpp import energy_map, scalar_energy
+
+    h = lambda a: 0.3 * a - 0.1 * a**3  # stands in for the network
+    x = jax.random.normal(jax.random.key(3), (1, 8, 8))
+    sigma, k, tau = 0.3, 0.7, 0.8
+
+    plain = scalar_energy(h(x), sigma, form, tau)
+    shifted = scalar_energy(h(x), sigma, form, tau, k)
+    assert float(plain - shifted) == pytest.approx(k * x.size, rel=1e-5)
+
+    # The map sums to the energy, which is what makes "per pixel" the right
+    # unit for the offset in the first place.
+    assert float(jnp.sum(energy_map(h(x), sigma, form, tau))) == pytest.approx(
+        float(plain), rel=1e-6)
+
+    grad = lambda off: jax.grad(
+        lambda a: scalar_energy(h(a), sigma, form, tau, off))(x)
+    np.testing.assert_allclose(np.asarray(grad(0.0)), np.asarray(grad(k)),
+                               rtol=1e-6)
+
+
+def test_without_the_offset_float32_loses_the_difference_entirely():
+    """Why the argument exists, measured rather than asserted.
+
+    At ``sigma = 0.001`` the ``"dae"`` prefactor is ~8e5, so a 128x128 scene
+    sits at ``E ~ 7e9`` where float32's spacing is already ~512.  Perturb one
+    pixel by a real 8 nats of energy and the subtraction returns **0.0** -- an
+    accept ratio quantised to nothing.  Subtracting the per-pixel level first
+    keeps the total near zero and recovers it to a part in 600.
+    """
+    from rubin_host_prior.nn.ncsnpp import scalar_energy
+
+    tau, sigma, baseline = 0.9, 0.001, 1.0
+    prefactor = (tau**2 + sigma**2) / sigma**2
+    base = (baseline + 1e-4 * jax.random.normal(jax.random.key(0), (1, 128, 128)))
+    base = base.astype(jnp.float32)
+    bumped = base.at[0, 64, 64].add(1e-5)
+    assert float(scalar_energy(base, sigma, "dae", tau)) > 1e9
+
+    # float64, from the same float32 inputs: the answer the sampler wants.
+    sq = lambda a: (np.asarray(a).astype(np.float64) ** 2).sum()
+    want = 0.5 * prefactor * (sq(bumped) - sq(base))
+    assert want == pytest.approx(8.1, rel=0.05)
+
+    at = lambda off: float(scalar_energy(bumped, sigma, "dae", tau, off)
+                           - scalar_energy(base, sigma, "dae", tau, off))
+    assert at(0.0) == 0.0
+    assert at(0.5 * prefactor * baseline**2) == pytest.approx(want, rel=1e-2)
+
+
 def test_both_energy_forms_descend_and_sum_descends_faster(energy_config):
     """Both train; ``"sum"`` gets further from a random init.
 

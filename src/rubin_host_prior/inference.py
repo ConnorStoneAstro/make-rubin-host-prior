@@ -54,8 +54,8 @@ def _score(model, x, sigma):
 
 
 @eqx.filter_jit
-def _energy(model, x, sigma):
-    return jax.vmap(lambda a, s: model(a, s))(x, sigma)
+def _energy(model, x, sigma, pixel_offset):
+    return jax.vmap(lambda a, s: model(a, s, pixel_offset))(x, sigma)
 
 
 @dataclass(frozen=True)
@@ -158,7 +158,8 @@ class Prior:
         return s.reshape(shape)
 
     def energy(
-        self, x: Float[Array, "..."], sigma: float | None = None
+        self, x: Float[Array, "..."], sigma: float | None = None,
+        pixel_offset: float = 0.0,
     ) -> Float[Array, "..."]:
         """``E(x, sigma)``, a scalar per scene, with ``score == -grad_x E``.
 
@@ -166,6 +167,12 @@ class Prior:
         accept/reject step is on the Hamiltonian, so it wants the potential
         itself and not only its gradient.  Up to an additive constant that is
         pure gauge, ``-energy`` is the unnormalised log density.
+
+        ``pixel_offset`` is subtracted from each pixel's contribution before
+        they are summed -- a per-pixel energy level, a function of sigma
+        alone, so it changes nothing but the constant.  It is how a sampler
+        keeps the total inside float32's useful range; see
+        ``nn.ncsnpp.scalar_energy``.
         """
         if not self.is_energy:
             raise TypeError(
@@ -176,17 +183,19 @@ class Prior:
                 f"if you need a potential, e.g. for HMC's accept/reject step."
             )
         batched, shape = self._as_batch(x)
-        e = _energy(self.model, batched, self._sigmas(sigma, len(batched)))
+        e = _energy(self.model, batched, self._sigmas(sigma, len(batched)),
+                    jnp.asarray(pixel_offset))
         return e[0] if len(shape) < 4 else e
 
-    def log_prob(self, x, sigma: float | None = None):
+    def log_prob(self, x, sigma: float | None = None, pixel_offset: float = 0.0):
         """``-energy``: the unnormalised log density, up to an additive constant.
 
         Not a normalised log probability and it does not pretend to be -- the
         partition function is not available.  Differences between scenes at the
-        same sigma are meaningful; the absolute value is not.
+        same sigma are meaningful; the absolute value is not.  ``pixel_offset``
+        moves the constant and nothing else, see ``energy``.
         """
-        return -self.energy(x, sigma)
+        return -self.energy(x, sigma, pixel_offset)
 
     def sample(
         self, key: PRNGKeyArray, n: int = 1, sampler: str = "pflow", **kwargs

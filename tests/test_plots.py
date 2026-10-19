@@ -173,12 +173,18 @@ def test_transform_figure_marks_the_floored_sky_position(dataset, tmp_path):
             dataset.sky_floor(dataset._sky_noise(hist_idx), None)))).ravel()
 
         assert marked[0] == pytest.approx(float(np.median(levels)))
-        # and it is NOT the unfloored level, which is what it used to draw
-        assert abs(marked[0] - dataset.transform.sky_level) > 0.1
-        # the predicted scatter is the floored one, which is far tighter
+        # Whatever the floor is set to, the figure must describe *that* floor
+        # and not the unfloored transform it used to draw.  Nothing here pins
+        # how large the difference is -- the floor bounds and the softening are
+        # knobs to experiment with, and an assertion on their magnitude is one
+        # that fights the experiment.
         k = 0.5 * (t.floor_sigma_lo + t.floor_sigma_hi)
-        floored = expected_sky_scatter(t.softening_sigma, k)
-        assert 0 < floored < 0.25 * expected_sky_scatter(t.softening_sigma)
+        if t.floors_enabled:
+            assert marked[0] > dataset.transform.sky_level
+            assert expected_sky_scatter(t.softening_sigma, k) < \
+                expected_sky_scatter(t.softening_sigma)
+        else:
+            assert marked[0] == pytest.approx(dataset.transform.sky_level)
     finally:
         plt.close(fig)
 

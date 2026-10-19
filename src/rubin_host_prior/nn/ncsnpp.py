@@ -595,22 +595,48 @@ class NCSNpp(eqx.Module):
         }
 
 
-def scalar_energy(
+def energy_map(
     h: Float[Array, "c h w"], sigma: Float[Array, ""], form: str,
     data_std: float,
+) -> Float[Array, "c h w"]:
+    """The per-pixel contributions whose sum is ``scalar_energy``.
+
+    Named to match ``ConvEnergyNet.energy_map``, and split out for the same two
+    reasons: it is the natural diagnostic -- where in the scene the energy is
+    coming from -- and it is where ``scalar_energy`` subtracts its offset, one
+    pixel at a time, before anything is added up.
+    """
+    sigma = jnp.asarray(sigma)
+    if form == "sum":
+        return h / sigma
+    if form == "dae":
+        return 0.5 * (data_std**2 + sigma**2) / sigma**2 * h**2
+    raise ValueError(f"energy_form must be 'sum' or 'dae', got {form!r}")
+
+
+def scalar_energy(
+    h: Float[Array, "c h w"], sigma: Float[Array, ""], form: str,
+    data_std: float, pixel_offset: Float[Array, ""] | float = 0.0,
 ) -> Float[Array, ""]:
     """Turn an NCSN++ output map into a scalar energy.
 
     Separated from the module so the two formulas can be checked against
     analytic cases without a network in the way -- which is how the ``"dae"``
     prefactor is pinned (see ``NCSNppEnergy``).
+
+    ``pixel_offset`` comes off every pixel's contribution *before* the sum:
+    ``E = sum(energy_map - pixel_offset)``.  A sampler passes the typical
+    per-pixel energy at this sigma, and gets back a total small enough for
+    float32 to resolve the O(1) differences a Metropolis test is made of --
+    the raw ``"dae"`` total runs to ~1e7 at small sigma, where float32 spacing
+    is already ~1, so the accept ratio is quantised to noise.  Subtracting
+    after the sum recovers none of that; the precision is lost in the adding.
+
+    Any offset that depends on sigma alone shifts every scene at that sigma by
+    the same constant, which is the gauge freedom an unnormalised energy
+    already has.  Differences, gradients and accept ratios are untouched.
     """
-    sigma = jnp.asarray(sigma)
-    if form == "sum":
-        return jnp.sum(h) / sigma
-    if form == "dae":
-        return 0.5 * (data_std**2 + sigma**2) / sigma**2 * jnp.sum(h**2)
-    raise ValueError(f"energy_form must be 'sum' or 'dae', got {form!r}")
+    return jnp.sum(energy_map(h, sigma, form, data_std) - pixel_offset)
 
 
 class NCSNppEnergy(EnergyModel):
@@ -715,10 +741,12 @@ class NCSNppEnergy(EnergyModel):
         self.data_std = float(data_std)
 
     def __call__(
-        self, x: Float[Array, "c h w"], sigma: Float[Array, ""]
+        self, x: Float[Array, "c h w"], sigma: Float[Array, ""],
+        pixel_offset: Float[Array, ""] | float = 0.0,
     ) -> Float[Array, ""]:
         return scalar_energy(self.net(x, sigma), sigma,
-                             self.net.config.energy_form, self.data_std)
+                             self.net.config.energy_form, self.data_std,
+                             pixel_offset)
 
     # -- interface ---------------------------------------------------------
 

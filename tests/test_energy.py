@@ -102,6 +102,27 @@ def test_sigma_conditioning_is_spatially_constant():
     assert abs(diff.flat[0]) > 0, "sigma has no effect at all"
 
 
+def test_a_pixel_offset_shifts_the_energy_and_leaves_the_score_alone(tiny_model):
+    """The same contract ``NCSNppEnergy`` honours, so a sampler can pass the
+    argument without first asking which architecture it has.
+
+    The offset is quoted on the energy as returned, so it comes off the raw
+    map scaled by sigma -- the test is on the returned number, which is the
+    only place the difference would show.
+    """
+    x = jax.random.normal(jax.random.key(11), (1, 20, 20))
+    sigma, k = jnp.asarray(0.5), 0.3
+    n = tiny_model.energy_map(x, sigma).size
+
+    plain = float(tiny_model(x, sigma))
+    assert float(tiny_model(x, sigma, 0.0)) == plain  # the default is untouched
+    assert plain - float(tiny_model(x, sigma, k)) == pytest.approx(k * n, rel=1e-4)
+
+    grad = lambda off: jax.grad(lambda a: tiny_model(a, sigma, off))(x)
+    np.testing.assert_allclose(np.asarray(grad(0.0)), np.asarray(grad(k)),
+                               atol=1e-6)
+
+
 def test_energy_depends_on_sigma(tiny_model):
     x = jax.random.normal(jax.random.key(6), (1, 20, 20))
     values = [float(tiny_model(x, jnp.asarray(s))) for s in (0.05, 0.5, 5.0)]

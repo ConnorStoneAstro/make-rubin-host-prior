@@ -75,7 +75,17 @@ hosts:
 #
 # NO_DATA is deliberately not a zero-tolerance plane: it is measured from the
 # inf-variance fraction instead, and having both meant the stricter always won
-# and max_no_data never did anything.
+# and max_no_data never did anything.  The tolerance is 0, which rejects the
+# same stamps a plane would -- but keeping it a *number* is what lets a later
+# run loosen it, and what lets the loader's patch.max_no_data re-cut a set that
+# was collected under a different one.
+#
+# Why zero.  DP2 writes no sentinel at a no-data pixel: measured over 1093
+# flagged stamps, not one is exactly 0.0 or non-finite, and the values there
+# are ordinary negatives between -5 and -18 sigma that overlap the real sky's
+# own tail.  So nothing downstream can find them in the image, and nothing can
+# inpaint them.  Rejecting at the gate is the only exact cut; on a 32,785-stamp
+# set it costs 3.3%.
 #
 # The depth thresholds are set for shallow, ragged coverage.  Early DP2 outside
 # the deep fields runs one visit per cell, where a single-visit difference
@@ -91,7 +101,7 @@ patches:
     COSMIC_RAY: 0.01
     INTERPOLATED: 0.001
   inner_fraction: 0.34
-  max_no_data: 0.02
+  max_no_data: 0.0
   max_inner_no_data: 0.0
   max_cell_depth_ratio: 3.5
   max_variance_step: null

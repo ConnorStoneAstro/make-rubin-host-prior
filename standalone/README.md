@@ -47,6 +47,25 @@ model was trained on is part of the operator rather than a window onto it.
 `prior.size` is that grid. Nothing here stops you evaluating on another one;
 the result simply means nothing.
 
+## The energy is large, and float32 is not
+
+`energy` and `log_prob` take a `pixel_offset`, subtracted from every pixel's
+contribution *before* they are summed. You want it. Under `energy_form="dae"`
+the prefactor goes as `1/sigma^2`, so a 128x128 scene at `sigma = 1e-3` sits at
+`E ~ 7e9`, where float32's spacing between neighbouring values is already ~500.
+Two scenes that genuinely differ by 8 nats then subtract to exactly `0.0`, and
+a Metropolis ratio built on that is accepting on rounding.
+
+```python
+k = prior.energy(reference, sigma) / n_pixels    # once per sigma
+u = prior.energy(x, sigma, pixel_offset=k)       # O(1), and resolved
+```
+
+Any `k` that depends on sigma alone shifts every scene at that sigma by the
+same `n_pixels * k`, which is the additive constant an unnormalised energy has
+anyway: differences, ratios and `score` are all untouched. Subtracting after
+the sum recovers nothing — the precision is lost in the adding, not the result.
+
 ## Keeping it in step with the trainer
 
 `host_prior/_net.py` is **generated**, byte for byte, from

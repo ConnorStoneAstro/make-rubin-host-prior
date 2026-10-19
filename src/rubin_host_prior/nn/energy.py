@@ -223,17 +223,29 @@ class ConvEnergyNet(EnergyModel):
         return total
 
     def __call__(
-        self, x: Float[Array, "c h w"], sigma: Float[Array, ""]
+        self, x: Float[Array, "c h w"], sigma: Float[Array, ""],
+        pixel_offset: Float[Array, ""] | float = 0.0,
     ) -> Float[Array, ""]:
+        """The scalar energy: ``energy_map`` summed, less ``pixel_offset`` a cell.
+
+        ``pixel_offset`` is a level on the energy *as returned*, subtracted
+        cell by cell before the sum so that float32 keeps the differences a
+        sampler cares about -- see ``nn.ncsnpp.scalar_energy``, which carries
+        the full argument.  The default zero leaves the arithmetic exactly as
+        it was.
+        """
         sigma = jnp.asarray(sigma)
-        e = jnp.sum(self.energy_map(x, sigma))
         if self.config.sigma_scaling == "inverse_sigma":
             # A reparameterisation, not a change to the loss or to the exactness
             # of the score: E = E~ / sigma makes grad(E~) ~ epsilon at every noise
             # level, so one set of weights does not have to span decades of score
             # magnitude.  Set sigma_scaling="none" for the unmodified energy.
-            e = e / sigma
-        return e
+            #
+            # The offset is quoted on E, not on E~, so it comes off the raw map
+            # scaled by sigma -- which is also where the cancellation has to
+            # happen to be worth anything.
+            return jnp.sum(self.energy_map(x, sigma) - pixel_offset * sigma) / sigma
+        return jnp.sum(self.energy_map(x, sigma) - pixel_offset)
 
     # -- reporting ---------------------------------------------------------
 

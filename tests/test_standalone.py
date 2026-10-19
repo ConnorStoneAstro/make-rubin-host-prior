@@ -90,6 +90,11 @@ def test_both_loaders_give_identical_numbers(standalone_loader, tmp_path,
     if full.is_energy:
         np.testing.assert_array_equal(np.asarray(lean.energy(x, 0.7)),
                                       np.asarray(full.energy(x, 0.7)))
+        # The offset too: it is an inference-side argument, so this is the
+        # only place the two implementations of it meet.
+        np.testing.assert_array_equal(
+            np.asarray(lean.energy(x, 0.7, pixel_offset=0.25)),
+            np.asarray(full.energy(x, 0.7, pixel_offset=0.25)))
     np.testing.assert_array_equal(
         np.asarray(lean.sample(jax.random.key(0), n=2, n_steps=4)),
         np.asarray(full.sample(jax.random.key(0), n=2, n_steps=4)))

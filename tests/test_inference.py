@@ -75,6 +75,24 @@ def test_shapes_come_back_as_they_went_in(prior, shape, energy_shape):
     assert np.shape(prior.log_prob(x)) == energy_shape
 
 
+def test_the_pixel_offset_reaches_the_model_through_both_wrappers(prior):
+    """``energy`` and ``log_prob`` thread it to the same place, and the score
+    -- which a sampler is calling in the same loop -- does not change."""
+    x = jnp.asarray(np.random.default_rng(7).normal(3.0, 1.0, (2, 1, SIZE, SIZE)),
+                    jnp.float32)
+    k, n = 0.4, SIZE * SIZE
+
+    plain = np.asarray(prior.energy(x, 1.0))
+    shifted = np.asarray(prior.energy(x, 1.0, pixel_offset=k))
+    np.testing.assert_allclose(plain - shifted, np.full(2, k * n), rtol=1e-4)
+    np.testing.assert_allclose(np.asarray(prior.log_prob(x, 1.0, pixel_offset=k)),
+                               -shifted, rtol=1e-6)
+
+    got = -jax.grad(lambda a: prior.energy(a, 1.0, pixel_offset=k).sum())(x)
+    np.testing.assert_allclose(np.asarray(got), np.asarray(prior.score(x, 1.0)),
+                               atol=1e-6)
+
+
 def test_a_wrong_rank_says_what_it_wanted(prior):
     with pytest.raises(ValueError, match=r"\(H, W\), \(C, H, W\) or"):
         prior.score(jnp.zeros((2, 3, 1, SIZE, SIZE)))

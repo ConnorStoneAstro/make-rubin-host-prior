@@ -603,7 +603,9 @@ def test_the_run_is_described_entirely_by_one_file(tmp_path):
     shipped = ExtractionConfig.load(
         Path(__file__).resolve().parent.parent / "extraction.yaml")
     assert shipped.out and shipped.stamps.bands and shipped.hosts.band == "r"
-    assert shipped.patches.gate_kwargs()["max_no_data"] > 0
+    # Present and settable, not a particular value: the tolerances in this
+    # file are what a run is tuned with.
+    assert "max_no_data" in shipped.patches.gate_kwargs()
 
     path = tmp_path / "e.yaml"
     shipped.save(path)
@@ -667,13 +669,23 @@ def test_describe_shows_which_cut_binds_at_each_size():
     assert rows[0][-1] == "magnitude" and rows[-1][-1] == "brightness"
 
 
-def test_no_data_is_gated_once_not_twice():
-    """It was both a zero-tolerance plane and a measured fraction with a 2%
+def test_no_data_is_gated_by_its_tolerance_and_not_by_a_plane():
+    """It was once both a zero-tolerance plane and a measured fraction with a
     tolerance, so the plane always won and the tolerance never did anything --
-    which on ragged coverage rejected most stamps that clipped a survey edge."""
-    cuts = PatchCuts()
-    assert "NO_DATA" not in cuts.zero_tolerance_planes
-    assert cuts.gate_kwargs()["max_no_data"] > 0
+    which on ragged coverage rejected most stamps that clipped a survey edge.
+
+    The tolerance is 0 now, which rejects the same stamps the plane would, so
+    it would be easy to think the distinction stopped mattering.  It did not:
+    a *settable* tolerance is what lets a future run loosen the cut, and what
+    lets ``patch.max_no_data`` re-cut a set collected under a different one.
+    A zero-tolerance plane would make both unreachable again, so what is
+    asserted is that the number decides -- not what the number currently is,
+    which is a thing to experiment with.
+    """
+    assert "NO_DATA" not in PatchCuts().zero_tolerance_planes
+    assert "max_no_data" in PatchCuts().gate_kwargs()
+    for value in (0.0, 0.02):
+        assert PatchCuts(max_no_data=value).gate_kwargs()["max_no_data"] == value
 
 
 # -- splitting a campaign across jobs ---------------------------------------
