@@ -815,9 +815,28 @@ def test_dataset_refuses_shards_smaller_than_the_config(shard_dir):
 def test_suggest_sigma_range_covers_the_data(shard_dir):
     _, _, ds = _dataset(shard_dir)
     stats = ds.stats(48)
-    lo, hi = suggest_sigma_range(stats)
+    lo, hi = suggest_sigma_range(stats, ds.pair_distances(48))
     assert 0 < lo < stats["sky_scatter"]
     assert hi >= stats["per_patch_range_p99"]
+
+
+def test_the_default_rule_will_not_quietly_fall_back(shard_dir):
+    """No silent return of the number this function used to return.
+
+    The two rules differ by ~sqrt(D), so a call that cannot apply the default
+    one has to say so rather than hand back the other and let a run be
+    configured by whichever branch it happened to take.
+    """
+    _, _, ds = _dataset(shard_dir)
+    stats = ds.stats(48)
+    with pytest.raises(ValueError, match="pair_distances"):
+        suggest_sigma_range(stats)
+    with pytest.raises(ValueError, match="per-pixel"):
+        suggest_sigma_range(stats, rule="root-d")
+    # ... and the old rule is still reachable, by name.
+    _, old = suggest_sigma_range(stats, rule="per-pixel")
+    assert old == pytest.approx(
+        max(2 * stats["std"], stats["per_patch_range_p99"]))
 
 
 # -- correlation length ----------------------------------------------------
@@ -1054,6 +1073,250 @@ def test_small_crops_do_not_wander_off_the_host(shard_dir):
     assert max(corners) - min(corners) <= 2 * 16
     centre = (224 - 48) // 2
     assert abs((max(corners) + min(corners)) / 2 - centre) <= 2
+
+
+def _crop_origin(out: np.ndarray, native_size: int, pool_factor: int) -> tuple[int, int]:
+    """Recover ``(y0, x0)`` from a pooled ramp, which encodes its own position."""
+    # block_mean over a pf x pf block of the ramp y*native + x adds
+    # (pf-1)/2 in each direction.
+    first = out[0, 0] - (pool_factor - 1) / 2.0 * (native_size + 1.0)
+    y0 = int(round(first // native_size))
+    return y0, int(round(first - y0 * native_size))
+
+
+def _shifts(n, *, min_translate, max_translate=None, seed=0, native=224,
+            out_size=16, pool_factor=3, translate=True):
+    from rubin_host_prior.data.pooling import pool_to_training_grid
+
+    a = np.arange(native * native, dtype=np.float64).reshape(native, native)
+    centre = (native - out_size * pool_factor) // 2
+    rng = np.random.default_rng(seed)
+    got = []
+    for _ in range(n):
+        out = pool_to_training_grid(a, out_size, pool_factor,
+                                    rng=rng if translate else None,
+                                    translate=translate,
+                                    max_translate=max_translate,
+                                    min_translate=min_translate)
+        y0, x0 = _crop_origin(out, native, pool_factor)
+        got.append((y0 - centre, x0 - centre))
+    return np.array(got)
+
+
+def test_a_zero_minimum_shift_is_the_draw_the_loader_always_made():
+    """Byte for byte, including the rng stream.
+
+    The minimum is new and the maximum is not, so the whole feature has to be
+    invisible when it is switched off -- otherwise every config written before
+    it trains on a different dataset than it used to.
+    """
+    a = _shifts(200, min_translate=0, max_translate=16, seed=7)
+    b = _shifts(200, min_translate=0, max_translate=16, seed=7)
+    np.testing.assert_array_equal(a, b)
+    assert np.abs(a).max() <= 16
+    # Uniform over the square: the centre is reachable and so are the corners.
+    assert np.hypot(*a.T).min() < 4
+    assert np.abs(a[:, 0]).max() >= 14 and np.abs(a[:, 1]).max() >= 14
+
+
+def test_a_minimum_shift_keeps_the_host_off_centre():
+    """The framing a transient actually has: out from the nucleus, still on the
+    host.  Radius for the floor, per axis for the cap -- so the corners of the
+    box reach ``max * sqrt 2`` and that is deliberate, not a leak."""
+    s = _shifts(600, min_translate=10, max_translate=16, seed=1)
+    r = np.hypot(*s.T)
+    assert r.min() >= 10
+    assert np.abs(s).max() <= 16
+    assert r.max() == pytest.approx(16 * np.sqrt(2), abs=1.5)
+    # Not a ring: the whole annulus is used, not one radius.
+    assert r.std() > 1.0
+
+
+def test_an_un_augmented_crop_stays_in_the_distribution_it_was_trained_on():
+    """With a minimum shift, a centred crop is *outside* the training set.
+
+    So translation off means the nearest allowed position rather than the
+    centre -- otherwise ``validation_batch`` and the diagnostic figures would
+    all be showing a framing the model never sees.  At a zero minimum it is
+    the centre again, which is what it has always been.
+    """
+    off = _shifts(1, min_translate=12, max_translate=16, translate=False)[0]
+    assert np.hypot(*off) >= 12
+    centred = _shifts(1, min_translate=0, max_translate=16, translate=False)[0]
+    np.testing.assert_array_equal(centred, [0, 0])
+
+
+def test_the_shift_bounds_are_a_half_width_and_say_so():
+    """``shift_bounds_native`` is the displacement, not the span.
+
+    It used to be the span and every caller divided by two, which is the sort
+    of thing that reads as correct in four places and is wrong in the fifth.
+    """
+    p = PatchConfig(native_size=512, out_size=128, pool_factor=2)
+    assert p.shift_bounds_native == (0, (512 - 256) // 2)
+    assert "+/-128" in p.shift_note
+
+    capped = PatchConfig(native_size=512, out_size=128, pool_factor=2,
+                         max_shift_native=40, min_shift_native=20)
+    assert capped.shift_bounds_native == (20, 40)
+    assert "20" in capped.shift_note and "40" in capped.shift_note
+
+
+def test_a_minimum_shift_bigger_than_the_stamp_is_refused():
+    with pytest.raises(ValueError, match="min_shift_native"):
+        PatchConfig(native_size=288, out_size=128, pool_factor=2,
+                    min_shift_native=40)  # only +/-16 px of room
+    with pytest.raises(ValueError, match="min_shift_native"):
+        PatchConfig(native_size=512, out_size=128, pool_factor=2,
+                    max_shift_native=10, min_shift_native=30)
+
+
+def test_the_shift_bounds_round_trip_through_a_config_file(tmp_path):
+    c = Config(energy=TINY_ENERGY)
+    c.patch = PatchConfig(native_size=512, out_size=128, pool_factor=2,
+                          min_shift_native=24, max_shift_native=48)
+    c.save(tmp_path / "c.json")
+    back = Config.load(tmp_path / "c.json")
+    assert back.patch.min_shift_native == 24
+    assert back.patch.max_shift_native == 48
+    assert back.patch.shift_bounds_native == (24, 48)
+
+
+def _dataset_with(shard_dir, **patch_kw):
+    """A loader on the synthetic shards with a measured transform."""
+    ss = ShardSet.from_dir(shard_dir)
+    config = Config(energy=TINY_ENERGY,
+                    patch=PatchConfig(native_size=ss.native_size, out_size=16,
+                                      pool_factor=3, **patch_kw))
+    pooled, _ = pool_shards(ss, config)
+    m = measure_transform(ss, config, pooled)
+    config.transform.softening = m["softening"]
+    config.transform.pooled_noise_ratio = m["pooled_noise_ratio"]
+    return PatchDataset.from_shards(
+        ss, config, LogFluxTransform.from_config(config.transform))
+
+
+def test_the_loader_moves_the_host_when_a_minimum_is_set(shard_dir):
+    """End to end: the bright core lands off centre in the images the loader
+    yields, which is the only statement that matters."""
+    def peak_radius(**extra):
+        ds = _dataset_with(shard_dir, **extra)
+        x = ds.make_batch(np.arange(min(24, len(ds))),
+                          rng=np.random.default_rng(0), augment=True)[:, 0]
+        n = x.shape[-1]
+        flat = x.reshape(len(x), -1).argmax(axis=1)
+        dy, dx = np.divmod(flat, n)
+        return np.hypot(dy - (n - 1) / 2, dx - (n - 1) / 2)
+
+    assert peak_radius(min_shift_native=15, max_shift_native=18).mean() > \
+        peak_radius(max_shift_native=0).mean()
+
+
+# -- sigma_max from pairwise distances -------------------------------------
+
+
+def test_pair_distances_measures_every_pair_and_reports_both_units(shard_dir):
+    """The whole-image norm and the per-pixel one, together.
+
+    They differ by ``sqrt(D)`` -- 181 at a 128x128 grid -- and reporting only
+    one of them is how a sigma_max comes to be two orders of magnitude short.
+    """
+    ds = _dataset_with(shard_dir)
+    pairs = ds.pair_distances(n=24, seed=0)
+
+    k = pairs["n_patches"]
+    assert pairs["n_pairs"] == k * (k - 1) // 2
+    assert pairs["dim"] == 16 * 16
+    root_d = np.sqrt(pairs["dim"])
+    assert pairs["max_per_pixel"] == pytest.approx(pairs["max"] / root_d)
+    assert pairs["mean_per_pixel"] == pytest.approx(pairs["mean"] / root_d)
+    assert pairs["min"] <= pairs["percentiles"]["50"] <= pairs["max"]
+    assert pairs["x_min"] < pairs["x_max"]
+    # The point: the whole-image distance is sqrt(D)-ish times the per-pixel
+    # spread, so it dwarfs anything read off a histogram of pixel values.
+    assert pairs["max"] > 4 * (pairs["x_max"] - pairs["x_min"]) / root_d
+
+
+def test_the_pairwise_rule_is_what_sets_sigma_max_when_it_is_asked_for(shard_dir):
+    """Song & Ermon (2020) Technique 1, and the old heuristic beside it.
+
+    Both are kept: the old one is what every config written before this was
+    built from, and a function that quietly returned a number 100x larger
+    would make those runs unreproducible.
+    """
+    from rubin_host_prior.data.dataset import suggest_sigma_range
+
+    ds = _dataset_with(shard_dir)
+    stats, pairs = ds.stats(24), ds.pair_distances(n=24, seed=0)
+
+    _, old = suggest_sigma_range(stats, rule="per-pixel")
+    lo, new = suggest_sigma_range(stats, pairs)
+    assert new == pytest.approx(pairs["max"])
+    assert old == pytest.approx(max(2 * stats["std"], stats["per_patch_range_p99"]))
+    assert new > old                     # the gap this exists to show
+    assert lo < min(old, new)            # sigma_min is untouched by the rule
+
+
+def test_mode_mixing_depends_on_d_over_sigma_and_not_on_dimension():
+    """The load-bearing fact behind ``sigma_max = max pairwise distance``.
+
+    Comparing a *per-pixel* sigma against a *whole-image* distance reads like a
+    unit error.  It is not: what decides whether noise can carry a sample from
+    one scene to another is the log-likelihood ratio between the two Gaussian
+    components, and that is distributed as ``N(-r^2/2, r^2)`` with
+    ``r = d/sigma`` -- no ``D`` anywhere.  An isotropic unit normal projected
+    onto one direction has unit variance however many directions exist, so
+    only the component of the noise along the separation ever matters.
+
+    Measured here across three orders of magnitude in ``D`` so that the rule
+    cannot quietly become dimension-dependent.
+    """
+    rng = np.random.default_rng(0)
+    d = 3.0
+    seen = {}
+    for dim in (64, 1024, 16384):
+        for r in (0.5, 1.0, 4.0):
+            sigma = d / r
+            delta = rng.normal(size=dim)
+            delta *= d / np.linalg.norm(delta)
+            z = rng.normal(size=(4000, dim))
+            ratio = -(z @ delta) / sigma - d**2 / (2 * sigma**2)
+            # The analytic law, which is what the rule rests on.  The mean's
+            # own standard error is r/sqrt(n), so the tolerance has to scale
+            # with r rather than being a fixed number.
+            sem = r / np.sqrt(len(ratio))
+            assert ratio.mean() == pytest.approx(-0.5 * r**2, abs=4 * sem)
+            assert ratio.std() == pytest.approx(r, rel=0.08)
+            seen.setdefault(r, []).append(float(np.mean(ratio > -1.0)))
+
+    # Same r, wildly different D: the same confusability, to sampling error.
+    for r, got in seen.items():
+        assert max(got) - min(got) < 0.03, (r, got)
+
+    # And the criterion itself: at d = sigma the two are substantially
+    # confusable, at d = 4 sigma they are not.
+    assert seen[1.0][0] > 0.5
+    assert seen[4.0][0] < 0.1
+
+
+def test_the_step_count_rule_tightens_with_dimension():
+    """Song & Ermon Technique 2.  The ``sqrt(D)`` that makes ``sigma_max`` large
+    makes the ladder fine, and both come from the same thin shell."""
+    from rubin_host_prior.data import suggest_n_steps
+
+    small = suggest_n_steps(256, 0.03, 10.0)
+    big = suggest_n_steps(16384, 0.03, 10.0)
+    assert 1.0 < big["gamma"] < small["gamma"]
+    assert big["n_steps"] > small["n_steps"]
+
+    # The hand check: at D = 16384 the shell half-width is 3 and the centre
+    # has to sit about 3 sigma out, so sqrt(D) (gamma - 1) ~ 3.
+    assert np.sqrt(16384) * (big["gamma"] - 1.0) == pytest.approx(3.0, abs=0.3)
+
+    # A wider schedule needs more steps at the same gamma, log-linearly.
+    wide = suggest_n_steps(16384, 0.03, 100.0)
+    assert wide["gamma"] == pytest.approx(big["gamma"])
+    assert wide["n_steps"] > big["n_steps"]
 
 
 # -- deep negatives survive the transform ----------------------------------

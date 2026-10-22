@@ -274,7 +274,8 @@ class PatchDataset:
                 rng=rng,
                 translate=translate,
                 scale_jitter=scale_jitter,
-                max_translate=p.max_translate_native,
+                max_translate=p.shift_bounds_native[1],
+                min_translate=p.shift_bounds_native[0],
             )
         return out
 
@@ -462,6 +463,107 @@ class PatchDataset:
         x = self.make_batch(idx, rng=rng, augment=False)[:, 0]
         return correlation_length(x)
 
+    def pair_distances(self, n: int = 512, seed: int = 0) -> dict:
+        """Euclidean distances between random pairs of training images.
+
+        **The standard way to set ``sigma_max``.**  Song & Ermon (2020),
+        *Improved Techniques for Training Score-Based Generative Models*,
+        Technique 1: take ``sigma_max`` to be the maximum pairwise distance
+        between training points.  The argument is about mode coverage.  The
+        reverse process starts at ``t = 1`` from ``N(data, sigma_max^2 I)``, and
+        for that start to be able to reach *any* mode the noise has to be able
+        to carry a sample from one datum to another.  If it cannot, the chain
+        is committed to whichever basin it was initialised near before it has
+        taken a single step, and the model's large-scale structure is decided
+        by the initial draw rather than by the score.
+
+        **Why a per-pixel sigma is compared against a whole-image distance.**
+        It looks like a unit error and it is not.  Take two scenes separated by
+        ``Delta``, ``||Delta|| = d``, and perturb one of them: ``y = x_a +
+        sigma z`` with ``z ~ N(0, I_D)``.  The log-likelihood ratio between the
+        two components at ``y`` is
+
+            log N(y|x_b) - log N(y|x_a)
+                = -<z, Delta> / sigma - d^2 / (2 sigma^2)
+
+        and ``<z, Delta> ~ N(0, d^2)``, because an isotropic unit normal
+        projected onto any one direction has unit variance however many
+        directions there are.  So the ratio is distributed as
+        ``N(-r^2/2, r^2)`` with ``r = d / sigma`` -- **a function of ``d/sigma``
+        alone, with no ``D`` in it at all.**  The noise is isotropic in ``D``
+        dimensions, but only its one-dimensional projection onto the separation
+        can tell the two scenes apart, and that projection has spread ``sigma``
+        whatever ``D`` is.  Mixing needs the ratio to be ``O(1)``, i.e.
+        ``sigma >~ d``, and ``sigma_max ~ d_max`` is the exact criterion rather
+        than a loose bound.  ``tests/test_data.py`` pins the independence.
+
+        Where ``D`` *does* enter is how big ``d`` is for a given per-pixel
+        spread: ``d ~ sqrt(2 D) s`` if the pixels are independent, so a 128x128
+        patch multiplies per-pixel intuition by ~180.  That is why a
+        ``sigma_max`` read off a histogram of pixel values is short, and why
+        the same factor cannot be recovered by taking "a multiple of the
+        brightest pixel" unless the multiple is itself ``~sqrt(D)``.  Real
+        scenes are correlated -- see ``correlation_length`` -- so the effective
+        count of independent directions is well below ``D`` and ``d`` falls
+        short of ``sqrt(2 D) s``.  Measuring it is the point: the correlations
+        are exactly what a dimensional argument cannot supply.
+
+        Reported alongside is the same distance divided by ``sqrt(D)`` -- the
+        per-pixel rms difference between two scenes -- because that is the
+        number that can be compared against ``data_std`` and the sky scatter,
+        and keeping both in view is what stops the two being confused.
+
+        One caveat worth keeping in view: Technique 1 models the data as an
+        empirical set of isolated points, and ``d_max`` is then the width of
+        the whole set.  Galaxy scenes are a connected distribution rather than
+        a handful of Diracs, so the strict maximum is the conservative end of
+        the range and a high percentile is defensible; ``p99`` is reported for
+        that reason.  Going lower than that is where the mode-coverage
+        argument starts to bite.
+        """
+        rng = np.random.default_rng(seed)
+        k = min(n, len(self))
+        idx = np.sort(rng.choice(len(self), size=k, replace=False))
+        x = self.make_batch(idx, rng=rng, augment=False)[:, 0]
+        flat = x.reshape(len(x), -1).astype(np.float64)
+        dim = flat.shape[1]
+
+        # Centred first.  ``x`` is absolute log flux, so it sits near +3 and
+        # ||x||^2 is ~50x the squared distances being read off it; the Gram
+        # identity below is a difference of those, and subtracting the mean --
+        # which moves no pair relative to another -- is what keeps the
+        # cancellation from eating the answer.
+        flat = flat - flat.mean()
+
+        # Every unordered pair of the sample, not a random subset of them: at
+        # n = 512 that is 130k distances for the price of one matrix, and the
+        # maximum is the statistic most sensitive to how many pairs you look
+        # at, so it is worth taking all of them.
+        sq = np.sum(flat**2, axis=1)
+        d2 = sq[:, None] + sq[None, :] - 2.0 * (flat @ flat.T)
+        iu = np.triu_indices(len(flat), k=1)
+        d = np.sqrt(np.maximum(d2[iu], 0.0))
+        return {
+            "n_patches": int(k),
+            "n_pairs": int(d.size),
+            "dim": int(dim),
+            "mean": float(d.mean()),
+            "std": float(d.std()),
+            "max": float(d.max()),
+            "min": float(d.min()),
+            "percentiles": {
+                str(q): float(np.percentile(d, q)) for q in (50, 90, 99)
+            },
+            # Per-pixel rms difference: distance / sqrt(D).  Comparable with
+            # data_std and sky_scatter; the raw distance is not.
+            "max_per_pixel": float(d.max() / np.sqrt(dim)),
+            "mean_per_pixel": float(d.mean() / np.sqrt(dim)),
+            # The largest value the loader emits, which is the other thing
+            # sigma has to be able to move across.
+            "x_max": float(x.max()),
+            "x_min": float(x.min()),
+        }
+
     def stats(self, n: int = 512, seed: int = 0) -> dict:
         """Summary of the log-space data. Read this before setting sigma_min/max."""
         rng = np.random.default_rng(seed)
@@ -518,21 +620,114 @@ class PatchDataset:
         }
 
 
-def suggest_sigma_range(stats: dict, sky_scatter_hint: float | None = None) -> tuple[float, float]:
-    """Heuristic ``(sigma_min, sigma_max)`` from ``PatchDataset.stats``.
+def suggest_sigma_range(
+    stats: dict,
+    pairs: dict | None = None,
+    sky_scatter_hint: float | None = None,
+    rule: str = "pairs",
+) -> tuple[float, float]:
+    """``(sigma_min, sigma_max)`` from ``PatchDataset.stats``.
 
-    ``sigma_max`` must dominate the data's own scale or the ``t = 1`` marginal is
-    not really Gaussian and sampling starts from the wrong distribution.
-    ``sigma_min`` should sit comfortably below the sky scatter in log space,
-    since below that the score is dominated by the noise the data already
-    contains and there is nothing left to learn.
+    ``sigma_min`` sits comfortably below the sky scatter in log space, since
+    below that the score is dominated by the noise the data already contains
+    and there is nothing left to learn.  That end has never been in doubt.
+
+    ``sigma_max`` is **the largest distance between two training images**:
+    Song & Ermon (2020) Technique 1, which wants ``pairs`` from
+    ``PatchDataset.pair_distances``.  That is the condition for the ``t = 1``
+    marginal to bridge between modes, and ``pair_distances`` carries the
+    derivation -- including why a per-pixel ``sigma`` is legitimately compared
+    against a whole-image distance, which looks like a unit error and is not.
+
+    ``rule="per-pixel"`` returns the old ``max(2 std, per-patch range)``.  It is
+    kept only to rebuild a config written before this, and it is wrong: it
+    compares ``sigma``, which is added to every pixel independently, against
+    the spread of a *single* pixel.  It therefore misses the whole ``sqrt(D)``
+    between a per-pixel scale and a whole-image one -- a factor of 181 on a
+    128x128 grid -- and the symptom is a model that reproduces texture and
+    small sources while **omitting structure above some size entirely**.  That
+    is the mechanism in ``plots.schedule_headroom``: a Fourier mode of power
+    ``P`` survives to ``t = 1`` whenever ``P > sigma_max^2``, and a mode that
+    survives is one the sampler is never asked to build, because
+    ``VESDE.prior_sample`` starts from white noise that does not contain it.
+    The deficit is a floor of ``1/sqrt(1 + P/sigma_max^2)`` on that mode's rms
+    and no amount of training removes it.  Coarse scales hold the most power
+    per mode, so they go first -- big objects, missing.
+
+    There is deliberately **no silent fallback**: asking for the default rule
+    without the measurement raises rather than quietly returning the number
+    this function used to return.
     """
-    sigma_max = float(max(2.0 * stats["std"], stats["per_patch_range_p99"]))
+    if rule not in ("pairs", "per-pixel"):
+        raise ValueError(
+            f"rule must be 'pairs' or 'per-pixel', got {rule!r}")
+    if rule == "pairs":
+        if pairs is None:
+            raise ValueError(
+                "rule='pairs' needs a PatchDataset.pair_distances() result. "
+                "Pass pairs=dataset.pair_distances(), or ask for "
+                "rule='per-pixel' to reproduce a config written before the "
+                "pairwise rule -- which under-sets sigma_max by ~sqrt(D) and "
+                "drops structure above some size from the samples."
+            )
+        sigma_max = float(pairs["max"])
+    else:
+        sigma_max = float(max(2.0 * stats["std"], stats["per_patch_range_p99"]))
     floor = sky_scatter_hint
     if floor is None:
         floor = stats.get("sky_scatter", stats["std"])
     sigma_min = float(max(1e-3, 0.05 * floor))
     return sigma_min, sigma_max
+
+
+def suggest_n_steps(
+    dim: int, sigma_min: float, sigma_max: float, overlap: float = 0.5
+) -> dict:
+    """The fewest sampler steps the schedule can be crossed in.
+
+    Song & Ermon (2020) Technique 2, the companion to the ``sigma_max`` rule in
+    ``suggest_sigma_range``.  Two adjacent noise levels in a geometric ladder
+    differ by a ratio ``gamma``, and for a sample annealed down the ladder to
+    stay in the typical set of the next level the two marginals have to
+    overlap.  In ``D`` dimensions the perturbed data concentrates on a thin
+    shell of radius ``sigma sqrt(D)``, and the shells for ``sigma`` and
+    ``gamma sigma`` overlap in the fraction
+
+        Phi(sqrt(D) (gamma - 1) + 3 gamma) - Phi(sqrt(D) (gamma - 1) - 3 gamma)
+
+    which the paper asks to be about ``1/2``.  Solving it for ``gamma`` and
+    taking ``log(sigma_max / sigma_min) / log(gamma)`` gives the step count.
+
+    The ``sqrt(D)`` is the same factor that makes ``sigma_max`` large, acting
+    the other way: high dimension makes the shells thin, so the ladder has to
+    be fine.  At a 128x128 grid ``gamma`` comes out near 1.02, which is a few
+    hundred steps across a realistic range -- more than a sampler default of
+    128 or 256 supplies, and a sampler that takes too few steps produces
+    exactly the blurred, structureless draws that a too-small ``sigma_max``
+    does.  The two failures look alike and this separates them.
+    """
+    from math import erf, log, sqrt
+
+    root_d = sqrt(float(dim))
+    phi = lambda z: 0.5 * (1.0 + erf(z / sqrt(2.0)))
+    mass = lambda g: phi(root_d * (g - 1.0) + 3.0 * g) - phi(
+        root_d * (g - 1.0) - 3.0 * g)
+
+    # mass is 1 at gamma = 1 and falls monotonically; bisect for the crossing.
+    lo, hi = 1.0, 2.0
+    while mass(hi) > overlap and hi < 1e6:
+        hi *= 2.0
+    for _ in range(200):
+        mid = 0.5 * (lo + hi)
+        if mass(mid) > overlap:
+            lo = mid
+        else:
+            hi = mid
+    gamma = 0.5 * (lo + hi)
+    span = log(max(sigma_max, 1e-30) / max(sigma_min, 1e-30))
+    n = span / log(gamma) if gamma > 1.0 else float("inf")
+    return {"gamma": float(gamma), "n_steps": int(np.ceil(max(n, 1.0))),
+            "overlap": float(overlap), "dim": int(dim)}
 
 
 def pool_shards(

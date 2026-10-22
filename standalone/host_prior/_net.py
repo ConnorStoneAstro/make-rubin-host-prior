@@ -578,7 +578,7 @@ class NCSNpp(eqx.Module):
             f"{'at the bottleneck' if cfg.attention else 'off'}",
             f"  progressive in/out {cfg.progressive_input}/{cfg.progressive}, "
             f"{resample} resampling, host free to move "
-            f"+/-{config.patch.max_translate_native // 2} native px",
+            f"{config.patch.shift_note}",
             f"  sigma -> t in [0, 1] over [{np.exp(self.log_sigma_min):.4g}, "
             f"{np.exp(self.log_sigma_max):.4g}], fourier_scale "
             f"{cfg.fourier_scale}",

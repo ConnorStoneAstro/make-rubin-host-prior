@@ -266,7 +266,7 @@ class ConvEnergyNet(EnergyModel):
             lines.append(
                 f"  grid {size} ({size * config.patch.pool_factor} native), "
                 f"loss on {size - 2 * margin}, host free to move "
-                f"+/-{config.patch.max_translate_native // 2} native px"
+                f"{config.patch.shift_note}"
             )
         return "\n".join(lines)
 

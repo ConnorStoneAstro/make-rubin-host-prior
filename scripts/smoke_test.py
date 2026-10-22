@@ -116,7 +116,11 @@ def main() -> None:
     transform = LogFluxTransform.from_config(config.transform)
     dataset = PatchDataset.from_shards(shards, config, transform)
     stats = dataset.stats(128)
-    config.sde.sigma_min, config.sde.sigma_max = suggest_sigma_range(stats)
+    # The pairwise rule, same as prepare_config: a smoke test that set up its
+    # schedule by a different rule than a real run would stop being a smoke
+    # test of the real run.
+    config.sde.sigma_min, config.sde.sigma_max = suggest_sigma_range(
+        stats, dataset.pair_distances(128))
     # x is absolute log flux, so the data is not centred on zero and the t=1
     # marginal is not either.
     config.sde.data_mean = float(stats["mean"])

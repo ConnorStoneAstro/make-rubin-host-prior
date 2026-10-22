@@ -1,5 +1,10 @@
 from .augment import N_DIHEDRAL, dihedral, random_dihedral
-from .dataset import PatchDataset, pool_shards, suggest_sigma_range
+from .dataset import (
+    PatchDataset,
+    pool_shards,
+    suggest_n_steps,
+    suggest_sigma_range,
+)
 from .pool import ShardPool, prefetch
 from .diagnostics import autocorrelation, reach_advice, correlation_length
 from .pooling import area_resample, block_mean, center_crop, pool_to_training_grid
@@ -34,5 +39,6 @@ __all__ = [
     "expected_sky_scatter",
     "pool_to_training_grid",
     "random_dihedral",
+    "suggest_n_steps",
     "suggest_sigma_range",
 ]

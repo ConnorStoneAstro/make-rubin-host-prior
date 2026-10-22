@@ -353,8 +353,14 @@ class SDEConfig:
     #: Below the sky scatter in x, where the score is dominated by noise the
     #: data already contains.
     sigma_min: float | None = None
-    #: Must dominate the data's own spread, or the ``t = 1`` marginal is not
-    #: really Gaussian and sampling starts from the wrong distribution.
+    #: The largest distance between two training images, measured by
+    #: ``PatchDataset.pair_distances`` -- Song & Ermon (2020) Technique 1, and
+    #: what ``prepare_config.py`` writes here.  Not "a few times the per-pixel
+    #: spread": that comparison is short by ``sqrt(D_eff)``, and the symptom of
+    #: setting it that way is a model that renders texture and small sources
+    #: faithfully while **omitting structure above some size** -- see
+    #: ``data.dataset.suggest_sigma_range`` and the floor column in
+    #: ``plots.schedule_headroom``.
     sigma_max: float | None = None
     #: Mean of ``x`` over the training set.  VE does not move the mean, so the
     #: ``t = 1`` marginal is centred here and ``prior_sample`` has to start from
@@ -525,12 +531,52 @@ class PatchConfig:
     #: so this costs nothing in accuracy -- which is only true because the loss
     #: is cropped; a full-field loss makes different sizes fight each other.
     out_sizes: tuple[int, ...] = ()
+    #: How far the crop may sit from the stamp centre, in **native** pixels of
+    #: displacement, as ``(min_shift_native, max_shift_native)``.
+    #:
+    #: Every stamp is cut centred on its host, so this is the knob that says
+    #: where the host lands in the training image.  ``max_shift_native = None``
+    #: means all the room the stamp has, which is the historical behaviour and
+    #: the right answer for a prior over host scenes: the host wanders, and the
+    #: network cannot score well by learning "bright blob in the middle".
+    #:
+    #: ``min_shift_native`` is the other end, and it is why these are settable
+    #: at all.  A transient does not go off in the nucleus and it does not go
+    #: off in empty sky; it goes off some way out on its host.  Setting a
+    #: minimum builds a training set framed that way -- the host displaced by
+    #: between the two bounds -- which is a different prior from the one over
+    #: host scenes and wants its own run.  Set the minimum to zero and this
+    #: file describes exactly the dataset it always did.
+    #:
+    #: The minimum is a radius and the maximum is per axis; see
+    #: ``pooling.pool_to_training_grid`` for why each takes the shape it does.
+    min_shift_native: int = 0
+    max_shift_native: int | None = None
 
     def __post_init__(self) -> None:
+        # Size first: the shift bounds are derived from nominal_crop, so a
+        # patch that does not fit its stamp would report a nonsense budget and
+        # complain about the wrong field.
         if self.native_size < self.nominal_crop:
             raise ValueError(
                 f"native_size ({self.native_size}) must be >= nominal_crop "
                 f"({self.out_size} * {self.pool_factor} = {self.nominal_crop})"
+            )
+        lo, hi = self.shift_bounds_native
+        if self.min_shift_native < 0:
+            raise ValueError(
+                f"min_shift_native must be >= 0, got {self.min_shift_native}")
+        if lo > hi:
+            raise ValueError(
+                f"min_shift_native ({self.min_shift_native}) exceeds the "
+                f"{hi} native px of shift available: native_size "
+                f"({self.native_size}) - nominal_crop ({self.nominal_crop}) "
+                f"gives +/-{(self.native_size - self.nominal_crop) // 2}"
+                + (f", capped to {self.max_shift_native} by max_shift_native"
+                   if self.max_shift_native is not None
+                   and self.max_shift_native <
+                   (self.native_size - self.nominal_crop) // 2 else "")
+                + ". Cut larger native stamps, or a smaller training crop."
             )
         for s in self.out_sizes:
             if s * self.pool_factor > self.native_size:
@@ -545,18 +591,41 @@ class PatchConfig:
         return self.out_size * self.pool_factor
 
     @property
-    def max_translate_native(self) -> int:
-        """Native-pixel translation room, fixed at the *reference* size.
+    def shift_bounds_native(self) -> tuple[int, int]:
+        """``(min, max)`` displacement of the crop from the stamp centre, native px.
 
-        Back on ``PatchConfig``, where it belongs: with no context border there
-        is nothing outside the crop to keep on the stamp, so this depends on the
-        patch alone and not on the energy's reach.  Smaller training crops leave
-        more room, but letting them wander that far would change the data
+        Fixed at the *reference* size.  With no context border there is nothing
+        outside the crop to keep on the stamp, so this depends on the patch
+        alone and not on the energy's reach.  Smaller training crops leave more
+        room, but letting them wander that far would change the data
         distribution with size -- small patches would mostly land on blank sky
-        away from the host -- so the offset is capped at the reference size's
-        room and every size looks at the same neighbourhood.
+        away from the host -- so every size looks at the reference size's
+        neighbourhood.
+
+        The maximum is a half-width, not a span: at the 512/256 defaults the
+        stamp supplies 256 px of slack and the crop centre moves +/-128.  It
+        used to be the span, with every caller dividing by two, which is one
+        division too many to keep writing out.
         """
-        return max(self.native_size - self.nominal_crop, 0)
+        room = max(self.native_size - self.nominal_crop, 0) // 2
+        hi = room if self.max_shift_native is None else min(
+            room, max(self.max_shift_native, 0))
+        return max(self.min_shift_native, 0), hi
+
+    @property
+    def shift_note(self) -> str:
+        """The shift bounds as a phrase, so every report says the same thing.
+
+        Three of them quote it -- both ``describe`` methods and
+        ``prepare_config`` -- and a framing that is off-centre on purpose is
+        exactly the kind of thing a reader needs told rather than left to infer
+        from a batch figure.
+        """
+        lo, hi = self.shift_bounds_native
+        if lo <= 0:
+            return f"+/-{hi} native px"
+        return (f"{lo}..{hi} native px off centre (radius >= {lo}, "
+                f"per axis <= {hi})")
 
     @property
     def training_sizes(self) -> tuple[int, ...]:
@@ -801,7 +870,7 @@ class Config:
         return out + self._translate_warning()
 
     def _translate_warning(self) -> list[str]:
-        if self.augment.translate and self.patch.max_translate_native == 0:
+        if self.augment.translate and self.patch.shift_bounds_native[1] == 0:
             return [
                 f"translation augmentation has no room: native_size "
                 f"({self.patch.native_size}) equals out_size * pool_factor. "

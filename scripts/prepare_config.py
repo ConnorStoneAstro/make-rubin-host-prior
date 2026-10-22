@@ -40,6 +40,7 @@ from rubin_host_prior.data import (
     expected_sky_scatter,
     pool_shards,
     reach_advice,
+    suggest_n_steps,
     suggest_sigma_range,
 )
 
@@ -101,6 +102,33 @@ def parser() -> argparse.ArgumentParser:
                    help="pooled training patch size; omit to use the config's "
                         "own value. nominal_crop follows as out_size x "
                         "pool_factor")
+    p.add_argument("--min-shift-native", type=int, default=None,
+                   help="smallest allowed displacement of the training crop "
+                        "from the stamp centre, in native px, measured as a "
+                        "radius. The host is cut at the centre, so this frames "
+                        "every patch with the host that far out -- which is "
+                        "how a transient sits on its host, and is the setting "
+                        "for a mock-data model. Omit to use the config's own "
+                        "value (0: crops may be centred)")
+    p.add_argument("--max-shift-native", type=int, default=None,
+                   help="largest allowed displacement per axis, in native px. "
+                        "Omit to use the config's own value (null: all the "
+                        "room the stamp has, (native_size - out_size x "
+                        "pool_factor) / 2)")
+    p.add_argument("--sigma-max-rule", default="pairs",
+                   choices=["pairs", "per-pixel"],
+                   help="how to pick sigma_max when the config does not fix "
+                        "it. 'pairs' is the standard rule (Song & Ermon 2020 "
+                        "Technique 1): the largest distance between two "
+                        "training images, and the default. 'per-pixel' is "
+                        "the old max(2 std, per-patch range), which is "
+                        "~sqrt(D) too small -- it drops structure above some "
+                        "size from the samples -- and is here only to "
+                        "reproduce a config written before")
+    p.add_argument("--n-pairs", type=int, default=512,
+                   help="patches to draw the pairwise distances from; every "
+                        "pair of them is used, so this is ~n^2/2 distances. "
+                        "Not a config field")
     p.add_argument("--n-stats", type=int, default=512,
                    help="patches to measure the statistics from. Not a config "
                         "field: it changes how well this script measures, not "
@@ -126,6 +154,10 @@ def main() -> None:
         config.patch.out_size = args.out_size
     if args.softening_sigma is not None:
         config.transform.softening_sigma = args.softening_sigma
+    if args.min_shift_native is not None:
+        config.patch.min_shift_native = args.min_shift_native
+    if args.max_shift_native is not None:
+        config.patch.max_shift_native = args.max_shift_native
 
     # Measured, like everything below it: the stamps are as big as the
     # extraction made them.  nominal_crop follows from out_size and pool_factor
@@ -138,6 +170,14 @@ def main() -> None:
             f"needs {config.patch.nominal_crop}. Lower --out-size, or extract "
             f"larger stamps."
         )
+    # The geometry above was assigned straight onto the dataclass, which does
+    # not re-run __post_init__, so the check that min_shift_native fits inside
+    # the stamp has to be asked for.  Here, before the minutes of I/O below,
+    # and not at save time: this is where the numbers came from.
+    try:
+        config.patch.__post_init__()
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from exc
     softening_sigma = config.transform.softening_sigma
     # Measured from pooled patches, not derived from the variance plane:
     # coadd pixel noise is correlated, so pooling reduces it by less than
@@ -181,7 +221,9 @@ def main() -> None:
     # and exits, so loading the whole set would be minutes of I/O to throw away.
     dataset = PatchDataset.from_shards(shards, config, transform, in_memory=False)
     stats = dataset.stats(args.n_stats)
-    sigma_min, sigma_max = suggest_sigma_range(stats)
+    pairs = dataset.pair_distances(args.n_pairs)
+    sigma_min, sigma_max = suggest_sigma_range(stats, pairs,
+                                               rule=args.sigma_max_rule)
     if config.sde.sigma_min is None:
         config.sde.sigma_min = round(sigma_min, 5)
     else:
@@ -201,6 +243,10 @@ def main() -> None:
         config.sde.data_mean = round(float(stats["mean"]), 4)
     else:
         kept.append(f"sde.data_mean = {config.sde.data_mean}")
+    # Computed here, printed far below: the JSON summary goes out before the
+    # human-readable report and both quote it.
+    ladder = suggest_n_steps(pairs["dim"], config.sde.sigma_min,
+                             config.sde.sigma_max)
     config.save(args.out)
 
     if kept:
@@ -218,6 +264,8 @@ def main() -> None:
                 "n_patches": len(shards),
                 "patches_per_band": counts,
                 "stats": stats,
+                "pair_distances": pairs,
+                "min_sampler_steps": ladder,
                 "softening_nJy": config.transform.softening,
                 "sigma_min": config.sde.sigma_min,
                 "sigma_max": config.sde.sigma_max,
@@ -282,6 +330,47 @@ def main() -> None:
                else "softening scale is probably wrong.")
         )
 
+    # -- sigma_max, the standard way -------------------------------------
+    #
+    # Reported whichever rule was used, because the two differ by sqrt(D) and
+    # the only way to see that a config is on the wrong side of it is to have
+    # both numbers side by side.
+    per_pixel = float(max(2.0 * stats["std"], stats["per_patch_range_p99"]))
+    root_d = pairs["dim"] ** 0.5
+    print(f"\npairwise distances between training images "
+          f"({pairs['n_pairs']:,} pairs from {pairs['n_patches']} patches, "
+          f"D = {pairs['dim']:,} px):")
+    print(f"  ||x_i - x_j||_2   mean {pairs['mean']:.1f}  "
+          f"std {pairs['std']:.1f}  max {pairs['max']:.1f}")
+    print(f"  per pixel (/{root_d:.0f})   mean "
+          f"{pairs['mean_per_pixel']:.3f}  max {pairs['max_per_pixel']:.3f}"
+          f"   [compare data_std = {config.sde.data_std}]")
+    print(f"  median {pairs['percentiles']['50']:.1f}, "
+          f"p90 {pairs['percentiles']['90']:.1f}, "
+          f"p99 {pairs['percentiles']['99']:.1f}, min {pairs['min']:.1f}")
+    print(f"  loader range: x in [{pairs['x_min']:.2f}, {pairs['x_max']:.2f}]")
+    print(f"  sigma_max by the standard rule (Song & Ermon 2020, Technique 1:")
+    print(f"    the largest pairwise distance) = {pairs['max']:.1f}")
+    print(f"  sigma_max by the old per-pixel heuristic   = {per_pixel:.2f}  "
+          f"(ratio {pairs['max'] / max(per_pixel, 1e-9):.0f}x)")
+    print(f"  in use: {config.sde.sigma_max}")
+    print(f"  steps to cross it (Song & Ermon Technique 2: adjacent levels "
+          f"must overlap)")
+    print(f"    gamma = {ladder['gamma']:.4f} per level  ->  "
+          f"n_steps >= {ladder['n_steps']} from sigma_min "
+          f"{config.sde.sigma_min} to sigma_max {config.sde.sigma_max}")
+    print(f"    the same sqrt(D) the other way round: high dimension makes "
+          f"the shells thin, so the ladder has to be fine")
+    if config.sde.sigma_max and config.sde.sigma_max < 0.5 * pairs["max"]:
+        print(
+            "  WARNING: sigma_max is below half the largest pairwise "
+            "distance. The t=1 marginal then cannot carry a sample from one "
+            "training image to another, so which mode the reverse process "
+            "lands in is decided by the initial draw rather than by the "
+            "score -- which looks exactly like a model with no large-scale "
+            "structure. Clear sde.sigma_max to re-measure."
+        )
+
     from rubin_host_prior import geometry
 
     lo, hi = config.usable_size_range()
@@ -315,8 +404,8 @@ def main() -> None:
               f"the whole scene, so there is no reach to compare with xi")
         print(f"  input centred on {config.input_offset:.2f} so the "
               f"convolutions' zero padding sits at the sky")
-    print(f"  sizes this stamp can serve: {lo} .. {hi}; translation room "
-          f"+/-{config.patch.max_translate_native // 2} native px")
+    print(f"  sizes this stamp can serve: {lo} .. {hi}; crop shift "
+          f"{config.patch.shift_note}")
     for w in config.check_sizes():
         print(f"  WARNING: {w}")
 
@@ -340,11 +429,20 @@ def main() -> None:
               f"{head['headroom'][i]:>9.1f} {head['pflow_ratio'][i]:>7.3f}{flag}")
     worst = min(head["pflow_ratio"])
     if worst < 0.9:
+        band = head["band"][head["pflow_ratio"].index(worst)]
+        hurt = [b for b, f in zip(head["band"], head["pflow_ratio"]) if f < 0.9]
         print(f"\n  WARNING: even a perfect score would reach only "
-              f"{worst:.2f} of the real power at "
-              f"{head['band'][head['pflow_ratio'].index(worst)]} px. Raise "
+              f"{worst:.2f} of the real power at {band} px. Raise "
               f"sde.sigma_max to at least 3x the largest sigma_vis "
               f"({3 * max(head['sigma_visible']):.0f}) and re-measure.")
+        print(f"  What this looks like in the samples: structure at "
+              f"{', '.join(hurt)} px comes out at a fraction of its true "
+              f"amplitude, so **objects above that size are missing from "
+              f"draws although they are plainly in the training data**. The "
+              f"model is not at fault and more training will not fix it -- "
+              f"prior_sample starts from white noise of variance sigma_max^2, "
+              f"the true t=1 marginal has variance P + sigma_max^2, and the "
+              f"shortfall is the initial condition.")
 
     cl = dataset.correlation_length(args.n_stats)
     print(f"\ncorrelation length (pooled, log space, over {cl['n_patches']} patches)")

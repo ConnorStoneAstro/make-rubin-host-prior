@@ -373,7 +373,7 @@ def test_nominal_crop_is_derived_rather_than_stated():
     # when valid convolutions meant the window the crop had to keep inside the
     # stamp included 2R of context per side; same-mode convolutions need no
     # context, so it depends on the patch alone.
-    assert p.max_translate_native == 224 - 192
+    assert p.shift_bounds_native == (0, (224 - 192) // 2)
     with pytest.raises(ValueError, match="native_size .* must be >="):
         PatchConfig(native_size=100, out_size=64, pool_factor=3)
 
@@ -608,14 +608,14 @@ def test_defaults_leave_room_for_translation():
     # 512 - 128*2 = 256 native px, +/-25.6 arcsec.  It matters more than it used
     # to: zero padding lets the network read its distance from the border, so
     # moving the host is what stops it learning position instead of shape.
-    assert c.patch.max_translate_native == 256
+    assert c.patch.shift_bounds_native[1] == 256 // 2
     assert not any("translation" in w for w in c.check_sizes())
 
 
 def test_zero_translation_room_is_reported():
     c = Config(patch=PatchConfig(native_size=384, out_size=128,
                                  pool_factor=3))
-    assert c.patch.max_translate_native == 0
+    assert c.patch.shift_bounds_native[1] == 0
     assert any("no room" in w for w in c.check_sizes())
 
 

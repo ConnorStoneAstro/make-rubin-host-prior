@@ -82,6 +82,40 @@ def center_crop(a: np.ndarray, size: int) -> np.ndarray:
     return crop(a, size, (h - size) // 2, (w - size) // 2)
 
 
+def diagonal_offset(half: int, min_translate: int) -> int:
+    """The smallest ``d >= 0`` with ``hypot(d, d) >= min_translate``, capped at ``half``.
+
+    The deterministic stand-in for a draw from the annulus: the point of the
+    allowed region closest to the stamp centre, on the diagonal.  At
+    ``min_translate == 0`` it is zero, which is the centred crop the loader has
+    always produced when translation is off.
+    """
+    d = int(np.ceil(max(min_translate, 0) / np.sqrt(2.0)))
+    return min(d, max(half, 0))
+
+
+def _annulus_offset(
+    rng: np.random.Generator, half: int, min_translate: int
+) -> tuple[int, int]:
+    """A uniform integer ``(dy, dx)`` in the box of half-width ``half``, outside
+    the disc of radius ``min_translate``.
+
+    Rejection, because the region is a square minus a disc and there is no
+    closed form for the uniform integer draw over it.  ``PatchConfig`` keeps
+    ``min_shift_native <= max_shift_native``, so the disc fits inside the box's
+    inscribed circle and at least ``1 - pi/4 = 21%`` of draws land: 64 tries
+    fail with probability ~1e-7, and the fallback is still inside the region.
+    """
+    r2 = min_translate * min_translate
+    for _ in range(64):
+        dy = int(rng.integers(-half, half + 1))
+        dx = int(rng.integers(-half, half + 1))
+        if dy * dy + dx * dx >= r2:
+            return dy, dx
+    d = diagonal_offset(half, min_translate)
+    return d, d
+
+
 def pool_to_training_grid(
     native: np.ndarray,
     out_size: int,
@@ -90,6 +124,7 @@ def pool_to_training_grid(
     translate: bool = False,
     scale_jitter: float = 0.0,
     max_translate: int | None = None,
+    min_translate: int = 0,
 ) -> np.ndarray:
     """Native stamp(s) -> ``out_size`` training image(s).
 
@@ -102,6 +137,26 @@ def pool_to_training_grid(
     ``max_translate`` caps how far the crop may wander from the stamp centre,
     in native pixels per side.  Without it a small crop would roam over the whole
     stamp; with it every training size looks at the same neighbourhood.
+
+    ``min_translate`` is a *floor* on the same displacement, measured as a
+    radius: the crop centre is drawn from the square of half-width
+    ``max_translate`` with the disc of radius ``min_translate`` punched out.
+    Each bound takes the shape its meaning asks for -- the maximum is per axis,
+    because that is how a crop runs out of stamp, and the minimum is radial,
+    because a square hole would print the pixel axes into the data.  At
+    ``min_translate == 0`` the draw is the plain uniform square it has always
+    been, byte for byte.
+
+    This is what builds a training set whose galaxies are deliberately
+    *off-centre* -- a prior over scenes framed the way a transient is framed,
+    some way out from the nucleus but still on the host.  With ``translate``
+    off the crop sits at the allowed position nearest the centre rather than at
+    the centre itself, so an un-augmented batch is still drawn from the
+    distribution the model was trained on.
+
+    ``min_translate`` is clipped to the room the stamp has; ``PatchConfig``
+    checks the configured value against the reference size and says so there,
+    where the number can be fixed.
 
     **There is no context border.**  There used to be: valid convolutions gave
     a correct score only ``2R`` pixels inside the input, so the loader carried
@@ -137,13 +192,20 @@ def pool_to_training_grid(
         # patches mostly blank sky far from the host -- i.e. a different data
         # distribution at every size, which is not what varying the size is for.
         room = min(room, 2 * max(max_translate, 0))
+    half = room // 2
+    min_translate = min(max(int(min_translate), 0), half)
     if translate and room > 0:
         if rng is None:
             raise ValueError("translate requires an rng")
-        y0 = int(rng.integers(0, room + 1))
-        x0 = int(rng.integers(0, room + 1))
+        if min_translate > 0:
+            dy, dx = _annulus_offset(rng, half, min_translate)
+            y0, x0 = half + dy, half + dx
+        else:
+            y0 = int(rng.integers(0, room + 1))
+            x0 = int(rng.integers(0, room + 1))
     else:
-        y0 = x0 = room // 2
+        d = diagonal_offset(half, min_translate)
+        y0 = x0 = room // 2 + d
     centre_shift = (h - size - room) // 2
     y0 += centre_shift
     x0 += centre_shift
