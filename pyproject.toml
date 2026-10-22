@@ -23,7 +23,12 @@ dependencies = [
 extract = ["pandas", "pyarrow", "astropy", "requests", "pyvo", "pyyaml"]
 # Diagnostic figures. matplotlib is imported lazily, so the package works without it.
 plots = ["matplotlib>=3.5", "pandas", "pyarrow"]
-dev = ["pytest", "matplotlib", "pandas", "pyarrow", "astropy", "requests", "pyyaml"]
+# The post-training two-sample test (scripts/pted_test.py). Imported lazily
+# and its tests skip when it is absent, so the package works without it.
+# Verified against v2.0.0, whose JAX backend is what makes the exact test
+# practical: the samples stay on the device that drew them.
+twosample = ["pted>=2.0"]
+dev = ["pytest", "matplotlib", "pandas", "pyarrow", "astropy", "requests", "pyyaml", "pted>=2.0"]
 
 [tool.setuptools.packages.find]
 where = ["src"]
