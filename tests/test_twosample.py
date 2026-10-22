@@ -232,18 +232,64 @@ def test_the_two_samples_come_back_the_same_shape(run_dir):
     assert got["dim"] == SIZE * SIZE
 
 
-def test_the_data_sample_is_drawn_without_replacement(run_dir):
-    """A permutation test reads duplicated rows as agreement, so the sample
-    has to be distinct scenes and not n draws from a smaller set."""
+def test_the_loader_is_an_infinite_generator_not_a_finite_set(run_dir):
+    """The stored patches are not the training distribution.
+
+    Each stands for eight dihedral images times a continuum of crop offsets,
+    so the loader can produce far more distinct scenes than it holds rows --
+    and the comparison sample must not be capped at the row count, which is a
+    number with nothing to do with the test's resolution.
+    """
     d, c = run_dir
     ss = ShardSet.from_dir(d / "shards")
     ds = PatchDataset.from_shards(
         ss, c, LogFluxTransform.from_config(c.transform))
-    # Asking for more than exists gives the whole set once, not repeats.
+    want = 4 * len(ds)
+    data = twosample.data_sample(ds, want, seed=0)
+    assert len(data) == want > len(ds)
+    # Every one a different image, despite base patches repeating.
+    flat = np.asarray(data).reshape(len(data), -1)
+    assert len(np.unique(flat, axis=0)) == want
+
+
+def test_without_augmentation_the_sample_stays_finite_and_distinct(run_dir):
+    """The exception, and why it is one: with augmentation off a base patch
+    drawn twice is the same image twice, and a permutation test reads exact
+    duplicates as agreement."""
+    d, c = run_dir
+    ss = ShardSet.from_dir(d / "shards")
+    ds = PatchDataset.from_shards(
+        ss, c, LogFluxTransform.from_config(c.transform))
     data = twosample.data_sample(ds, 10_000, seed=0, augment=False)
     assert len(data) == len(ds)
     flat = np.asarray(data).reshape(len(data), -1)
     assert len(np.unique(flat, axis=0)) == len(data)
+
+
+def test_the_draw_covers_the_whole_set_not_a_resident_slice(run_dir):
+    """Why this does not use ``PatchDataset.batches``.
+
+    That stream draws from a pool of resident shards refreshed every
+    ``pool_refill_every`` batches, which averages out over a training run and
+    does not over a single bulk draw -- at the defaults a 16384-patch draw can
+    come from 8 shards of ~31.  Shards are written in extraction order, so
+    that slice is a contiguous piece of the sky walk, and the control cannot
+    see it because both halves of one sample share the bias.
+
+    Uniform indices are the fix, so the thing to pin is that they stay
+    uniform: a draw of a few times the row count has to touch nearly every
+    row, not a band of them.
+    """
+    d, c = run_dir
+    ss = ShardSet.from_dir(d / "shards")
+    ds = PatchDataset.from_shards(
+        ss, c, LogFluxTransform.from_config(c.transform), in_memory=False)
+    rng = np.random.default_rng(0)
+    idx = rng.integers(0, len(ds), size=8 * len(ds))
+    # Coupon collector: 8n draws miss e^-8 of n rows, well under 1%.
+    assert len(np.unique(idx)) > 0.99 * len(ds)
+    assert idx.min() < 0.1 * len(ds) and idx.max() > 0.9 * len(ds)
+    ds.close()
 
 
 def test_the_data_sample_follows_the_augmentation_it_is_told_to(run_dir):

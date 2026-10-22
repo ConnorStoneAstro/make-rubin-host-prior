@@ -56,7 +56,10 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("--which", default="ema", choices=["ema", "model"],
                    help="which weights; ema is what you would deploy")
     p.add_argument("--n-data", type=int, default=16384,
-                   help="training patches to draw (cheap)")
+                   help="training patches to draw (cheap). Not bounded by the "
+                        "number of stored patches: the loader augments, so it "
+                        "is an infinite generator and this is a free choice. "
+                        "With --no-augment it is capped at the stored count")
     p.add_argument("--n-model", type=int, default=512,
                    help="model draws (an ODE solve each). This is what sets "
                         "how small a difference the test can see")
@@ -119,9 +122,13 @@ def main() -> None:
     import jax
 
     print(f"\njax devices: {jax.devices()}")
-    print(f"drawing {min(args.n_data, len(dataset))} patches from "
-          f"{len(dataset)} available"
-          + ("" if not args.no_augment else "  (augmentation OFF)"))
+    # Not "of N available": with augmentation on, the loader is an infinite
+    # generator and the stored count is not a ceiling on anything.
+    print(f"drawing {args.n_data} patches "
+          + (f"from {len(dataset)} stored (x8 dihedral x crop offsets)"
+             if not args.no_augment
+             else f"of {len(dataset)} stored  (augmentation OFF, so the "
+                  f"draw is capped there)"))
     data = twosample.data_sample(dataset, args.n_data, seed=args.seed,
                                  augment=not args.no_augment)
 

@@ -58,22 +58,50 @@ def _pted():
 
 
 def data_sample(
-    dataset, n: int, seed: int = 0, augment: bool = True, chunk: int = 1024
-) -> np.ndarray:
-    """``n`` training patches, drawn the way the loader drew them for training.
+    dataset, n: int, seed: int = 0, augment: bool = True, chunk: int = 1024,
+) -> "jax.Array":
+    """``n`` patches from the loader, through the augmentation training uses.
 
-    Without replacement, so the sample carries ``n`` independent scenes rather
-    than ``n`` draws from a smaller set -- a permutation test on duplicated
-    rows reads the duplication as agreement.  Falls back to the whole set,
-    with a smaller ``n``, when the set is smaller than asked for.
+    **The stored patches are not the training distribution.**  Each one stands
+    for eight dihedral images times a continuum of crop offsets times its own
+    floor draw, and the model learnt that whole thing -- so the loader is an
+    effectively infinite generator and ``n`` has no business being capped at
+    the shard count.  Indices are drawn uniformly **with replacement**; a base
+    patch drawn twice comes back as two different images, which is the point.
+
+    Not ``PatchDataset.batches``, though that is the stream the trainer reads,
+    and the difference is worth stating because it is not obvious.  On an
+    uncached set ``batches`` draws from a *pool* of ``pool_shards`` resident
+    shards, refreshed every ``pool_refill_every`` batches.  Training can
+    accept that: over 200k steps the residency correlation averages out.  A
+    one-shot draw does not average out -- at the defaults (8 resident,
+    refilling every 64 batches) a 16384-patch draw at ``batch_size=512`` is
+    32 batches, so it never refills at all and the whole sample comes from 8
+    shards of ~31, a quarter of the set.  Shards are written in extraction
+    order, so that quarter is a contiguous slice of the sky walk rather than
+    a random one.  **The control cannot catch this**: both halves of one
+    sample carry the same bias.  Uniform indices cost scattered reads and buy
+    coverage, which is the right trade for a diagnostic and the wrong one for
+    a training loop.
+
+    ``augment=False`` is the exception.  Without augmentation a base patch
+    drawn twice is the *same image twice*, and a permutation test reads exact
+    duplicates as agreement -- zero distances in the within-group term, which
+    biases the energy distance down. So that path draws without replacement
+    and is capped at the stored count, which is honest about what it has.
     """
     rng = np.random.default_rng(seed)
-    n = min(n, len(dataset))
-    idx = np.sort(rng.choice(len(dataset), size=n, replace=False))
+    if augment:
+        idx = rng.integers(0, len(dataset), size=n)
+    else:
+        n = min(n, len(dataset))
+        idx = rng.choice(len(dataset), size=n, replace=False)
     out = []
     for start in range(0, n, chunk):
-        out.append(dataset.make_batch(idx[start:start + chunk], rng=rng,
-                                      augment=augment))
+        # Sorted within the chunk for read locality, which costs nothing: the
+        # pooled sample is shuffled by the permutation test anyway.
+        out.append(dataset.make_batch(np.sort(idx[start:start + chunk]),
+                                      rng=rng, augment=augment))
     return jnp.asarray(np.concatenate(out))
 
 
