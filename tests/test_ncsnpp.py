@@ -378,6 +378,198 @@ def test_the_dae_prefactor_makes_the_epsilon_optimal_net_exact():
         assert ratio == pytest.approx(sigma**2 / (tau**2 + sigma**2), rel=1e-3)
 
 
+# -- the decoder removed ---------------------------------------------------
+
+
+@pytest.fixture(scope="module")
+def encoder_config(tiny_config) -> Config:
+    c = dataclasses.replace(tiny_config, architecture="ncsnpp_encoder")
+    c.sde = dataclasses.replace(tiny_config.sde, data_std=0.9)
+    c.ncsnpp = dataclasses.replace(tiny_config.ncsnpp, nf=8, ch_mult=(1, 2),
+                                   num_blocks=1, attention=False)
+    return c
+
+
+def test_the_encoder_energy_taps_every_resolution(encoder_config):
+    """One map per level plus the bottleneck, each at its own grid.
+
+    The pyramid is the architecture, not an option on it: a bottleneck-only
+    energy closes 38.5% of the gap to the analytic optimum on iid Gaussian
+    data where the U-Net reaches 94.6%, and the taps take it to 85.1%.
+    """
+    model = encoder_config.build_model(jax.random.key(0))
+    x = jax.random.normal(jax.random.key(1), (1, SIZE, SIZE))
+    maps = model.energy_maps(x, jnp.float32(1.0))
+    assert len(maps) == len(encoder_config.ncsnpp.ch_mult) + 1
+    grids = [m.shape[-1] for m in maps]
+    assert grids == [SIZE, SIZE // 2, SIZE // 2]   # levels, then the bottleneck
+    assert model(x, jnp.float32(1.0)).shape == ()
+    assert model.score(x, jnp.float32(1.0)).shape == x.shape
+
+
+def test_the_encoder_energy_score_is_conservative(encoder_config):
+    """Summing scalar fields leaves a scalar, so the score is still an exact
+    gradient -- which is the only reason a pyramid of taps is allowed."""
+    model = encoder_config.build_model(jax.random.key(0))
+    x = jax.random.normal(jax.random.key(5), (1, 8, 8))
+    jac = np.asarray(jax.jacrev(model.score)(x, jnp.float32(1.0))).reshape(64, 64)
+    assert np.abs(jac - jac.T).max() / np.abs(jac).max() < 1e-4
+
+
+def test_coarse_levels_are_weighted_by_the_area_their_cells_cover(encoder_config):
+    """Without it the finest level drowns the rest by the ratio of their cell
+    counts -- measured 731x across five levels, 6x with the weighting."""
+    model = encoder_config.build_model(jax.random.key(0))
+    x = jax.random.normal(jax.random.key(2), (1, SIZE, SIZE))
+    sigma = jnp.float32(1.0)
+    maps = model.energy_maps(x, sigma)
+    want = sum(float((SIZE / m.shape[-1]) ** 2) * float(
+        (m - off(sigma)).sum()) for m, off in zip(maps, model.offsets))
+    assert float(model(x, sigma)) == pytest.approx(want, rel=1e-4)
+    # Each level's weight is the pixels one of its cells stands for.
+    assert [int((SIZE / m.shape[-1]) ** 2) for m in maps] == [1, 4, 4]
+
+
+def test_the_encoder_energy_is_not_size_locked(encoder_config):
+    """What the U-Net cannot do: nothing reconstructs a fixed-size output, so
+    any grid the downsampling divides is a valid scene."""
+    model = encoder_config.build_model(jax.random.key(0))
+    for size in (8, 16, 24):
+        x = jnp.zeros((1, size, size))
+        assert model.score(x, jnp.float32(1.0)).shape == (1, size, size)
+
+
+def test_the_sigma_offset_cannot_move_the_score(encoder_config):
+    """The whole licence for subtracting it. A function of sigma alone has no
+    gradient in x, so the offsets are free to be anything at all."""
+    from rubin_host_prior.nn.ncsnpp import SigmaOffset
+
+    model = encoder_config.build_model(jax.random.key(0))
+    x = jax.random.normal(jax.random.key(3), (1, SIZE, SIZE))
+    sigma = jnp.float32(0.3)
+    before = np.asarray(model.score(x, sigma))
+
+    wild = tuple(
+        eqx.tree_at(lambda o: (o.b0, o.w, o.log_q), off,
+                    (jnp.float32(1e4), off.w * -37.0, off.log_q + 5.0))
+        for off in model.offsets
+    )
+    moved = eqx.tree_at(lambda m: m.offsets, model, wild)
+    np.testing.assert_array_equal(before, np.asarray(moved.score(x, sigma)))
+    # ... and it does move the energy, so it is not a no-op either.
+    assert float(moved(x, sigma)) != pytest.approx(float(model(x, sigma)))
+
+
+def test_the_offset_bands_start_at_the_derived_values():
+    """``sum_j w_j = 1/2`` per cell is the per-cell reading of the Gaussian
+    identity ``sum_j w_j = D/2``, which a fit recovers to 0.1% unprompted."""
+    from rubin_host_prior.nn.ncsnpp import SigmaOffset
+
+    for n_bands in (1, 2, 4):
+        off = SigmaOffset(n_bands, var=0.49)
+        assert float(off.w.sum()) == pytest.approx(0.5)
+        assert len(off.log_q) == n_bands
+        # Spread across the spectrum, not stacked: two bands at one power are
+        # one band and a wasted one.
+        q = np.exp(np.asarray(off.log_q))
+        if n_bands > 1:
+            assert q.max() / q.min() == pytest.approx(100.0, rel=1e-3)
+        # Monotone in sigma, as 0.5*sum_k log(P_k + sigma^2) is.
+        vals = [float(off(jnp.float32(s))) for s in (0.01, 0.1, 1.0, 10.0)]
+        assert vals == sorted(vals)
+
+    with pytest.raises(ValueError, match="n_bands"):
+        SigmaOffset(0)
+
+
+def test_calibration_flattens_the_energy_and_leaves_the_score_alone(encoder_config):
+    """What ``calibrate_offsets`` is for, end to end.
+
+    The offsets get exactly zero gradient from score matching -- it cannot see
+    a function of sigma alone -- so they are fitted afterwards instead of
+    bolted onto the training loop.
+    """
+    from rubin_host_prior.nn.ncsnpp import calibrate_offsets, offset_residual
+
+    model = encoder_config.build_model(jax.random.key(0))
+    sde = VESDE.from_config(encoder_config.sde)
+    x = jnp.asarray(np.random.default_rng(0).normal(3.0, 0.7, (4, 1, SIZE, SIZE)),
+                    jnp.float32)
+    fitted = calibrate_offsets(model, x, sde, n_sigma=8)
+
+    sigmas = [0.05, 0.5, 5.0]
+    before = max(abs(float(model(x[0], jnp.float32(s)))) for s in sigmas)
+    after = max(abs(float(fitted(x[0], jnp.float32(s)))) for s in sigmas)
+    assert after < before
+
+    # Provably, not approximately: the score is untouched.
+    for s in sigmas:
+        np.testing.assert_array_equal(
+            np.asarray(model.score(x[0], jnp.float32(s))),
+            np.asarray(fitted.score(x[0], jnp.float32(s))))
+
+    got = offset_residual(fitted, x, sde, n_sigma=8)
+    assert len(got["levels"]) == len(model.offsets)
+    assert all(np.isfinite(L["max_residual"]) for L in got["levels"])
+
+
+def test_the_encoder_refuses_the_dae_form(encoder_config):
+    """``dae`` is ``||x - s(x)||^2 / 2``, which needs ``h`` to be a
+    full-resolution denoising residual whose Jacobian is about ``-I/sigma``.
+
+    A coarse tap's Jacobian is a downsampling operator and nothing drives any
+    one tap to be ``sigma * score``, so the derivation does not survive here.
+    Refused at build rather than silently squaring the maps.
+    """
+    c = dataclasses.replace(encoder_config)
+    c.ncsnpp = dataclasses.replace(encoder_config.ncsnpp, energy_form="dae")
+    with pytest.raises(ValueError, match="energy_form='sum'"):
+        c.build_model(jax.random.key(0))
+    # ... and the U-Net energy, where the derivation does hold, still takes it.
+    u = dataclasses.replace(encoder_config, architecture="ncsnpp_energy")
+    u.ncsnpp = dataclasses.replace(encoder_config.ncsnpp, energy_form="dae")
+    assert u.build_model(jax.random.key(0)) is not None
+
+
+def test_the_offsets_cost_nothing_in_training_precision(encoder_config):
+    """Why calibration is about staleness and not about float32.
+
+    Reverse mode starts from ``dE/dE = 1`` and the backward of a sum is an
+    exact broadcast, so the energy's magnitude never enters the gradient.
+    Shifted far enough to move E by ~1e7, the loss gradient has to be
+    unchanged to the last bit -- and the offsets' own gradient has to be
+    exactly zero, which is what makes them unfittable by the loss.
+    """
+    model = encoder_config.build_model(jax.random.key(0))
+    sde = VESDE.from_config(encoder_config.sde)
+    x = jnp.asarray(np.random.default_rng(0).normal(3.0, 0.7, (4, 1, SIZE, SIZE)),
+                    jnp.float32)
+    wild = tuple(eqx.tree_at(lambda o: o.b0, off, jnp.float32(1e4))
+                 for off in model.offsets)
+    moved = eqx.tree_at(lambda m: m.offsets, model, wild)
+    assert abs(float(moved(x[0], jnp.float32(1.0)))) > 1e5
+
+    g0 = eqx.filter_grad(dsm_loss)(model, x, jax.random.key(1), sde)
+    g1 = eqx.filter_grad(dsm_loss)(moved, x, jax.random.key(1), sde)
+    for a, b in zip(jax.tree.leaves(eqx.filter(g0, eqx.is_inexact_array)),
+                    jax.tree.leaves(eqx.filter(g1, eqx.is_inexact_array))):
+        np.testing.assert_array_equal(np.asarray(a), np.asarray(b))
+    for off in g0.offsets:
+        assert float(jnp.abs(off.b0).max()) == 0.0
+        assert float(jnp.abs(off.w).max()) == 0.0
+
+
+def test_the_encoder_architecture_round_trips(encoder_config):
+    import json
+
+    back = Config.from_dict(json.loads(json.dumps(encoder_config.to_dict())))
+    assert back == encoder_config
+    assert back.architecture == "ncsnpp_encoder"
+    assert back.ncsnpp.n_offset_bands == encoder_config.ncsnpp.n_offset_bands
+    with pytest.raises(ValueError, match="n_offset_bands"):
+        NCSNppConfig(n_offset_bands=0)
+
+
 @pytest.mark.parametrize("form", ["sum", "dae"])
 def test_the_energy_score_is_conservative(energy_config, form):
     """What the whole exercise is for.  A score that is a gradient has a

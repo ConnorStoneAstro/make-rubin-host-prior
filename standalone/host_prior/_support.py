@@ -105,6 +105,7 @@ class NCSNppConfig:
     #: ``(sigma_d^2+sigma^2)/(2 sigma^2) * ||h||^2``.  Read only when the
     #: checkpoint's architecture is ``"ncsnpp_energy"``.
     energy_form: str = "sum"
+    n_offset_bands: int = 2
 
     def check(self) -> None:
         if self.progressive not in ("output_skip", "none"):

@@ -284,6 +284,11 @@ class NCSNppConfig:
     #: form and starts slowly without one.  ``nn.ncsnpp.NCSNppEnergy`` has the
     #: derivation, the loss curves, and what each gives up.
     energy_form: str = "sum"
+    #: Bands in each pyramid level's ``k(sigma)`` offset, for
+    #: ``"ncsnpp_encoder"`` only.  Two is measured to land within 0.03% of the
+    #: exact Gaussian curve over a dynamic range of 95,000; one is 0.5%.  They
+    #: are not trained by the loss -- see ``nn.ncsnpp.SigmaOffset``.
+    n_offset_bands: int = 2
 
     def __post_init__(self) -> None:
         if self.progressive not in ("output_skip", "none"):
@@ -302,6 +307,9 @@ class NCSNppConfig:
             raise ValueError(
                 f"combine_method must be 'cat' or 'sum', got " f"{self.combine_method!r}"
             )
+        if self.n_offset_bands < 1:
+            raise ValueError(
+                f"n_offset_bands must be >= 1, got {self.n_offset_bands}")
         if self.energy_form not in ("sum", "dae"):
             raise ValueError(f"energy_form must be 'sum' or 'dae', got " f"{self.energy_form!r}")
         if not self.ch_mult:
@@ -762,7 +770,7 @@ class Config:
             c = 0.5 * (t.floor_sigma_lo + t.floor_sigma_hi) * pooled_sigma
         return log(c + t.softening * log(2.0))
 
-    ARCHITECTURES = ("energy", "ncsnpp", "ncsnpp_energy")
+    ARCHITECTURES = ("energy", "ncsnpp", "ncsnpp_energy", "ncsnpp_encoder")
 
     @property
     def model_config(self) -> "EnergyConfig | NCSNppConfig":
@@ -795,8 +803,8 @@ class Config:
             from .nn.energy import ConvEnergyNet
 
             return ConvEnergyNet(self.energy, input_offset=self.input_offset, key=key)
-        if self.architecture in ("ncsnpp", "ncsnpp_energy"):
-            from .nn.ncsnpp import NCSNpp, NCSNppEnergy
+        if self.architecture in ("ncsnpp", "ncsnpp_energy", "ncsnpp_encoder"):
+            from .nn.ncsnpp import NCSNpp, NCSNppEncoderEnergy, NCSNppEnergy
 
             if self.sde.sigma_min is None or self.sde.sigma_max is None:
                 raise ValueError(
@@ -821,6 +829,24 @@ class Config:
                     "scripts/prepare_config.py, or set energy_form to 'sum', "
                     "which does not use it."
                 )
+            if self.architecture == "ncsnpp_encoder":
+                if self.ncsnpp.energy_form != "sum":
+                    raise ValueError(
+                        "architecture 'ncsnpp_encoder' requires "
+                        "energy_form='sum'. The 'dae' form is "
+                        "||x - s(x)||^2 / 2 with Tweedie's s = x + sigma * h, "
+                        "so it needs h to be a full-resolution denoising "
+                        "residual whose Jacobian is about -I/sigma -- that is "
+                        "what makes -grad E reduce to the feed-forward output. "
+                        "This architecture sums taps at several resolutions "
+                        "and nothing drives any one of them to be sigma*score, "
+                        "so a coarse tap's Jacobian is a downsampling operator "
+                        "and the derivation does not survive. Squaring the "
+                        "maps anyway would be a formula without an argument "
+                        "behind it."
+                    )
+                return NCSNppEncoderEnergy(
+                    self.ncsnpp, data_std=self.sde.data_std or 1.0, **common)
             return NCSNppEnergy(self.ncsnpp, data_std=self.sde.data_std or 1.0, **common)
         raise ValueError(
             f"unknown architecture {self.architecture!r}; "
@@ -843,7 +869,7 @@ class Config:
         """Warnings about the configured training sizes; empty means fine."""
         _, hi = self.usable_size_range()
         out = []
-        if self.architecture in ("ncsnpp", "ncsnpp_energy"):
+        if self.architecture in ("ncsnpp", "ncsnpp_energy", "ncsnpp_encoder"):
             out += self._ncsnpp_size_warnings()
             out += self._translate_warning()
             return out

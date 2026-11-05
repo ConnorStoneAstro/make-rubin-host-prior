@@ -164,6 +164,26 @@ def _shardings(n_devices: int | None, batch_size: int, verbose: bool):
             NamedSharding(mesh, PartitionSpec("batch")))
 
 
+def _calibrated(model, eval_batch, sde):
+    """Fit the sigma offsets, for the architectures that have any.
+
+    Run at every checkpoint rather than once at the end, for two reasons that
+    are not precision -- the offsets provably cost nothing there, since the
+    loss gradient does not see them at all.  They go **stale**: the typical
+    energy drifts as the model learns, so a fit from step 10k is wrong at
+    200k.  And doing it here means every saved checkpoint is immediately
+    usable for a Metropolis test, with no separate step to remember.
+
+    Against ``eval_batch``, which is fixed, so the fit is comparable from one
+    checkpoint to the next.  A no-op for every other architecture.
+    """
+    from ..nn.ncsnpp import NCSNppEncoderEnergy, calibrate_offsets
+
+    if eval_batch is None or not isinstance(model, NCSNppEncoderEnergy):
+        return model
+    return calibrate_offsets(model, jnp.asarray(eval_batch), sde)
+
+
 def train(
     model: ScoreModel,
     batches: Iterator[np.ndarray],
@@ -417,9 +437,15 @@ def train(
                 # needed for the most recent one.  That lives in `latest`, which
                 # is overwritten, so ten checkpoints cost the weights ten times
                 # and the optimiser once.
+                # Calibrated here and not on the stop path above: that one
+                # runs inside a scheduler's grace period, where the only
+                # priority is not losing the chunk.  The next checkpoint
+                # refits anyway.
+                saved = _calibrated(model, eval_batch, sde)
+                saved_ema = _calibrated(ema_model, eval_batch, sde)
                 save_checkpoint(out / "checkpoints" / f"step-{step:08d}",
-                                step, config, model, ema_model)
-                save_checkpoint(out / "latest", step, config, model, ema_model,
+                                step, config, saved, saved_ema)
+                save_checkpoint(out / "latest", step, config, saved, saved_ema,
                                 opt_state)
                 record = {"step": step, "event": "checkpoint",
                           "seconds": time.time() - t0}
@@ -435,6 +461,8 @@ def train(
     # writing it anyway would tell the next chunk -- and scripts/sample.py --
     # that this is the trained model.
     if not stop and step >= cfg.steps:
+        model = _calibrated(model, eval_batch, sde)
+        ema_model = _calibrated(ema_model, eval_batch, sde)
         save_checkpoint(out / "final", cfg.steps, config, model, ema_model, opt_state)
     return model, ema_model
 

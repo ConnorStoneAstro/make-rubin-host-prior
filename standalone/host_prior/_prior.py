@@ -20,7 +20,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-from ._net import NCSNpp, NCSNppEnergy
+from ._net import NCSNpp, NCSNppEncoderEnergy, NCSNppEnergy
 from ._support import NCSNppConfig
 
 _LINEAR_BELOW = -20.0
@@ -383,12 +383,12 @@ def load_prior(directory, which: str = "ema") -> Prior:
     d = Path(directory)
     cfg = json.loads((d / "config.json").read_text())
     architecture = cfg.get("architecture", "energy")
-    if architecture not in ("ncsnpp", "ncsnpp_energy"):
+    if architecture not in ("ncsnpp", "ncsnpp_energy", "ncsnpp_encoder"):
         raise ValueError(
             f"{d} was trained with architecture {architecture!r}, which this "
-            f"loader does not carry -- it has the NCSN++ U-Net only, in the "
-            f"two forms 'ncsnpp' and 'ncsnpp_energy'. Load it with the full "
-            f"rubin_host_prior package instead."
+            f"loader does not carry -- it has the NCSN++ backbone only, as "
+            f"'ncsnpp', 'ncsnpp_energy' and 'ncsnpp_encoder'. Load it with "
+            f"the full rubin_host_prior package instead."
         )
 
     sde_cfg, tr_cfg, patch = cfg["sde"], cfg["transform"], cfg["patch"]
@@ -411,13 +411,18 @@ def load_prior(directory, which: str = "ema") -> Prior:
     if architecture == "ncsnpp":
         skeleton = NCSNpp(net_cfg, **common)
     else:
+        # Both energies need data_std for the 'dae' prefactor, and both
+        # restore their sigma-offset bands from the checkpoint like any other
+        # array -- they are module fields, not metadata.
         if net_cfg.energy_form == "dae" and sde_cfg.get("data_std") is None:
             raise ValueError(
                 f"{d} uses the 'dae' energy, whose prefactor is "
                 f"(data_std^2 + sigma^2)/sigma^2, but its config has no "
                 f"sde.data_std."
             )
-        skeleton = NCSNppEnergy(
+        cls = (NCSNppEncoderEnergy if architecture == "ncsnpp_encoder"
+               else NCSNppEnergy)
+        skeleton = cls(
             net_cfg, data_std=float(sde_cfg.get("data_std") or 1.0), **common)
 
     name = {"ema": "ema.eqx", "model": "model.eqx"}[which]

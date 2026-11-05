@@ -644,6 +644,424 @@ def scalar_energy(
     return jnp.sum(energy_map(h, sigma, form, data_std) - pixel_offset)
 
 
+class SigmaOffset(eqx.Module):
+    """``k(sigma)``: the typical per-cell energy of one pyramid level.
+
+    Subtracted from every cell *before* the level is summed, which is the only
+    place it buys anything -- the precision a huge total costs is lost in the
+    adding, not in the result, so taking it off afterwards recovers nothing.
+    Being a function of ``sigma`` alone it cannot change ``-grad_x E``: it is
+    the additive gauge an unnormalised energy has anyway.
+
+    **The shape is derived, not fitted blind.**  For a stationary Gaussian
+    field the typical energy is exactly ``0.5 * sum_k log(P_k + sigma^2)`` over
+    the ``D`` Fourier modes.  Group modes of similar power and a group of
+    ``n_j`` modes with power ``q_j`` contributes ``(n_j / 2) log(q_j +
+    sigma^2)``, so
+
+        k(sigma) = b0 + sum_j w_j log(q_j + sigma^2)
+
+    with ``w_j`` half the modes in band ``j`` and ``q_j`` that band's power.
+    Fitted against the exact curve for a red field, two bands land within
+    0.03% of a dynamic range of 95,000 and recover ``2 * sum_j w_j = 16368``
+    against a true ``D = 16384`` without being told it.  A generic MLP on the
+    noise embedding manages the same job only after learning the asymptotes
+    from scratch; ``b0 + b1/sigma^2 + b2 log sigma`` -- the shape the old
+    ``"sum"`` models appeared to have -- is 22% out, because that growth was
+    parameterisation drift and not the log density.
+
+    Everything here is **per cell**, so a level's contribution to the total is
+    ``A * n * k = D * k``: the offset scales with the scene and the parameters
+    do not have to. ``w_j`` therefore initialises at ``1 / (2 J)``, which is
+    the per-cell reading of ``sum_j w_j = D / 2``.
+
+    The parameters are learnable but get no gradient from the score-matching
+    loss, which cannot see them. ``calibrate_offsets`` fits them.
+    """
+
+    b0: Float[Array, ""]
+    w: Float[Array, " j"]
+    log_q: Float[Array, " j"]
+
+    def __init__(self, n_bands: int = 2, var: float = 1.0):
+        if n_bands < 1:
+            raise ValueError(f"n_bands must be >= 1, got {n_bands}")
+        self.b0 = jnp.zeros(())
+        self.w = jnp.full((n_bands,), 0.5 / n_bands)
+        # Spread across the spectrum, not stacked: two bands initialised at the
+        # same power are one band and a wasted one.
+        var = float(var) if var and np.isfinite(var) else 1.0
+        self.log_q = jnp.log(jnp.asarray(
+            np.geomspace(var / 10.0, var * 10.0, n_bands), jnp.float32))
+
+    def __call__(self, sigma: Float[Array, ""]) -> Float[Array, ""]:
+        sigma = jnp.asarray(sigma)
+        return self.b0 + jnp.sum(
+            self.w * jnp.log(jnp.exp(self.log_q) + sigma**2))
+
+
+class NCSNppEncoderEnergy(EnergyModel):
+    """NCSN++ read as an energy, with the decoder removed.
+
+    The downsampling half, the bottleneck attention and every trick that lives
+    in them -- FIR (1,3,3,1) resampling, BigGAN blocks, GroupNorm,
+    ``skip_rescale``, ``progressive_input`` -- then a scalar instead of an
+    upsampling path.  Measured against ``NCSNppEnergy`` at ``nf=32,
+    ch_mult=(1,2,4,4)`` on 128 px: 2.79M parameters against 7.20M, and a score
+    for 9.96 GFLOP against 42.34, a **4.25x** saving.  The decoder is 77% of
+    the U-Net rather than half, because its levels run ``num_blocks + 1``
+    blocks against ``num_blocks`` and each takes a concatenated skip, so twice
+    the input channels.
+
+    **The energy is a pyramid and that is not optional.**  Every resolution
+    taps a scalar map off the trunk, weighted by the area its cells cover, and
+    they are summed.  Taking the energy from the bottleneck alone does not
+    work: on iid Gaussian data, where the optimal score is exactly
+    ``-y / (tau^2 + sigma^2)`` and therefore purely pixel-local, 400 Adam steps
+    close **38.5%** of the gap to the analytic optimum against the U-Net's
+    94.6%.  Add the pyramid and it is **85.1%**, for 883 more parameters and
+    0.9% more FLOPs.  The reason is the gradient path: the level-0 tap reaches
+    the input through ``conv_in``, two blocks and one convolution, so its
+    contribution to ``-grad_x E`` is local and fine by construction, rather
+    than having to be rebuilt through the adjoint of four FIR low-passes.
+
+    Summing scalar fields is what keeps this an energy at all -- each tap is
+    already complete on its own, so the total is a scalar and the score is
+    still an exact gradient.  It is the same construction ``ConvEnergyNet``
+    used across dilations, moved across resolutions.
+
+    **Area weighting.**  A cell at level ``l`` stands for ``4 ** l`` pixels, so
+    its map value is a density and the level's sum is weighted by that area.
+    Without it the finest level drowns the rest at initialisation by the ratio
+    of their cell counts -- measured 731x across five levels, 6x with it.
+
+    One thing the U-Net cannot do: because the energy is extensive and nothing
+    reconstructs a fixed-size output, **this is not size-locked**.  Any grid
+    divisible by ``2 ** (len(ch_mult) - 1)`` works, so ``patch.out_sizes``
+    multi-size training is available here.  Zero padding still lets it read
+    its distance from the border, so it is not translation-invariant.
+    """
+
+    time_fourier: FourierFeatures
+    time_dense0: eqx.nn.Linear
+    time_dense1: eqx.nn.Linear
+    conv_in: eqx.nn.Conv2d
+    down_levels: tuple[_DownLevel, ...]
+    mid_block1: ResnetBlockBigGANpp
+    mid_attn: SelfAttention | None
+    mid_block2: ResnetBlockBigGANpp
+    level_norms: tuple[eqx.nn.GroupNorm, ...]
+    level_convs: tuple[eqx.nn.Conv2d, ...]
+    head_norm: eqx.nn.GroupNorm
+    head_conv: eqx.nn.Conv2d
+    offsets: tuple[SigmaOffset, ...]
+    config: NCSNppConfig = eqx.field(static=True)
+    log_sigma_min: float = eqx.field(static=True)
+    log_sigma_max: float = eqx.field(static=True)
+    input_offset: float = eqx.field(static=True)
+    data_std: float = eqx.field(static=True)
+    act: callable = eqx.field(static=True)
+
+    def __init__(
+        self,
+        config: NCSNppConfig,
+        *,
+        sigma_min: float,
+        sigma_max: float,
+        input_offset: float = 0.0,
+        data_std: float = 1.0,
+        key: PRNGKeyArray,
+    ):
+        self.config = config
+        self.log_sigma_min = float(np.log(sigma_min))
+        self.log_sigma_max = float(np.log(sigma_max))
+        self.input_offset = float(input_offset)
+        self.data_std = float(data_std)
+        self.act = act = get_activation(config.activation)
+        nf, mult = config.nf, tuple(config.ch_mult)
+        temb_dim = 4 * nf
+        n_levels = len(mult)
+
+        def next_key():
+            nonlocal key
+            key, sub = jax.random.split(key)
+            return sub
+
+        self.time_fourier = FourierFeatures(
+            nf // 2, config.fourier_scale, config.fourier_seed)
+        self.time_dense0 = _linear(nf, temb_dim, key=next_key())
+        self.time_dense1 = _linear(temb_dim, temb_dim, key=next_key())
+
+        def block(in_ch, out_ch, **kw):
+            return ResnetBlockBigGANpp(
+                in_ch, out_ch, temb_dim, act, fir=config.fir,
+                fir_kernel=config.fir_kernel, skip_rescale=config.skip_rescale,
+                init_scale=config.init_scale, key=next_key(), **kw)
+
+        self.conv_in = _conv(config.in_channels, nf, 3, key=next_key())
+        ch = nf
+        down, norms, convs = [], [], []
+        for level in range(n_levels):
+            blocks = []
+            for _ in range(config.num_blocks):
+                blocks.append(block(ch, nf * mult[level]))
+                ch = nf * mult[level]
+            # The tap: read off the trunk, do not divert it.  `h` carries on
+            # into the downsample unchanged.
+            norms.append(_group_norm(ch))
+            convs.append(_conv(ch, 1, 3, 1.0, key=next_key()))
+            resample = combine = None
+            if level != n_levels - 1:
+                resample = block(ch, None, down=True)
+                if config.progressive_input == "input_skip":
+                    combine = Combine(config.in_channels, ch,
+                                      config.combine_method, key=next_key())
+                    if config.combine_method == "cat":
+                        ch *= 2
+            down.append(_DownLevel(tuple(blocks), resample, combine))
+        self.down_levels = tuple(down)
+        self.level_norms = tuple(norms)
+        self.level_convs = tuple(convs)
+
+        self.mid_block1 = block(ch, None)
+        self.mid_attn = (SelfAttention(ch, config.init_scale, key=next_key())
+                         if config.attention else None)
+        self.mid_block2 = block(ch, None)
+        # init_scale 1, not 1e-2: as in NCSNpp's out_conv, this is a sole path
+        # to the output and starting it near zero starts the score at zero.
+        self.head_norm = _group_norm(ch)
+        self.head_conv = _conv(ch, 1, 3, 1.0, key=next_key())
+
+        var = self.data_std**2 if self.data_std else 1.0
+        self.offsets = tuple(
+            SigmaOffset(config.n_offset_bands, var)
+            for _ in range(n_levels + 1))     # one per tap, plus the bottleneck
+
+    # -- forward -----------------------------------------------------------
+
+    def t_of_sigma(self, sigma: Float[Array, ""]) -> Float[Array, ""]:
+        return (jnp.log(sigma) - self.log_sigma_min) / (
+            self.log_sigma_max - self.log_sigma_min)
+
+    def energy_maps(
+        self, x: Float[Array, "c h w"], sigma: Float[Array, ""]
+    ) -> tuple[Float[Array, "1 e e"], ...]:
+        """Every level's per-cell energy map, finest first, bottleneck last.
+
+        The diagnostic view, and what ``calibrate_offsets`` measures.
+        """
+        sigma = jnp.asarray(sigma)
+        temb = self.time_fourier(self.t_of_sigma(sigma))
+        temb = self.time_dense1(self.act(self.time_dense0(temb)))
+        raw = x - self.input_offset
+        h = self.conv_in(raw)
+        down_x = raw
+        maps = []
+        for i, level in enumerate(self.down_levels):
+            for blk in level.blocks:
+                h = blk(h, temb)
+            maps.append(energy_map(
+                self.level_convs[i](self.act(self.level_norms[i](h))),
+                sigma, self.config.energy_form, self.data_std))
+            if level.down is not None:
+                h = level.down(h, temb)
+                if level.combine is not None:
+                    down_x = fir_downsample(down_x, self.config.fir_kernel)
+                    h = level.combine(down_x, h)
+        h = self.mid_block1(h, temb)
+        if self.mid_attn is not None:
+            h = self.mid_attn(h)
+        h = self.mid_block2(h, temb)
+        maps.append(energy_map(
+            self.head_conv(self.act(self.head_norm(h))),
+            sigma, self.config.energy_form, self.data_std))
+        return tuple(maps)
+
+    def __call__(
+        self, x: Float[Array, "c h w"], sigma: Float[Array, ""],
+        pixel_offset: Float[Array, ""] | float = 0.0,
+    ) -> Float[Array, ""]:
+        sigma = jnp.asarray(sigma)
+        size = x.shape[-1]
+        total = jnp.zeros(())
+        for emap, offset in zip(self.energy_maps(x, sigma), self.offsets):
+            # The area one cell stands for, read off the map rather than
+            # assumed, so any ch_mult and any input size are handled.
+            area = (size / emap.shape[-1]) ** 2
+            total = total + area * jnp.sum(
+                emap - offset(sigma) - pixel_offset)
+        return total
+
+    # -- interface ---------------------------------------------------------
+
+    @property
+    def in_channels(self) -> int:
+        return self.config.in_channels
+
+    @property
+    def loss_margin(self) -> int:
+        """Zero: same-mode padding, so every pixel is scored."""
+        return 0
+
+    def describe(self, config) -> str:
+        from .score import n_parameters
+
+        grid = config.patch.out_size
+        mult = tuple(self.config.ch_mult)
+        res = [grid // 2**i for i in range(len(mult))]
+        form = self.config.energy_form
+        return "\n".join([
+            f"NCSN++ encoder energy: nf={self.config.nf}, ch_mult={mult}, "
+            f"{self.config.num_blocks} blocks/level, "
+            f"{n_parameters(self):,} parameters",
+            f"  resolutions {res} from a {grid} grid "
+            f"({grid * config.patch.pool_factor} native); attention "
+            f"{'at the bottleneck' if self.config.attention else 'off'}, "
+            f"no decoder",
+            f"  energy summed over {len(res) + 1} area-weighted taps by "
+            f"'{form}', host free to move {config.patch.shift_note}",
+            f"  per-level offsets: {self.config.n_offset_bands} bands of "
+            f"b0 + sum_j w_j log(q_j + sigma^2); fit by calibrate_offsets, "
+            f"not by the loss",
+            "  score is -grad_x E, so a training step is a gradient of a "
+            "gradient -- but of the encoder only",
+        ])
+
+    def log_header(self, config) -> dict:
+        return {
+            "architecture": "ncsnpp_encoder",
+            "nf": self.config.nf,
+            "ch_mult": list(self.config.ch_mult),
+            "num_blocks": self.config.num_blocks,
+            "attention": self.config.attention,
+            "energy_form": self.config.energy_form,
+            "n_offset_bands": self.config.n_offset_bands,
+            "data_std": self.data_std,
+            "input_offset": round(self.input_offset, 4),
+        }
+
+
+@eqx.filter_jit
+def _fit_bands(params, sigmas, target, n_steps=2000, lr=5e-2):
+    """Least squares for ``b0 + sum_j w_j log(q_j + sigma^2)`` against ``target``.
+
+    Adam inside a ``fori_loop`` rather than Levenberg-Marquardt: no scipy
+    dependency, and jitted so this is cheap enough to run at every checkpoint
+    instead of once at the end.  ``n_bands`` comes from the parameter shape, so
+    it is static without being an argument.
+    """
+    import optax
+
+    n_bands = (params.shape[0] - 1) // 2
+
+    def predict(p):
+        b0, w, log_q = p[0], p[1:1 + n_bands], p[1 + n_bands:]
+        return b0 + jnp.sum(
+            w[:, None] * jnp.log(jnp.exp(log_q)[:, None] + sigmas[None, :] ** 2),
+            axis=0)
+
+    loss = lambda p: jnp.mean((predict(p) - target) ** 2)
+    tx = optax.adam(lr)
+
+    def body(_, carry):
+        p, state = carry
+        upd, state = tx.update(jax.grad(loss)(p), state, p)
+        return optax.apply_updates(p, upd), state
+
+    out, _ = jax.lax.fori_loop(0, n_steps, body, (params, tx.init(params)))
+    return out
+
+
+def calibrate_offsets(
+    model: "NCSNppEncoderEnergy",
+    x: Float[Array, "b c h w"],
+    sde,
+    n_sigma: int = 24,
+    max_batch: int = 64,
+) -> "NCSNppEncoderEnergy":
+    """Fit every level's ``k(sigma)`` to the energies the model actually gives.
+
+    **Post-hoc, because the loss cannot do it.**  The offsets are functions of
+    ``sigma`` alone, so ``-grad_x E`` does not see them and score matching
+    returns *exactly* zero gradient for them -- measured, not assumed: shifting
+    them far enough to move the energy by 1e7 changes the loss gradient over
+    all 81 parameter arrays by 0.000e+00.  That is also why they cost nothing
+    in training precision, and why they have to be fitted separately or they
+    would sit at their initialisation forever.
+
+    What it fits is the mean cell of each level's map at each noise level,
+    which is what makes the level's sum small.  Returns a new model; the
+    original is unchanged.
+
+    Cheap enough for every checkpoint: ``n_sigma`` batched forwards and a
+    jitted least-squares in ``2 J + 1`` scalars per level.  Run it against a
+    *fixed* batch -- the trainer uses ``eval_batch`` -- so the fit is
+    comparable from one checkpoint to the next rather than tracking whatever
+    the last training batch happened to contain.
+    """
+    import numpy as _np
+
+    sigmas = jnp.asarray(sde.sigma(jnp.linspace(0.0, 1.0, n_sigma)))
+    x = jnp.asarray(x)
+    if x.ndim == 3:
+        x = x[None]
+    x = x[:max_batch]
+
+    @eqx.filter_jit
+    def mean_cells(model, batch, sigma):
+        maps = jax.vmap(lambda a: model.energy_maps(a, sigma))(batch)
+        return jnp.stack([m.mean() for m in maps])
+
+    rows = jnp.stack([mean_cells(model, x, s) for s in sigmas])  # (n_sigma, lvl)
+
+    fitted = []
+    for level, offset in enumerate(model.offsets):
+        params = jnp.concatenate(
+            [jnp.atleast_1d(offset.b0), offset.w, offset.log_q])
+        got = _fit_bands(params, sigmas, rows[:, level])
+        n_bands = len(offset.w)
+        fitted.append(eqx.tree_at(
+            lambda o: (o.b0, o.w, o.log_q), offset,
+            (got[0], got[1:1 + n_bands], got[1 + n_bands:])))
+    return eqx.tree_at(lambda m: m.offsets, model, tuple(fitted))
+
+
+def offset_residual(
+    model: "NCSNppEncoderEnergy",
+    x: Float[Array, "b c h w"],
+    sde,
+    n_sigma: int = 24,
+) -> dict:
+    """How well the fitted offsets track the measured means, per level.
+
+    The number that says whether ``n_offset_bands`` is enough: a residual
+    comparable to the level's own span means the closed form has not captured
+    the shape and the band count should go up.
+    """
+    import numpy as _np
+
+    sigmas = _np.asarray(sde.sigma(_np.linspace(0.0, 1.0, n_sigma)))
+    x = jnp.asarray(x)
+    if x.ndim == 3:
+        x = x[None]
+    out = {"sigma": [float(s) for s in sigmas], "levels": []}
+    rows, preds = [], []
+    for s in sigmas:
+        sj = jnp.asarray(s, jnp.float32)
+        maps = jax.vmap(lambda a: model.energy_maps(a, sj))(x)
+        rows.append([float(m.mean()) for m in maps])
+        preds.append([float(o(sj)) for o in model.offsets])
+    rows, preds = _np.array(rows), _np.array(preds)
+    for level in range(rows.shape[1]):
+        span = float(rows[:, level].max() - rows[:, level].min())
+        resid = float(_np.abs(rows[:, level] - preds[:, level]).max())
+        out["levels"].append({
+            "level": level, "span": span, "max_residual": resid,
+            "fraction_of_span": resid / span if span else float("nan"),
+        })
+    return out
+
+
 class NCSNppEnergy(EnergyModel):
     """The same U-Net, read as a scalar energy instead of as a score.
 

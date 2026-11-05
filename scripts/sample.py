@@ -100,6 +100,7 @@ def main() -> None:
         fig.suptitle(f"prior samples (log space), step {step}")
         fig.tight_layout()
         fig.savefig(f"{args.out}.png", dpi=130)
+        plt.close(fig)  # harmless here, since this exits -- consistent with _save
         print(f"wrote {args.out}.png and {args.out}.npy")
     except ImportError:
         print(f"wrote {args.out}.npy (matplotlib unavailable, no PNG)")

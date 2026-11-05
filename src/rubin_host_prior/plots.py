@@ -55,12 +55,33 @@ def _show(ax, img, vmin=None, vmax=None, cmap="magma"):
 
 
 def _save(fig, out: Path | None, name: str) -> Path | None:
+    """Write the figure to ``out/name.png``, and release it.
+
+    **Closing is part of saving**, and it lives here because every figure in
+    this module goes out through this one function.  ``pyplot`` keeps a
+    reference to every figure it creates until something closes it, so a
+    caller in a loop accumulates them: the trainer draws a sample grid at
+    every eval and discards the figure, which is 20 of them by step 100k and
+    a RuntimeWarning telling you so.  A fix at that one call site would have
+    left the same trap set for the next repeated caller.
+
+    The rule is ownership.  With ``out`` given the content is on disk and the
+    caller asked for a file, so pyplot's copy is dead weight.  With ``out``
+    None nothing has been written, the figure *is* the return value, and
+    closing it would be throwing away the only thing produced.
+
+    Closing does not damage the returned object: ``plt.close`` drops the
+    figure manager, while the ``Figure`` keeps its axes, artists and text and
+    can still be saved again.  The diagnostics and tests that read a figure
+    after writing it go on working.
+    """
     if out is None:
         return None
     out = Path(out)
     out.mkdir(parents=True, exist_ok=True)
     path = out / f"{name}.png"
     fig.savefig(path, dpi=110, bbox_inches="tight")
+    _plt().close(fig)
     return path
 
 
@@ -999,5 +1020,7 @@ def make_all(
     for fig, path in made:
         if path is not None:
             written.append(path)
+        # Redundant now that _save closes what it writes, and kept anyway:
+        # it is what releases a figure whose save was skipped.
         plt.close(fig)
     return written

@@ -61,6 +61,48 @@ def _n_drawn(fig):
     return sum(1 for ax in fig.axes if ax.images or ax.patches or ax.lines)
 
 
+def test_saving_a_figure_releases_it(tmp_path):
+    """The trainer draws a sample grid at every eval and drops the figure.
+
+    pyplot holds a reference to every figure it makes, so without a close that
+    is a leak with a RuntimeWarning at 20 of them -- which is what showed up
+    in a real run. Pinned at the one place every figure here is written,
+    rather than at the call site that happened to notice.
+    """
+    before = set(plt.get_fignums())
+    x = np.random.default_rng(0).normal(3.0, 1.0, (9, 1, 16, 16))
+    for step in range(25):
+        plots.plot_samples(x, step=step, out=tmp_path, name=f"step-{step:03d}")
+    assert set(plt.get_fignums()) == before
+
+
+def test_a_saved_figure_is_still_the_figure(tmp_path):
+    """Closing drops the manager, not the content.
+
+    Every diagnostic here returns ``(fig, path)`` and several tests read the
+    figure after writing it, so releasing it must not cost anything the
+    caller came for.
+    """
+    x = np.random.default_rng(1).normal(3.0, 1.0, (4, 1, 16, 16))
+    fig, path = plots.plot_samples(x, step=7, out=tmp_path)
+    assert path.exists()
+    assert sum(1 for ax in fig.axes if ax.images) == 4
+    assert "step 7" in fig.texts[0].get_text()
+    fig.savefig(tmp_path / "again.png")          # and still savable
+    assert (tmp_path / "again.png").stat().st_size > 0
+
+
+def test_without_an_output_path_the_caller_owns_the_figure():
+    """``out=None`` writes nothing, so the figure is the whole return value
+    and closing it would be throwing the result away."""
+    before = set(plt.get_fignums())
+    x = np.random.default_rng(2).normal(3.0, 1.0, (4, 1, 16, 16))
+    fig, path = plots.plot_samples(x, out=None)
+    assert path is None
+    assert set(plt.get_fignums()) - before == {fig.number}
+    plt.close(fig)
+
+
 def test_cutouts_draws_every_requested_panel(shards, tmp_path):
     fig, path = plots.plot_cutouts(shards, n=9, out=tmp_path)
     assert path.exists() and path.stat().st_size > 0
