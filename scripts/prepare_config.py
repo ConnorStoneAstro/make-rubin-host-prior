@@ -13,7 +13,7 @@ no flag for it.
 It writes a config and prints the diagnostics you should look at before
 training:
 
-* ``sky_scatter`` should match ``expected_sky_scatter(softening_sigma, k)``.  If it
+* ``sky_scatter`` should match ``transform.predicted_sky_scatter``.  If it
   does not, the softening scale is wrong.  It is a check on a *typical* width:
   one scale serves every band, so a band deeper or shallower than the scale was
   measured from scatters proportionally less or more.
@@ -37,7 +37,6 @@ from rubin_host_prior.data import (
     PatchDataset,
     ShardSet,
     estimate_softening, measure_transform,
-    expected_sky_scatter,
     pool_shards,
     reach_advice,
     suggest_n_steps,
@@ -282,23 +281,30 @@ def main() -> None:
     t = LogFluxTransform.from_config(config.transform)
     tc = config.transform
     ss = tc.softening_sigma
-    # The *typical* floor: k at the midpoint of its per-stamp draw, times the
-    # pooled sky noise, which `softening / softening_sigma` recovers.  Every
-    # number below is quoted for that, because quoting the unfloored ones for a
-    # floored dataset is how the transform figure came to be wrong.
-    k_mid = 0.5 * (tc.floor_sigma_lo + tc.floor_sigma_hi) if tc.floors_enabled else 0.0
-    floor = k_mid * (t.softening / ss) if (k_mid and ss) else 0.0
-    print(f"\nlog transform:  x = log(c + s*softplus((f-c)/s)),  model map f = exp(x)")
+    # The *typical* floor: `floor_sigma` times the pooled sky noise, which
+    # `softening / softening_sigma` recovers.  Typical and not exact because
+    # each cutout floors at a multiple of its own noise.  Every number below is
+    # quoted for that, because quoting the unfloored ones for a floored dataset
+    # is how the transform figure came to be wrong.
+    k = tc.floor_sigma if tc.floors_enabled else 0.0
+    floor = k * (t.softening / ss) if (k and ss) else 0.0
+    pedestal = tc.floor_pedestal if tc.floors_enabled else 0.0
+    print(f"\nlog transform:  x = log(p + s*softplus((f-c)/s)),  model map f = exp(x)")
     print(f"  softening s = {t.softening:.1f} nJy ({ss:.2f} x pooled sky noise)"
           f" -- how sharp the knee is")
     if floor:
-        print(f"  sky floor   c = {floor:.1f} nJy (k = {tc.floor_sigma_lo:.2f}"
-              f"..{tc.floor_sigma_hi:.2f} x each cutout's own pooled sky noise,"
-              f" drawn per stamp)")
+        print(f"  sky floor   c = {floor:.1f} nJy (k = {tc.floor_sigma:.2f}"
+              f" x each cutout's own pooled sky noise) -- where the map bends")
+        print(f"  pedestal    p = {pedestal:g} nJy -- what it bends over to, "
+              f"the faintest flux the prior can represent")
+        print(f"  bright flux therefore comes out {floor - pedestal:.1f} nJy "
+              f"low: soften(f) -> f - (c - p), so exp(x) is not f. Use "
+              f"to_flux_exact to recover a measurement.")
     else:
-        print(f"  sky floor   none (floor_sigma_hi = 0): the pre-floor transform")
+        print(f"  sky floor   none (floor_sigma = 0): the pre-floor transform")
     print(f"  bright flux passes through as log(f), the same x in every band")
-    print(f"  sky sits at log(c + s*log2) = {float(t.sky_level_at(floor)):.2f} "
+    print(f"  sky sits at log(soften(0)) = "
+          f"{float(t.sky_level_at(floor, pedestal)):.2f} "
           f"for a typical cutout; each one floors at its own level")
     print(
         f"  data mean x = {config.sde.data_mean:.3f}, which is where " f"prior_sample starts from"
@@ -317,11 +323,11 @@ def main() -> None:
         + ("-> floored, as anything below c is" if floor
            else "-> representable (softplus has no floor)")
     )
-    predicted = expected_sky_scatter(ss, k_mid)
+    predicted = tc.predicted_sky_scatter
     print(
         f"  sky scatter in x: {stats['sky_scatter']:.3f} measured vs "
         f"{predicted:.3f} predicted"
-        + (f" at k = {k_mid:.2f}" if k_mid else " (unfloored)")
+        + (f" at k = {k:.2f}" if k else " (unfloored)")
     )
     if not 0.5 * predicted < stats["sky_scatter"] < 2.0 * predicted:
         print(

@@ -106,7 +106,8 @@ _TINY = 1e-300
 SKY_SLOPE = 0.5 / log(2.0)
 
 
-def expected_sky_scatter(softening_sigma: float, floor_sigma: float = 0.0) -> float:
+def expected_sky_scatter(softening_sigma: float, floor_sigma: float = 0.0,
+                         pedestal_sigma: float | None = None) -> float:
     """Predicted spread of ``x`` for sky pixels.
 
     Without a floor this is ``0.721 / softening_sigma``: the slope of the map
@@ -123,6 +124,12 @@ def expected_sky_scatter(softening_sigma: float, floor_sigma: float = 0.0) -> fl
     ``floor_sigma = 0`` returns the closed form unchanged, so every caller and
     test written against the unfloored transform still means what it said.
 
+    ``pedestal_sigma`` is what the map bends over *to*, in the same units;
+    ``None`` means "the same as ``floor_sigma``".  Lowering it widens this,
+    because ``x`` is then the log of a smaller number: measured at the fitted
+    scales, dropping the pedestal from ``0.5 sigma`` to 0.1 nJy takes the
+    scatter from 0.265 to 0.378.
+
     Exact for a band at the noise level the single scale was measured from, and
     proportionally wider or narrower for a band deeper or shallower than that:
     the scatter is ``0.721 * sigma_band / s``.  So this is the *typical* width,
@@ -134,10 +141,12 @@ def expected_sky_scatter(softening_sigma: float, floor_sigma: float = 0.0) -> fl
     # Gauss-Hermite would need fewer points, but the integrand is a logarithm of
     # a softplus and the tail is what matters here, so a wide uniform grid over
     # the sky's own distribution is both simpler and easier to check.
+    if pedestal_sigma is None:
+        pedestal_sigma = floor_sigma
     u = np.linspace(-8.0, 8.0, 20001)
     weight = np.exp(-0.5 * u ** 2)
     weight /= weight.sum()
-    x = np.log(floor_sigma + softening_sigma
+    x = np.log(pedestal_sigma + softening_sigma
                * softplus((u - floor_sigma) / softening_sigma, np))
     mean = float((weight * x).sum())
     return float(np.sqrt((weight * (x - mean) ** 2).sum()))
@@ -167,32 +176,57 @@ def softplus(u, xp=None):
     return np.logaddexp(0.0, u)
 
 
-def soften(flux, scale, xp=None, floor=0.0):
-    """``floor + scale * softplus((flux - floor) / scale)``: nJy in, nJy out.
+def soften(flux, scale, xp=None, floor=0.0, pedestal=None):
+    """``pedestal + scale * softplus((flux - floor) / scale)``: nJy in, nJy out.
 
-    Two parameters, both fluxes, and they do different jobs:
+    Three parameters, all fluxes, and they do different jobs:
 
-    * ``floor`` is **where** the map bends over -- the flux the output
-      approaches from above and never goes below.  At ``floor = 0`` this is the
+    * ``floor`` is **where** the map bends over.  At ``floor = 0`` this is the
       original one-parameter softening exactly, which is why adding it broke
       nothing.
-    * ``scale`` is **how sharp** the bend is.  Above ``floor + a few scale`` the
-      map is the identity, since ``softplus(u) -> u`` exponentially fast.
+    * ``pedestal`` is **what it bends over to** -- the flux the output
+      approaches from below-infinity and never goes under.  ``None`` means
+      "the same as ``floor``", which is the two-parameter map this file had
+      before, so every caller that does not pass it is unchanged.
+    * ``scale`` is **how sharp** the bend is.
 
-    Separating them is the point.  With one parameter the only way to flatten
-    the sky was to raise the knee, which dragged faint *sources* into the
-    compressed regime with it: measured, pushing ``softening_sigma`` to 5 gets
-    the sky scatter down to 0.14 in x but reports a 3-sigma source 73% too
-    bright, and at 10 it is 2.8x too bright.  With the knee at ``floor = 1.5``
-    sky sigma and ``scale = sigma/3``, the sky scatter is 0.084 and a 3-sigma
-    source is wrong by 0.1%.
+    Separating the first two was asked for because a floor at ``0.5 sigma`` is
+    a *measurable* flux: the prior could represent no pixel fainter than about
+    6.5 nJy, which fights a likelihood that wants to go below it.  With
+    ``pedestal = 0.1`` the knee stays where the sky is -- the compression is
+    unchanged, since ``d soften / d f = sigmoid((f - floor) / scale)`` does not
+    involve the pedestal at all -- and the floor drops somewhere the data never
+    argues with.
+
+    **Two things it costs, both measured at the fitted scales.**  The sky
+    scatter in ``x`` rises 42% (0.265 to 0.378), because ``x`` is the log of a
+    smaller number and ``g'/g`` is therefore larger -- some of what the floor
+    was added to buy is given back.  And the bright end is **no longer the
+    identity**: ``softplus(u) -> u``, so the map tends to
+    ``f - (floor - pedestal)``, about 6.5 nJy low and varying per stamp because
+    ``floor`` does.  ``inverse`` (``exp(x)``) and ``inverse_exact`` no longer
+    converge at large flux; they stay that far apart forever.  Keeping the
+    identity would need a ``(floor - pedestal) * sigmoid((f - floor) / scale)``
+    term, which costs the closed-form inverse -- deliberately not taken.
+
+    Separating ``floor`` from ``scale`` is the older point.  With one parameter
+    the only way to flatten the sky was to raise the knee, which dragged faint
+    *sources* into the compressed regime with it: measured, pushing
+    ``softening_sigma`` to 5 gets the sky scatter down to 0.14 in x but reports
+    a 3-sigma source 73% too bright, and at 10 it is 2.8x too bright.  With the
+    knee at ``floor = 1.5`` sky sigma and ``scale = sigma/3``, the sky scatter
+    is 0.084 and a 3-sigma source is wrong by 0.1%.
 
     ``floor`` is meant to be **per stamp** -- a multiple of that cutout's own
     sky noise -- so the sky sits at its own level in each one and the prior
     gets a range of sky levels rather than a single memorised value.
+    ``pedestal`` is deliberately *not*: it is one constant for the whole set,
+    so the floor is a property of the representation rather than of the stamp.
     """
     xp = _xp(flux) if xp is None else xp
-    return floor + scale * softplus((flux - floor) / scale, xp)
+    if pedestal is None:
+        pedestal = floor
+    return pedestal + scale * softplus((flux - floor) / scale, xp)
 
 
 def log_softplus(u, xp=None):
@@ -229,19 +263,19 @@ class LogFluxTransform:
             )
         return cls(softening=float(s))
 
-    def soften(self, flux, floor=0.0):
-        """``floor + s * softplus((flux - floor) / s)``: nJy in, nJy out.
+    def soften(self, flux, floor=0.0, pedestal=None):
+        """``pedestal + s * softplus((flux - floor) / s)``: nJy in, nJy out.
 
         The definition the other maps are built from.  ``forward`` is
         ``log(soften(f))`` and ``inverse`` is exactly this composed with it, so
         this is the one place the shape is stated and the only shape the model
         can express.  ``floor`` may be an array, one entry per stamp.
         """
-        return soften(flux, self.softening, _xp(flux), floor)
+        return soften(flux, self.softening, _xp(flux), floor, pedestal)
 
     # -- the two maps ------------------------------------------------------
 
-    def forward(self, flux, floor=0.0):
+    def forward(self, flux, floor=0.0, pedestal=None):
         """nJy -> log space: ``log(soften(f, floor))``, which tends to ``log(f)``.
 
         Takes no band.  Defined and finite for every real input, at any floor.
@@ -258,22 +292,27 @@ class LogFluxTransform:
         """
         xp = _xp(flux)
         s = self.softening
+        if pedestal is None:
+            pedestal = floor
         u = (flux - floor) / s
-        val = self.soften(flux, floor)
+        val = self.soften(flux, floor, pedestal)
         # ``log_softplus(u) + log(s)``: the exact limit, used wherever the
         # direct form loses it.  Below u = -20 softplus is subnormal and
         # ``log(s * softplus(u))`` drifts -- half a nat at u = -745 -- while
         # ``u`` itself is exact to 1e-9 there; below u = -745 it underflows to
         # zero outright and the direct form is -inf.
         #
-        # Only reachable at ``floor == 0``.  A positive floor keeps ``val`` at
-        # or above it, so nothing underflows and the direct branch is exact.
+        # Only reachable at ``pedestal == 0``.  Any positive pedestal keeps
+        # ``val`` at or above it, so nothing underflows and the direct branch
+        # is exact.  It is the *pedestal* and not the floor that decides this:
+        # the floor shifts the softplus argument, the pedestal is what the
+        # output cannot go below.
         limit = u + log(s)
         direct = val > 0
         if xp is not np:
-            degenerate = (xp.asarray(floor) == 0) & (u < _LINEAR_BELOW)
+            degenerate = (xp.asarray(pedestal) == 0) & (u < _LINEAR_BELOW)
         else:
-            degenerate = (np.asarray(floor) == 0) & (u < _LINEAR_BELOW)
+            degenerate = (np.asarray(pedestal) == 0) & (u < _LINEAR_BELOW)
         direct = direct & ~degenerate
         return xp.where(direct, xp.log(xp.where(direct, val, 1.0)), limit)
 
@@ -298,9 +337,9 @@ class LogFluxTransform:
         """
         return _xp(x).exp(x)
 
-    def inverse_exact(self, x, floor=0.0):
+    def inverse_exact(self, x, floor=0.0, pedestal=None):
         """The true inverse of ``forward``: ``floor + s * log(expm1(v))`` with
-        ``v = (exp(x) - floor) / s``.
+        ``v = (exp(x) - pedestal) / s``.
 
         For round-trip checks and for recovering the measured flux, including
         its negative values.  Pass the same ``floor`` the forward map was given,
@@ -309,14 +348,16 @@ class LogFluxTransform:
         """
         xp = _xp(x)
         s = self.softening
+        if pedestal is None:
+            pedestal = floor
         # ``v = softplus((f - floor)/s)``: the quantity the three regimes below
         # are expressed in, and ``cx = log(v)``.  At ``floor == 0`` that log is
         # ``x - log(s)`` in closed form, which stays exact where ``exp(x)``
         # itself has long underflowed; with a positive floor ``x`` is bounded
         # below by ``log(floor)`` so there is nothing to underflow.
-        zero_floor = xp.asarray(floor) == 0
+        zero_floor = xp.asarray(pedestal) == 0
         v = xp.where(zero_floor, xp.exp(x - log(s)),
-                     (xp.exp(xp.where(zero_floor, 0.0, x)) - floor) / s)
+                     (xp.exp(xp.where(zero_floor, 0.0, x)) - pedestal) / s)
         # A pixel sitting exactly at the floor has ``v == 0``: its original flux
         # was minus infinity, and the floor threw it away.  Substituting the
         # smallest positive double rather than 1.0 keeps ``cx`` hugely negative,
@@ -341,14 +382,25 @@ class LogFluxTransform:
 
     # -- analytic diagnostics ---------------------------------------------
 
-    def sky_level_at(self, floor=0.0):
-        """``x`` at zero flux: ``log(floor + s * log 2)``.  Where the sky sits.
+    def sky_level_at(self, floor=0.0, pedestal=None):
+        """``x`` at zero flux: ``log(soften(0))``.  Where the sky sits.
 
         With a per-stamp floor this is per stamp too, which is the point --
         each cutout's sky sits at its own level, so the prior sees a range of
         them rather than one memorised value.
+
+        **This used to read ``log(floor + s * log 2)``, which was wrong.**
+        That is ``log(soften(0))`` only at ``floor = 0``, where
+        ``softplus(0) = log 2`` -- the expression was the unfloored one with
+        the floor added on, and it was never updated when the floor landed.
+        At the fitted scales it overstated the sky by 0.13 nats, and it fed
+        ``Config.input_offset``, the transform figure's sky marker and
+        ``prepare_config``'s report alike.  The same class of mistake as the
+        figure that went on drawing an unfloored map of a floored dataset:
+        two statements of one quantity, and only one of them maintained.
         """
-        return _xp(floor).log(floor + self.softening * log(2.0))
+        return _xp(floor).log(self.soften(0.0 * _xp(floor).asarray(floor),
+                                          floor, pedestal))
 
     @property
     def sky_level(self) -> float:

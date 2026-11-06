@@ -179,3 +179,30 @@ def test_an_unknown_config_field_does_not_stop_a_model_loading(standalone_loader
     (d / "config.json").write_text(json.dumps(cfg))
     prior = standalone_loader(d)
     assert prior.size == SIZE
+
+
+def test_an_older_checkpoints_floor_bounds_still_read(standalone_loader, tmp_path):
+    """``floor_sigma_lo``/``hi`` became one ``floor_sigma``.
+
+    A checkpoint written before that carries the pair, and its floor was the
+    *midpoint* of the two -- that is exactly what ``Config.input_offset``
+    computed then, so reading it that way is a restatement rather than a
+    guess.  Nothing else in the file changes, so the model must load and the
+    offset must come out at the midpoint's value.
+    """
+    sys.path.insert(0, str(STANDALONE))
+    try:
+        from host_prior._prior import _floor_k, _input_offset
+    finally:
+        sys.path.remove(str(STANDALONE))
+
+    new = {"softening": 26.0, "softening_sigma": 2.0, "floor_sigma": 0.5,
+           "floor_pedestal": 0.1}
+    old = {"softening": 26.0, "softening_sigma": 2.0, "floor_sigma_lo": 0.25,
+           "floor_sigma_hi": 0.75, "floor_pedestal": 0.1}
+    assert _floor_k(old) == 0.5
+    assert _floor_k(new) == 0.5
+    assert _input_offset(old) == _input_offset(new)
+
+    # And a config from before the floor existed at all is still unfloored.
+    assert _floor_k({"softening": 26.0}) == 0.0

@@ -211,20 +211,26 @@ def test_transform_figure_marks_the_floored_sky_position(dataset, tmp_path):
         rng.choice(len(dataset), size=min(2, len(dataset)), replace=False)
         hist_idx = np.sort(rng.choice(len(dataset),
                                       size=min(256, len(dataset)), replace=False))
-        levels = np.atleast_1d(np.asarray(dataset.transform.sky_level_at(
-            dataset.sky_floor(dataset._sky_noise(hist_idx), None)))).ravel()
+        # Where zero flux lands for those stamps, through the loader's own
+        # path rather than the figure's formula -- otherwise this would mirror
+        # whatever `plot_transform` does and could not catch it dropping the
+        # floor or the pedestal, which is what it is here to catch.
+        zeros = np.zeros((len(hist_idx), 2, 2), dtype=np.float32)
+        logged, _ = dataset.to_log_space(zeros, dataset._sky_noise(hist_idx))
+        levels = np.asarray(logged)[:, 0, 0]
 
         assert marked[0] == pytest.approx(float(np.median(levels)))
         # Whatever the floor is set to, the figure must describe *that* floor
         # and not the unfloored transform it used to draw.  Nothing here pins
-        # how large the difference is -- the floor bounds and the softening are
-        # knobs to experiment with, and an assertion on their magnitude is one
-        # that fights the experiment.
-        k = 0.5 * (t.floor_sigma_lo + t.floor_sigma_hi)
+        # how large the difference is, or which way it goes -- the floor, the
+        # pedestal and the softening are knobs to experiment with, and with a
+        # pedestal below the floor the sky moves *down* rather than up.  An
+        # assertion on the magnitude or the sign is one that fights the
+        # experiment; that they differ at all is the claim.
         if t.floors_enabled:
-            assert marked[0] > dataset.transform.sky_level
-            assert expected_sky_scatter(t.softening_sigma, k) < \
-                expected_sky_scatter(t.softening_sigma)
+            assert marked[0] != pytest.approx(dataset.transform.sky_level)
+            assert t.predicted_sky_scatter != pytest.approx(
+                expected_sky_scatter(t.softening_sigma))
         else:
             assert marked[0] == pytest.approx(dataset.transform.sky_level)
     finally:

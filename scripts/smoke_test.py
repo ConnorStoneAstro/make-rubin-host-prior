@@ -34,7 +34,6 @@ from rubin_host_prior.data import (
     PatchDataset,
     ShardSet,
     estimate_softening,
-    expected_sky_scatter,
     pool_shards,
     reach_advice,
     suggest_sigma_range,
@@ -126,7 +125,7 @@ def main() -> None:
     config.sde.data_mean = float(stats["mean"])
     print(f"[2] softening {config.transform.softening:.1f} nJy")
     print(f"    sky_scatter {stats['sky_scatter']:.3f} (expect ~"
-          f"{expected_sky_scatter(config.transform.softening_sigma, 0.5 * (config.transform.floor_sigma_lo + config.transform.floor_sigma_hi)):.2f}), "
+          f"{config.transform.predicted_sky_scatter:.2f}), "
           f"deepest {stats['deepest_flux_sigma']:.1f} sigma")
     print(f"    sky level {stats['sky_level']:.2f} (every band)")
     print(f"    sigma range [{config.sde.sigma_min:.4f}, {config.sde.sigma_max:.2f}]"

@@ -209,10 +209,8 @@ class PatchDataset:
         return np.asarray(self.shards.meta["sky_noise"],
                           dtype=np.float32)[self._rows_for(indices)]
 
-    def sky_floor(
-        self, sky_noise: np.ndarray, rng: np.random.Generator | None
-    ) -> np.ndarray | float:
-        """The per-stamp floor in nJy: ``k * pooled sigma``, ``k`` drawn per stamp.
+    def sky_floor(self, sky_noise: np.ndarray) -> np.ndarray | float:
+        """The per-stamp floor in nJy: ``floor_sigma * that stamp's pooled sigma``.
 
         ``sky_noise`` is the native-resolution number the shards carry, so it is
         divided by ``pool_factor`` and corrected by the measured
@@ -220,10 +218,14 @@ class PatchDataset:
         it by less than ``pool_factor`` and the uncorrected figure would put the
         floor too low.
 
+        **No rng.**  ``floor_sigma`` is one number for the set; the per-stamp
+        variation is each cutout's own sky noise, which is measured rather than
+        drawn, so this is deterministic and the same on every path.  It used to
+        take one, to jitter ``k`` within ``[lo, hi]`` as an augmentation, which
+        made the unaugmented and augmented paths floor differently.
+
         Returns ``0.0`` when floors are switched off, which is exactly the
-        pre-floor transform.  Without an rng -- the unaugmented path, which has
-        to be reproducible -- ``k`` is the midpoint rather than a draw, and the
-        per-stamp variation comes from each cutout's own sky noise alone.
+        pre-floor transform.
         """
         t = self.config.transform
         if not t.floors_enabled:
@@ -238,11 +240,7 @@ class PatchDataset:
             )
         sigma = np.asarray(sky_noise, dtype=np.float64) / self.config.patch.pool_factor
         sigma = sigma * float(ratio)
-        if rng is None or t.floor_sigma_hi == t.floor_sigma_lo:
-            k = 0.5 * (t.floor_sigma_lo + t.floor_sigma_hi)
-        else:
-            k = rng.uniform(t.floor_sigma_lo, t.floor_sigma_hi, size=sigma.shape)
-        return (k * sigma)[:, None, None]
+        return (t.floor_sigma * sigma)[:, None, None]
 
     def _pool_stamps(
         self,
@@ -283,8 +281,6 @@ class PatchDataset:
         self,
         pooled: np.ndarray,
         sky_noise: np.ndarray | None,
-        rng: np.random.Generator | None,
-        augment: bool,
     ) -> tuple[np.ndarray, np.ndarray | float]:
         """Pooled flux -> ``x``, and the floor that was used.  ``(x, floor)``.
 
@@ -294,15 +290,17 @@ class PatchDataset:
         reimplemented the chain is exactly how the transform figure came to be
         drawing an unfloored map of a floored dataset.
 
-        The ``k`` draw is an *augmentation*, so it follows ``augment`` and not
-        merely whether an rng exists: ``validation_batch`` and the diagnostic
-        figures pass an rng with augmentation off and have to be reproducible.
-        Each stamp still floors at its own level either way -- that comes from
-        its own sky noise -- it is only the jitter on ``k`` that freezes.
+        **Deterministic given the stamp.**  Each cutout floors at a fixed
+        multiple of its own measured sky noise, so the augmented and
+        unaugmented paths see the same floor for the same stamp.  It took an
+        rng and an ``augment`` flag while ``k`` was jittered per stamp.
         """
-        floor = (0.0 if sky_noise is None
-                 else self.sky_floor(sky_noise, rng if augment else None))
-        return self.transform.forward(pooled, floor), floor
+        floor = 0.0 if sky_noise is None else self.sky_floor(sky_noise)
+        # The pedestal rides with the floor: both are off when floors are, so
+        # `floors_enabled = False` is still the original one-parameter map.
+        pedestal = (self.config.transform.floor_pedestal
+                    if self.config.transform.floors_enabled else 0.0)
+        return self.transform.forward(pooled, floor, pedestal), floor
 
     def batch_from_stamps(
         self,
@@ -328,7 +326,7 @@ class PatchDataset:
             scale_jitter=aug.scale_jitter if augment else 0.0,
             out_size=out_size,
         )
-        x, _ = self.to_log_space(x, sky_noise, rng, augment)
+        x, _ = self.to_log_space(x, sky_noise)
         if augment and aug.dihedral:
             if rng is None:
                 raise ValueError("dihedral augmentation requires an rng")

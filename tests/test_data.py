@@ -1337,8 +1337,7 @@ def test_sky_scatter_matches_the_prediction(shard_dir):
         # the c = 0 relation.  With a floor the sky scatter is set by the floor
         # instead -- that is the whole point of having one -- so this check is
         # about the softening and has to switch the floor off to see it.
-        config.transform.floor_sigma_lo = 0.0
-        config.transform.floor_sigma_hi = 0.0
+        config.transform.floor_sigma = 0.0
         pooled, pooled_bands = pool_shards(ss, config)
         config.transform.softening = estimate_softening(pooled, ss_val)
         ds = PatchDataset.from_shards(
@@ -1496,9 +1495,20 @@ def _floored_config(shard_dir):
     return ss, config
 
 
-def test_the_loader_flattens_the_sky_and_varies_the_floor_per_stamp(shard_dir):
-    """End to end, which is the claim that matters: the sky stops being noisy
-    and every cutout floors somewhere slightly different."""
+def test_the_loader_floors_each_stamp_at_its_own_level(shard_dir):
+    """End to end: switching the floor on moves the sky by what
+    ``predicted_sky_scatter`` says it should, and every cutout floors somewhere
+    slightly different.
+
+    It used to assert that the floor *flattens* -- ``scatter_on < 0.5 *
+    scatter_off`` -- and that was true while the map bent over to the floor
+    itself, because the flattening came from the ``+c`` inside ``log(c + ...)``
+    rather than from the knee.  With ``floor_pedestal`` well below the floor
+    there is no ``+c`` to compress with, and the sky scatters slightly *wider*
+    than unfloored.  So the direction is now a config choice and this holds the
+    loader to the prediction instead of to a direction, which is also what
+    ``prepare_config`` warns on.
+    """
     import dataclasses
 
     ss, config = _floored_config(shard_dir)
@@ -1517,15 +1527,25 @@ def test_the_loader_flattens_the_sky_and_varies_the_floor_per_stamp(shard_dir):
                 b.reshape(len(b), -1).min(axis=1))
 
     off = dataclasses.replace(config)
-    off.transform = dataclasses.replace(config.transform, floor_sigma_lo=0.0,
-                                        floor_sigma_hi=0.0)
+    off.transform = dataclasses.replace(config.transform, floor_sigma=0.0)
     scatter_off, _ = measure(off)
     scatter_on, mins = measure(config)
 
-    # the sky goes from a wide wobble to a narrow one
-    assert scatter_on < 0.5 * scatter_off, (scatter_off, scatter_on)
-    # bounded below, and not all at the same place: each cutout floors at a
-    # multiple of its own sky noise, with k drawn per stamp
+    # The measured ratio against the predicted one.  A ratio because the two
+    # estimators differ -- this one is a per-patch std of the faint 40%,
+    # `expected_sky_scatter` is a quadrature over the sky's own Gaussian --
+    # and the ratio cancels most of that.  Nothing here pins the config: the
+    # prediction is computed from whatever it is set to.
+    want = (config.transform.predicted_sky_scatter
+            / off.transform.predicted_sky_scatter)
+    assert scatter_on / scatter_off == pytest.approx(want, rel=0.25), (
+        scatter_off, scatter_on, want)
+
+    # Bounded below by the pedestal, which is the point of having one, and not
+    # all at the same place: each cutout floors at a multiple of its own sky
+    # noise.  The bound is loose by construction -- the sky sits well above it
+    # -- but nothing may fall through it.
+    assert mins.min() > np.log(config.transform.floor_pedestal), mins.min()
     assert mins.std() > 0.005, mins
 
 
@@ -1559,9 +1579,21 @@ def test_expected_sky_scatter_tracks_the_floor(self_check=None):
     quoted = {0.25: 0.64, 0.5: 0.40, 0.75: 0.27, 1.0: 0.18, 1.5: 0.084}
     for k, want in quoted.items():
         assert expected_sky_scatter(1 / 3, k) == pytest.approx(want, abs=0.01), k
-    # monotone: a higher floor always flattens harder
+    # monotone: with the map bending over to the floor itself, a higher floor
+    # always flattens harder
     got = [expected_sky_scatter(1 / 3, k) for k in sorted(quoted)]
     assert got == sorted(got, reverse=True)
+
+    # And the other series the same comment quotes: with the pedestal well
+    # below the floor the direction reverses, because the flattening came from
+    # the `+c` and the pedestal is what stands in its place.  This is the one
+    # that applies to the shipped default, so it is the one worth holding.
+    low = {0.0: 0.361, 0.5: 0.376, 1.0: 0.392, 3.0: 0.440}
+    for k, want in low.items():
+        assert expected_sky_scatter(2.0, k, 0.0076) == pytest.approx(
+            want, abs=0.01), k
+    rising = [expected_sky_scatter(2.0, k, 0.0076) for k in sorted(low)]
+    assert rising == sorted(rising)
 
 
 def test_expected_sky_scatter_is_unchanged_without_a_floor():
