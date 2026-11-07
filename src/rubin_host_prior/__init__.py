@@ -19,17 +19,22 @@ The pieces, in the order they are used:
 ``inference``  Loading a trained prior and using it.
 ``geometry``   Shape arithmetic for the dilated architecture.
 
-**Three architectures**, chosen by ``Config.architecture``:
+**Four architectures**, chosen by ``Config.architecture``:
 
-``energy``         dilated convolutions summed to a scalar; score is ``-grad_x E``.
-``ncsnpp``         an NCSN++ U-Net predicting ``sigma * score`` directly.
-``ncsnpp_energy``  the same U-Net read as a scalar energy.
+``energy``          dilated convolutions summed to a scalar; score is ``-grad_x E``.
+``ncsnpp``          an NCSN++ U-Net predicting ``sigma * score`` directly.
+``ncsnpp_energy``   the same U-Net read as a scalar energy.
+``ncsnpp_encoder``  its downsampling half only, with taps at several
+                    resolutions summed into the energy; needs
+                    ``ncsnpp.energy_form = 'sum'``, since the ``dae`` form's
+                    derivation needs a full-resolution denoising residual and
+                    there is no decoder to produce one.
 
 The distinction that matters downstream is whether the score is the gradient of
-something.  It is for ``energy`` and ``ncsnpp_energy``, which therefore expose a
-potential; it is not for ``ncsnpp``, which is cheaper to train and cannot be
-used with any sampler that needs a Hamiltonian -- HMC among them, since its
-accept/reject step is on the energy and not on the score.
+something.  It is for ``energy``, ``ncsnpp_energy`` and ``ncsnpp_encoder``,
+which therefore expose a potential; it is not for ``ncsnpp``, which is cheaper
+to train and cannot be used with any sampler that needs a Hamiltonian -- HMC
+among them, since its accept/reject step is on the energy and not on the score.
 
 **Every architecture here is size-locked.**  The convolutions are same-mode and
 zero-padded, so the training grid is part of the operator: a model trained on

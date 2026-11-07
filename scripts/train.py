@@ -70,8 +70,13 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("--steps", type=int, default=None)
     p.add_argument("--batch-size", type=int, default=None)
     p.add_argument("--lr", type=float, default=None)
+    # From `Config.ARCHITECTURES`, not a second hand-written list.  The two
+    # drifted once already: `ncsnpp_encoder` was added to the config, the
+    # builder and the standalone loader, and this line was the one place that
+    # did not know about it, so the architecture could be configured but not
+    # asked for on the command line.
     p.add_argument("--architecture", default=None,
-                   choices=["energy", "ncsnpp", "ncsnpp_energy"],
+                   choices=list(Config.ARCHITECTURES),
                    help="override the config's architecture. Both sections are "
                         "always present in a config, so this switches which one "
                         "is built without disturbing the other")
@@ -151,8 +156,8 @@ def main() -> None:
         if config.architecture != "energy":
             raise SystemExit(
                 "--n-layers resizes the energy model's first branch; the "
-                "architecture is 'ncsnpp', whose depth is ch_mult and "
-                "num_blocks in the config."
+                f"architecture is {config.architecture!r}, whose depth is "
+                "ch_mult and num_blocks in the config."
             )
         # The first branch only: it is the one whose depth is a free choice.
         # A long-range branch's layer count is set by the reach it has to cover,

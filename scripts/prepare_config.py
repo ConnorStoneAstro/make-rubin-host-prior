@@ -87,14 +87,19 @@ def parser() -> argparse.ArgumentParser:
         "and the flux above which the exponential model map is "
         "accurate. Omit to use the config's own value",
     )
+    # From `Config.ARCHITECTURES` rather than a second hand-written list; see
+    # the same argument in train.py for what drifted when it was one.
     p.add_argument("--architecture", default=None,
-                   choices=["energy", "ncsnpp", "ncsnpp_energy"],
+                   choices=list(Config.ARCHITECTURES),
                    help="which network computes the score. 'energy' is the "
                         "dilated-convolution scalar; 'ncsnpp' is the U-Net, "
                         "which predicts sigma*score directly and is not "
                         "conservative; 'ncsnpp_energy' is the same U-Net read "
-                        "as a scalar energy, which is what HMC needs. Omit to "
-                        "use the config's own value")
+                        "as a scalar energy, which is what HMC needs; "
+                        "'ncsnpp_encoder' is its downsampling half only, with "
+                        "taps summed at several resolutions, and needs "
+                        "ncsnpp.energy_form='sum'. Omit to use the config's "
+                        "own value")
     p.add_argument("--pool-factor", type=int, default=None,
                    help="omit to use the config's own value")
     p.add_argument("--out-size", type=int, default=None,
@@ -345,12 +350,13 @@ def main() -> None:
     # frame is mostly sky and the map is smooth across it.  Once the knee is
     # sharp enough to pin the sky, the measurement spans the gap from the
     # pedestal up to the sources instead, and a mismatch means nothing.
+    if pinned == pinned and floor:
+        print(f"  {pinned:.0%} of pixels are pinned to the pedestal")
     if pinned == pinned and pinned > 0.5:
         print(
-            f"  {pinned:.0%} of pixels are pinned to the pedestal, so the "
-            "measured number is the pedestal-to-source gap, not a sky width; "
-            "the prediction is the width of the spike and the two are not "
-            "comparable here."
+            "  past half, so the measured number is the pedestal-to-source "
+            "gap rather than a sky width; the prediction is the width of the "
+            "spike and the two are not comparable here."
         )
         print(
             f"  sigma_min is set from the measured {stats['sky_scatter']:.3f}, "
@@ -363,8 +369,22 @@ def main() -> None:
             + ("floor or the softening scale is probably wrong." if floor
                else "softening scale is probably wrong.")
         )
-    elif pinned == pinned and floor:
-        print(f"  {pinned:.0%} of pixels are pinned to the pedestal")
+        if floor:
+            # Worth saying before anyone goes hunting: the two numbers are not
+            # measuring the same pixels.  The prediction integrates over sky
+            # alone; the measurement is every pixel in the frame, sources
+            # included, and everything above the knee rides the identity up.
+            # So the measurement sits above the prediction by design, and by
+            # more as `floor_sigma` rises.  A ratio a little past 2 on a field
+            # full of structure is that, not a broken scale.
+            print(
+                "  before changing anything: the prediction is sky only, the "
+                "measurement is every pixel, and sources above the knee pull "
+                "it up -- expect the measurement high, and higher at a higher "
+                "floor_sigma. Suspect the scale when the measurement is "
+                "*below* the prediction, or far above it with few pixels "
+                "pinned."
+            )
 
     # -- sigma_max, the standard way -------------------------------------
     #
@@ -429,9 +449,13 @@ def main() -> None:
               f"{config.input_offset:.2f} so those zeros sit at the sky")
     else:
         cfg = config.ncsnpp
-        if config.architecture == "ncsnpp_energy":
+        if config.architecture in ("ncsnpp_energy", "ncsnpp_encoder"):
             print(f"  scalar energy by '{cfg.energy_form}'; score is -grad_x E, "
                   f"so a step is a gradient of a gradient (2-3x, halve the batch)")
+        if config.architecture == "ncsnpp_encoder":
+            print(f"  encoder only: the upsampling half is dropped and the "
+                  f"energy is summed from taps at every resolution, so there "
+                  f"is no full-resolution output to read as sigma*score")
         print(f"  nf {cfg.nf}, ch_mult {tuple(cfg.ch_mult)}, "
               f"{cfg.num_blocks} blocks/level -> resolutions "
               f"{[size // 2 ** i for i in range(cfg.n_levels)]}")

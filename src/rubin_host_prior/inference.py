@@ -195,8 +195,9 @@ class Prior:
                 f"{self.source} was trained with architecture "
                 f"{self.architecture!r}, which predicts the score directly and "
                 f"is not the gradient of anything -- there is no energy to "
-                f"return. Train with architecture 'ncsnpp_energy' (or 'energy') "
-                f"if you need a potential, e.g. for HMC's accept/reject step."
+                f"return. Train with architecture 'ncsnpp_energy', "
+                f"'ncsnpp_encoder' or 'energy' if you need a potential, e.g. "
+                f"for HMC's accept/reject step."
             )
         batched, shape = self._as_batch(x)
         e = _energy(self.model, batched, self._sigmas(sigma, len(batched)),

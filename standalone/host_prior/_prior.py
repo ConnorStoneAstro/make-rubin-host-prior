@@ -21,7 +21,7 @@ import jax.numpy as jnp
 import numpy as np
 
 from ._net import NCSNpp, NCSNppEncoderEnergy, NCSNppEnergy
-from ._support import NCSNppConfig
+from ._support import EnergyModel, NCSNppConfig
 
 _LINEAR_BELOW = -20.0
 _EXPM1_ABOVE = 30.0
@@ -296,8 +296,15 @@ class Prior:
     def is_energy(self) -> bool:
         """Whether ``energy`` is available -- i.e. whether the score is an exact
         gradient.  False for ``architecture="ncsnpp"``, which predicts the score
-        directly and defines no potential."""
-        return isinstance(self.model, NCSNppEnergy)
+        directly and defines no potential.
+
+        Against ``EnergyModel`` and not a list of classes, which is what the
+        training package's ``inference.Prior`` does and what keeps the two in
+        step.  It was ``isinstance(self.model, NCSNppEnergy)``, and
+        ``NCSNppEncoderEnergy`` is a sibling rather than a subclass of that,
+        so an encoder checkpoint produced a correct score and then refused to
+        give up its energy -- which is the one thing HMC needs."""
+        return isinstance(self.model, EnergyModel)
 
     @property
     def sigma_min(self) -> float:
@@ -360,7 +367,7 @@ class Prior:
                 f"{self.architecture!r}, which predicts the score directly and "
                 f"is not the gradient of anything -- there is no energy to "
                 f"return. It needs a checkpoint trained with architecture "
-                f"'ncsnpp_energy'."
+                f"'ncsnpp_energy' or 'ncsnpp_encoder'."
             )
         batched, shape = self._as_batch(x)
         e = _energy(self.model, batched, self._sigmas(sigma, len(batched)),

@@ -424,11 +424,13 @@ class TransformConfig:
     not enough: at ``c = 1 sigma, s = 0.12 sigma`` zero flux sits on the
     pedestal to four digits and the sky still scatters 2.14 in x, because a
     sixth of it is above one sigma and rides the identity up.  At ``c = 2
-    sigma`` that fraction is 2% and the scatter is 0.040.
+    sigma`` that fraction is 2% and the scatter is 0.041 at a sharp knee,
+    0.956 at the default one.
 
     The defaults are the second of those.  What they cost is everything
     below two sky sigma, which is compressed into the floor: a 2-sigma pixel
-    reads 14.2 nJy against a true 26.2.  Three sigma is exact.
+    reads about half its flux; see ``softening_sigma`` for the series.  Three
+    sigma comes through whole.
 
     Both halves had to be rediscovered, because with ``p`` equal to ``c`` the
     flattening came from the ``+c`` inside the logarithm instead, and raising
@@ -478,16 +480,25 @@ class TransformConfig:
     #: pedestal is the ratio ``c / s``, so this and ``floor_sigma`` are two
     #: halves of one choice and neither reads sensibly alone.
     #:
-    #: 0.12 is deliberately sharp: at ``floor_sigma = 2`` it puts ``c / s`` at
-    #: 16.7, far above the 7.2 a pinned floor needs, and zero measured flux
-    #: lands on 0.1000 nJy.  Blunter knees give that up quickly -- at the same
-    #: floor, 0.18 scatters 0.41 and 0.25 scatters 0.95, against 0.040 here --
-    #: while barely reducing the restoration gain (3.3 and 2.5 against 4.7),
-    #: which is the only thing sharpening costs.  Measured instead with the
-    #: floor doing no work (``softening_sigma = 2``, ``floor_sigma = 1``, 0.1
-    #: nJy pedestal): scatter 0.392 and a 3-sigma source 12% low; s = 3 gives
-    #: 0.256 and 8% high; s = 4 gives 0.189 and 30% high.
-    softening_sigma: float = 0.25
+    #: **Deliberately not written around whichever value is set here**, which
+    #: is a knob and moves.  What is fixed is the axis: sharpening buys a
+    #: flatter sky and pays for it in restoration gain, bluntening does the
+    #: reverse, and the turn is abrupt rather than gradual.  At ``floor_sigma
+    #: = 2`` the floor stops being pinned above s = 0.279 (that is ``c / s``
+    #: falling through the 7.2 of the bound), and the sky scatter goes from
+    #: 0.04 to 1.0 over the factor of two below it.  Measured there with the
+    #: restoration term on:
+    #:
+    #:     s      c/s   zero flux   sky scatter   peak gain   f at 2 sigma
+    #:     0.12   16.7   0.100 nJy      0.041        4.67         54%
+    #:     0.25    8.0   0.110          0.956        2.52         59%
+    #:     0.35    5.7   0.201          1.431        1.97         62%
+    #:     0.50    4.0   0.688          1.564        1.56         67%
+    #:
+    #: Measured instead with the floor doing no work (``floor_sigma = 1``,
+    #: 0.1 nJy pedestal): s = 2 gives scatter 0.392 and a 3-sigma source 12%
+    #: low; s = 3 gives 0.256 and 8% high; s = 4 gives 0.189 and 30% high.
+    softening_sigma: float = 0.12
     #: What the soft floor bends over *to*, in nJy -- a single constant for
     #: the whole set, not a per-stamp multiple of the noise.  The floor itself
     #: (``floor_sigma`` times each cutout's own sky noise) is where the map
@@ -517,12 +528,12 @@ class TransformConfig:
     #:   16-84 range lies inside the floored region.
     #:
     #: Measured at ``softening_sigma = 0.12`` with the restoration term on:
-    #: scatter 2.14 at k = 1 against 0.040 at k = 2, with zero flux on the
+    #: scatter 2.14 at k = 1 against 0.041 at k = 2, with zero flux on the
     #: pedestal in both.  That is the second effect alone, and it is why the
     #: default is 2.  Its price is the first effect: the knee sits at two sky
-    #: sigma, so a 2-sigma pixel reads 14.2 nJy against a true 26.2 and
-    #: everything fainter is compressed into the floor.  3 sigma is exact to
-    #: 1.5e-4.
+    #: sigma, so a 2-sigma pixel reads about half its flux -- 54% at
+    #: ``softening_sigma = 0.12``, 59% at 0.25 -- and everything fainter is
+    #: compressed into the floor.  3 sigma comes through at 100% and 99%.
     #:
     #: Measured instead with the knee too blunt to pin anything
     #: (``softening_sigma = 2``, pedestal at 0.0076 sigma): 0.361 unfloored,
@@ -545,12 +556,13 @@ class TransformConfig:
     #: and ``s``, and this term is zero down there by construction -- it has
     #: to be, or it would lift the floor off the pedestal.  What it costs is a
     #: gain above one in a narrow ring around ``c``: at least 2.3, and 4.67
-    #: at the defaults, where it is above 2 over 0.54 sky sigma and above 1.1
-    #: over 0.92, centred on the knee.  Pixels in that ring have their noise
+    #: at ``floor_sigma = 2, softening_sigma = 0.12``, where it is above 2
+    #: over 0.54 sky sigma and above 1.1 over 0.92, centred on the knee.
+    #: ``softening_sigma`` carries the series.  Pixels in that ring have their noise
     #: amplified by that much; outside it the gain is 1.00 and the flux is
     #: true.  The peak is ``0.5 + (c - p) / (4 s)``, so it is the joint price
-    #: of a sharp knee and a high floor, and it is what stops sharpening past
-    #: 0.12 being free.  ``data.transform.soften`` derives the bound and why
+    #: of a sharp knee and a high floor, and it is what makes sharpening
+    #: ``softening_sigma`` cost something.  ``data.transform.soften`` derives the bound and why
     #: widening the handback to escape it puts the sky back up at 17 nJy.
     #:
     #: Costs the closed-form inverse: ``inverse_exact`` switches to Newton.

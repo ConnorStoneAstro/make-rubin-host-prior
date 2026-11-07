@@ -362,6 +362,18 @@ def test_the_config_builder_still_knows_where_to_read_and_write():
     assert p.get_default("shards").startswith(ExtractionConfig.out)
 
 
+def test_both_clis_offer_every_architecture_the_config_knows():
+    """``--architecture`` used to carry its own hand-written list in each
+    script, and `ncsnpp_encoder` reached the config, the builder and the
+    standalone loader without reaching either of those -- so it could be
+    configured but not asked for, and ``--architecture ncsnpp_encoder`` died
+    in argparse.  Both now read ``Config.ARCHITECTURES``; this holds them to
+    it rather than to a list, so a fifth one needs no edit here."""
+    for name in ("train.py", "prepare_config.py"):
+        actions = {a.dest: a for a in _script(name).parser()._actions}
+        assert set(actions["architecture"].choices) == set(Config.ARCHITECTURES), name
+
+
 def test_nominal_crop_is_derived_rather_than_stated():
     """It is exactly ``out_size * pool_factor``, so it was a second statement of
     a number the other two already fix -- and one that had to be edited in step

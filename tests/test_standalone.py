@@ -67,7 +67,13 @@ def test_the_exported_architecture_is_not_stale():
 
 
 @pytest.mark.parametrize("architecture,energy_form", [
-    ("ncsnpp", "sum"), ("ncsnpp_energy", "sum"), ("ncsnpp_energy", "dae")])
+    ("ncsnpp", "sum"), ("ncsnpp_energy", "sum"), ("ncsnpp_energy", "dae"),
+    # `ncsnpp_encoder` was missing from this list, and that is exactly how it
+    # came to load with a correct score and then refuse to give up its energy:
+    # the vendored `is_energy` tested `isinstance(model, NCSNppEnergy)` and the
+    # encoder is a sibling of that class, not a subclass.  'sum' only -- the
+    # config rejects 'dae' for this architecture, and a test below holds that.
+    ("ncsnpp_encoder", "sum")])
 def test_both_loaders_give_identical_numbers(standalone_loader, tmp_path,
                                              architecture, energy_form):
     """Identical, not close.  The two paths run the same code on the same
@@ -79,7 +85,10 @@ def test_both_loaders_give_identical_numbers(standalone_loader, tmp_path,
     assert lean.step == full.step == 4242
     assert lean.size == full.size == SIZE
     assert lean.pool_factor == full.pool_factor
-    assert lean.is_energy == full.is_energy == (architecture == "ncsnpp_energy")
+    # Every architecture here is a potential except plain `ncsnpp`, which
+    # predicts the score directly.  Stated that way round rather than naming
+    # the one that is, which is what let the encoder through.
+    assert lean.is_energy == full.is_energy == (architecture != "ncsnpp")
     assert lean.sigma_min == full.sigma_min
     assert lean.sigma_max == full.sigma_max
 
