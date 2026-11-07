@@ -1,5 +1,6 @@
 """The log transform, pooling, augmentation, shards and loader."""
 
+import math
 from pathlib import Path
 
 import numpy as np
@@ -1482,6 +1483,130 @@ def test_a_per_stamp_floor_broadcasts_over_a_batch():
     np.testing.assert_allclose(t.inverse_exact(x, floor=c), f, atol=1e-9)
 
 
+def test_the_restoration_term_makes_the_bright_end_exact():
+    """What ``restore_bright_end`` is for: the pedestal leaves the plain map a
+    flat ``floor - pedestal`` low at every flux, however bright, and this hands
+    it back above the knee."""
+    from rubin_host_prior.data.transform import LogFluxTransform
+
+    s, c, p = 1.572, 13.1, 0.1
+    plain = LogFluxTransform(softening=s)
+    restored = LogFluxTransform(softening=s, restore_bright_end=True)
+    bright = np.array([30.0 * c, 300.0 * c, 3e5])
+
+    # the plain map is low by exactly c - p, and stays that way forever
+    np.testing.assert_allclose(plain.soften(bright, c, p), bright - (c - p),
+                               rtol=1e-12)
+    # the restored one is the identity, to double precision
+    np.testing.assert_allclose(restored.soften(bright, c, p), bright, rtol=1e-12)
+    # and both still bend over to the same pedestal
+    for t in (plain, restored):
+        assert float(t.soften(np.array([-50.0 * c]), c, p)[0]) == pytest.approx(p)
+
+
+def test_the_restoration_term_leaves_the_floor_where_it_was():
+    """It must be dead at zero flux or it would lift the sky off the pedestal,
+    which is the whole constraint that forces the gain at the knee."""
+    from rubin_host_prior.data.transform import LogFluxTransform
+
+    s, c, p = 13.1 * 0.12, 13.1, 0.1
+    restored = LogFluxTransform(softening=s, restore_bright_end=True)
+    sky = float(restored.soften(np.array([0.0]), c, p)[0])
+    assert sky == pytest.approx(p, rel=0.05), sky
+
+    # The sky then lands within a tenth of a nat of the pedestal whatever that
+    # stamp's noise is -- `softening` is one number for the whole set and only
+    # the floor is per stamp, so c/s is what varies, and the level approaches
+    # log(p) from above as it grows.  That one-sidedness is the point: the
+    # stamps cannot straddle the pedestal, only sit above it.
+    levels = [float(restored.sky_level_at(np.array([1.0 * sig]), p)[0])
+              for sig in (11.0, 13.1, 16.0)]
+    assert max(levels) - min(levels) < 0.12, levels
+    assert levels == sorted(levels, reverse=True), levels
+    assert min(levels) > np.log(p), levels
+
+
+def test_the_restored_map_is_monotone_and_invertible():
+    """No closed-form inverse, so ``inverse_exact`` goes to Newton. It is still
+    a true inverse: both terms of the derivative are positive, so the root is
+    unique."""
+    from rubin_host_prior.data.transform import LogFluxTransform
+
+    s, c, p = 1.572, 13.1, 0.1
+    t = LogFluxTransform(softening=s, restore_bright_end=True)
+
+    f = np.linspace(-5.0 * s, 500.0, 200001)
+    assert np.all(np.diff(t.soften(f, c, p)) >= 0.0)
+
+    # round trip wherever the floor has not thrown the value away
+    f = np.concatenate([np.linspace(-5.0, 300.0, 5001), np.logspace(2.5, 9, 300)])
+    back = t.inverse_exact(t.forward(f, floor=c, pedestal=p), floor=c, pedestal=p)
+    np.testing.assert_allclose(back, f, rtol=1e-9, atol=1e-5)
+
+    # A per-stamp floor broadcasts through the Newton path, and it is no less
+    # accurate than the closed form on the same inputs.  Held as a comparison
+    # rather than an absolute tolerance because both lose the same precision
+    # the same way: `exp(x) - pedestal` cancels for a pixel tens of sigma
+    # below the floor, where the floor has thrown the value away in any case.
+    plain = LogFluxTransform(softening=s)
+    g = np.random.default_rng(0).normal(0.0, 13.1, (4, 8, 8))
+    cs = np.array([9.0, 11.0, 13.0, 17.0])[:, None, None]
+    worst = []
+    for tr in (t, plain):
+        back = tr.inverse_exact(tr.forward(g, floor=cs, pedestal=p),
+                                floor=cs, pedestal=p)
+        assert back.shape == g.shape
+        worst.append(float(np.abs(back - g).max()))
+    assert worst[0] <= 2.0 * worst[1], worst
+
+
+def test_the_restoration_gain_cannot_be_tuned_below_its_bound():
+    """The claim the ``soften`` docstring rests on: pinning the floor to the
+    pedestal forces a peak gain of at least ~2.3, whatever the two scales are.
+
+    If this ever fails, the docstring's "and the cost cannot be tuned away" is
+    wrong and the field comment that repeats it is too.
+    """
+    from rubin_host_prior.data.transform import LogFluxTransform
+
+    sigma, c, p = 13.1, 13.1, 0.1
+    f = np.linspace(-3.0 * sigma, 20.0 * sigma, 200001)
+    for ss in (0.08, 0.12, 0.2, 0.3, 0.5, 1.0, 2.0):
+        t = LogFluxTransform(softening=ss * sigma, restore_bright_end=True)
+        g = t.soften(f, c, p)
+        gain = float(np.diff(g).max() / (f[1] - f[0]))
+        pinned = float(t.soften(np.array([0.0]), c, p)[0]) < 1.1 * p
+        if pinned:
+            assert gain > 2.0, (ss, gain)
+        else:
+            # the escape is real but it costs the floor, which is the trade
+            assert gain < 2.0, (ss, gain)
+
+
+def test_expected_sky_scatter_reports_half_the_16_84_range():
+    """It is compared against ``stats()["sky_scatter"]``, which measures half
+    the 16-84 range, and ``prepare_config`` warns on a factor of two between
+    them.  It used to return a standard deviation: the same number for a
+    near-Gaussian x, and wildly different once the floor bites."""
+    from rubin_host_prior.data.transform import expected_sky_scatter, soften
+
+    u = np.linspace(-8.0, 8.0, 400001)
+    w = np.exp(-0.5 * u ** 2)
+    w /= w.sum()
+    for ss, k, ped in ((2.0, 1.0, 0.0076), (0.25, 4.0, 0.0076),
+                       (1 / 3, 1.5, None)):
+        x = np.log(soften(u, ss, np, k, ped))
+        lo, hi = np.interp([0.16, 0.84], np.cumsum(w), x)
+        assert expected_sky_scatter(ss, k, ped) == pytest.approx(
+            0.5 * (hi - lo), abs=2e-3), (ss, k, ped)
+
+    # and the two statistics really do come apart once the sky is pinned
+    x = np.log(soften(u, 0.25, np, 4.0, 0.0076))
+    mean = float((w * x).sum())
+    std = float(np.sqrt((w * (x - mean) ** 2).sum()))
+    assert std > 0.04 and expected_sky_scatter(0.25, 4.0, 0.0076) < 0.01
+
+
 def _floored_config(shard_dir):
     """A config with everything the floor needs measured, like prepare_config."""
     ss = ShardSet.from_dir(shard_dir)
@@ -1522,31 +1647,75 @@ def test_the_loader_floors_each_stamp_at_its_own_level(shard_dir):
                               augment=False)
         finally:
             ds.close()
-        faint = np.percentile(b, 40, axis=(1, 2, 3))
-        return (float(np.mean([p[p <= f].std() for p, f in zip(b, faint)])),
-                b.reshape(len(b), -1).min(axis=1))
+        # Half the 16-84 range, which is what `stats()["sky_scatter"]`
+        # measures and therefore what `predicted_sky_scatter` predicts.  It
+        # was a per-patch standard deviation of the faint 40%, and that was
+        # fine only while x stayed near-Gaussian: once the floor pins the sky
+        # the distribution is a spike plus a one-sided tail and the two
+        # statistics stop tracking each other, so the ratio below stopped
+        # cancelling the difference between them.
+        p16, p84 = np.percentile(b, [16, 84])
+        return float(0.5 * (p84 - p16)), b.reshape(len(b), -1).min(axis=1)
 
     off = dataclasses.replace(config)
     off.transform = dataclasses.replace(config.transform, floor_sigma=0.0)
     scatter_off, _ = measure(off)
     scatter_on, mins = measure(config)
 
-    # The measured ratio against the predicted one.  A ratio because the two
-    # estimators differ -- this one is a per-patch std of the faint 40%,
-    # `expected_sky_scatter` is a quadrature over the sky's own Gaussian --
-    # and the ratio cancels most of that.  Nothing here pins the config: the
-    # prediction is computed from whatever it is set to.
-    want = (config.transform.predicted_sky_scatter
-            / off.transform.predicted_sky_scatter)
-    assert scatter_on / scatter_off == pytest.approx(want, rel=0.25), (
-        scatter_off, scatter_on, want)
+    t = config.transform
+    pooled_sigma = t.softening / t.softening_sigma
+    c, s, pedestal = t.floor_sigma * pooled_sigma, t.softening, t.floor_pedestal
+    # Reaching the pedestal to within 10% needs `c / s > log(10 (c - p) / p)`;
+    # above that the sky is a spike on the pedestal rather than a peak with a
+    # width.  Read off whatever the config is set to -- nothing here pins it.
+    pinned = c / s > math.log(10.0 * (c - pedestal) / pedestal)
 
-    # Bounded below by the pedestal, which is the point of having one, and not
-    # all at the same place: each cutout floors at a multiple of its own sky
-    # noise.  The bound is loose by construction -- the sky sits well above it
-    # -- but nothing may fall through it.
-    assert mins.min() > np.log(config.transform.floor_pedestal), mins.min()
-    assert mins.std() > 0.005, mins
+    if not pinned:
+        # The measured ratio against the predicted one.  A ratio rather than
+        # the value because `expected_sky_scatter` integrates over one
+        # Gaussian at one noise level while the loader floors each stamp at a
+        # multiple of its own, against a single shared softening scale; the
+        # ratio cancels most of that.
+        want = (t.predicted_sky_scatter / off.transform.predicted_sky_scatter)
+        assert scatter_on / scatter_off == pytest.approx(want, rel=0.25), (
+            scatter_off, scatter_on, want)
+    else:
+        # Pinned: `expected_sky_scatter` predicts the width of the spike while
+        # this measures the 16-84 range of every pixel, which now spans the
+        # gap from the pedestal up to the sources.  Not comparable, the same
+        # split `prepare_config` makes.  What is still checkable is that the
+        # floor bites at all, which unfloored it does not.
+        assert scatter_on < scatter_off, (scatter_on, scatter_off)
+
+    # Bounded below by the pedestal, which is the point of having one.  The
+    # slack is float32, which is what the batch is: with the floor pinned
+    # every stamp sits *exactly* on the pedestal rather than somewhere above
+    # it, so the bound is tight and `log(0.1)` does not round the same way in
+    # single precision.
+    assert float(np.exp(mins.min())) >= pedestal * (1.0 - 1e-5), mins.min()
+
+    # Each cutout floors at a multiple of *its own* sky noise, so one fixed
+    # flux reads differently in a noisy stamp than in a quiet one, ordered by
+    # that stamp's noise.  Asserted on the map rather than on the spread of
+    # `mins`, which that used to do: once the floor is pinned every stamp
+    # bottoms out on the one shared pedestal and that spread goes to zero.
+    # The per-stamp floor is still there, it just stops showing at the bottom
+    # of the frame -- and the atom it was introduced to prevent is then back,
+    # by choice, which is a config question and not this test's business.
+    ds = PatchDataset.from_shards(ss, config, transform, max_in_memory_gb=16.0)
+    try:
+        noise = ds._sky_noise(np.arange(n))
+        floors = np.asarray(ds.sky_floor(noise)).reshape(-1)
+    finally:
+        ds.close()
+    uniq = np.unique(floors)
+    assert uniq.size > 1, floors
+    # More noise -> higher floor -> the probe sits further below the knee ->
+    # lower x.  Over the distinct floors, because several cutouts can share a
+    # sky noise and then share a floor; that is a tie, not a failure.
+    x_probe = np.asarray(transform.forward(np.full(uniq.size, c), floor=uniq,
+                                           pedestal=pedestal))
+    assert np.all(np.diff(x_probe) < 0), (uniq, x_probe)
 
 
 def test_the_floor_refuses_to_guess_the_pooled_noise_ratio(shard_dir):
@@ -1576,7 +1745,7 @@ def test_expected_sky_scatter_tracks_the_floor(self_check=None):
     """
     from rubin_host_prior.data import expected_sky_scatter
 
-    quoted = {0.25: 0.64, 0.5: 0.40, 0.75: 0.27, 1.0: 0.18, 1.5: 0.084}
+    quoted = {0.25: 0.69, 0.5: 0.37, 0.75: 0.20, 1.0: 0.102, 1.5: 0.021}
     for k, want in quoted.items():
         assert expected_sky_scatter(1 / 3, k) == pytest.approx(want, abs=0.01), k
     # monotone: with the map bending over to the floor itself, a higher floor
@@ -1588,7 +1757,7 @@ def test_expected_sky_scatter_tracks_the_floor(self_check=None):
     # below the floor the direction reverses, because the flattening came from
     # the `+c` and the pedestal is what stands in its place.  This is the one
     # that applies to the shipped default, so it is the one worth holding.
-    low = {0.0: 0.361, 0.5: 0.376, 1.0: 0.392, 3.0: 0.440}
+    low = {0.0: 0.361, 0.5: 0.375, 1.0: 0.392, 3.0: 0.441}
     for k, want in low.items():
         assert expected_sky_scatter(2.0, k, 0.0076) == pytest.approx(
             want, abs=0.01), k

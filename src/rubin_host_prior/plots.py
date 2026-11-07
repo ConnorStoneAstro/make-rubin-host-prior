@@ -703,6 +703,7 @@ def plot_transform(dataset, n: int = 4, seed: int = 0, out: Path | None = None):
     fill = dict(dataset._last_fill)
     noise = dataset._sky_noise(idx)
     logged, _ = dataset.to_log_space(pooled, noise)
+    t_cfg = dataset.config.transform
 
     fig = plt.figure(figsize=(10.5, 2.4 * n + 2.6))
     gs = fig.add_gridspec(n + 1, 3, height_ratios=[1] * n + [1.25])
@@ -717,8 +718,9 @@ def plot_transform(dataset, n: int = 4, seed: int = 0, out: Path | None = None):
                     True,
                 ),
                 (np.arcsinh(pooled[k] / sigma), "pooled flux (asinh)", "magma", True),
-                (logged[k],
-                 "x = log(p + s\u00b7softplus((f−c)/s))", "viridis", False),
+                (logged[k], "x = log(soften(f))" if t_cfg.restore_bright_end
+                 else "x = log(p + s\u00b7softplus((f−c)/s))",
+                 "viridis", False),
             )
         ):
             ax = fig.add_subplot(gs[k, col])
@@ -737,7 +739,7 @@ def plot_transform(dataset, n: int = 4, seed: int = 0, out: Path | None = None):
     allx = dataset.make_batch(hist_idx, rng=None, augment=False)[:, 0].ravel()
     ax.hist(allx, bins=200, color="0.3")
 
-    t = dataset.config.transform
+    t = t_cfg
     # Where zero flux lands, for the same patches the histogram is drawn from.
     # Not one line any more: the floor is a multiple of each cutout's own sky
     # noise, so the sky level is a spread, and that spread is deliberate -- it

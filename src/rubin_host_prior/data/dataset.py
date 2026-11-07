@@ -575,6 +575,17 @@ class PatchDataset:
         # widths about that shared level, so what this gives is a typical one.
         p16, p84 = np.percentile(x, [16, 84])
         sky_scatter = float(0.5 * (p84 - p16))
+        # Fraction sitting on the pedestal, within 1% in flux.  With a sharp
+        # knee this is most of the frame, and then ``sky_scatter`` is no
+        # longer a sky width: the 16-84 range spans the gap between the
+        # pedestal and the sources rather than the spread of either.  The two
+        # numbers have to be read together, which is why this one is here.
+        tcfg = self.config.transform
+        floor_fraction = float("nan")
+        if tcfg.floors_enabled and tcfg.floor_pedestal > 0:
+            floor_fraction = float(
+                np.mean(x < np.log(tcfg.floor_pedestal) + np.log(1.01))
+            )
         deepest_sigma = np.nan
         flux = self._pool_stamps(self._native_stamps(idx), rng=None,
                                  translate=False, scale_jitter=0.0)
@@ -598,6 +609,11 @@ class PatchDataset:
             # wrong.  It is a check on the width -- the per-band sky *level*
             # differs by design.
             "sky_scatter": sky_scatter,
+            # Share of pixels pinned to the pedestal.  Above about a half,
+            # read ``sky_scatter`` as the pedestal-to-source gap and compare
+            # ``transform.expected_sky_scatter`` against nothing -- it
+            # predicts the width of the sky peak, which is then a spike.
+            "floor_fraction": floor_fraction,
             # Per-patch spread is what sigma_max has to cover: the reverse
             # process starts from N(0, sigma_max^2) and must be able to reach
             # the brightest structure in a single patch.

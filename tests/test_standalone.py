@@ -181,6 +181,50 @@ def test_an_unknown_config_field_does_not_stop_a_model_loading(standalone_loader
     assert prior.size == SIZE
 
 
+def test_the_restoration_term_is_absent_from_an_older_checkpoint(standalone_loader):
+    """``restore_bright_end`` arrived after checkpoints were already being
+    written.  A config without the key must mean the map it was trained with,
+    not whatever the default became -- a silent flip here would compute
+    different fluxes from the same weights with nothing to say so.
+
+    And with the key set, the vendored map must match the training package's
+    exactly, which is the thing ``input_offset`` being a static field makes
+    easy to get wrong.
+    """
+    sys.path.insert(0, str(STANDALONE))
+    try:
+        from host_prior._prior import LogFluxTransform as Vendored, _input_offset
+    finally:
+        sys.path.remove(str(STANDALONE))
+    from rubin_host_prior.data.transform import LogFluxTransform
+
+    base = {"softening": 1.572, "softening_sigma": 0.12, "floor_sigma": 1.0,
+            "floor_pedestal": 0.1}
+    assert Vendored(softening=1.572).restore_bright_end is False
+    assert _input_offset(base) == _input_offset({**base,
+                                                 "restore_bright_end": False})
+    assert _input_offset(base) != _input_offset({**base,
+                                                 "restore_bright_end": True})
+
+    f = np.linspace(-30.0, 500.0, 2001)
+    for on in (False, True):
+        here = LogFluxTransform(softening=1.572, restore_bright_end=on)
+        there = Vendored(softening=1.572, restore_bright_end=on)
+        for floor, pedestal in ((13.1, 0.1), (0.0, 0.1), (4.0, None)):
+            np.testing.assert_allclose(there.soften(f, floor, pedestal),
+                                       here.soften(f, floor, pedestal),
+                                       rtol=1e-12, atol=1e-12)
+            np.testing.assert_allclose(
+                there.forward(f, floor=floor, pedestal=pedestal),
+                here.forward(f, floor=floor, pedestal=pedestal),
+                rtol=1e-12, atol=1e-12)
+            x = here.forward(f, floor=floor, pedestal=pedestal)
+            np.testing.assert_allclose(
+                there.inverse_exact(x, floor=floor, pedestal=pedestal),
+                here.inverse_exact(x, floor=floor, pedestal=pedestal),
+                rtol=1e-10, atol=1e-10)
+
+
 def test_an_older_checkpoints_floor_bounds_still_read(standalone_loader, tmp_path):
     """``floor_sigma_lo``/``hi`` became one ``floor_sigma``.
 

@@ -289,7 +289,10 @@ def main() -> None:
     k = tc.floor_sigma if tc.floors_enabled else 0.0
     floor = k * (t.softening / ss) if (k and ss) else 0.0
     pedestal = tc.floor_pedestal if tc.floors_enabled else 0.0
-    print(f"\nlog transform:  x = log(p + s*softplus((f-c)/s)),  model map f = exp(x)")
+    restored = bool(tc.restore_bright_end)
+    shape = ("p + s*softplus((f-c)/s) + (c-p)*sigmoid((f-c)/s)" if restored
+             else "p + s*softplus((f-c)/s)")
+    print(f"\nlog transform:  x = log({shape}),  model map f = exp(x)")
     print(f"  softening s = {t.softening:.1f} nJy ({ss:.2f} x pooled sky noise)"
           f" -- how sharp the knee is")
     if floor:
@@ -297,9 +300,16 @@ def main() -> None:
               f" x each cutout's own pooled sky noise) -- where the map bends")
         print(f"  pedestal    p = {pedestal:g} nJy -- what it bends over to, "
               f"the faintest flux the prior can represent")
-        print(f"  bright flux therefore comes out {floor - pedestal:.1f} nJy "
-              f"low: soften(f) -> f - (c - p), so exp(x) is not f. Use "
-              f"to_flux_exact to recover a measurement.")
+        if restored:
+            print(f"  bright flux is exact: the sigmoid term hands the "
+                  f"{floor - pedestal:.1f} nJy back above the knee, at a peak "
+                  f"gain of {0.5 + (floor - pedestal) / (4 * t.softening):.1f} "
+                  f"in a ring around c. Below the knee it changes nothing.")
+        else:
+            print(f"  bright flux therefore comes out {floor - pedestal:.1f} nJy "
+                  f"low: soften(f) -> f - (c - p), so exp(x) is not f. Use "
+                  f"to_flux_exact to recover a measurement. Setting "
+                  f"transform.restore_bright_end fixes it; see that field.")
     else:
         print(f"  sky floor   none (floor_sigma = 0): the pre-floor transform")
     print(f"  bright flux passes through as log(f), the same x in every band")
@@ -324,17 +334,37 @@ def main() -> None:
            else "-> representable (softplus has no floor)")
     )
     predicted = tc.predicted_sky_scatter
+    pinned = stats.get("floor_fraction", float("nan"))
     print(
         f"  sky scatter in x: {stats['sky_scatter']:.3f} measured vs "
         f"{predicted:.3f} predicted"
         + (f" at k = {k:.2f}" if k else " (unfloored)")
     )
-    if not 0.5 * predicted < stats["sky_scatter"] < 2.0 * predicted:
+    # The prediction is the width of the *sky peak*; the measurement is the
+    # 16-84 range of every pixel.  Those are the same number only while the
+    # frame is mostly sky and the map is smooth across it.  Once the knee is
+    # sharp enough to pin the sky, the measurement spans the gap from the
+    # pedestal up to the sources instead, and a mismatch means nothing.
+    if pinned == pinned and pinned > 0.5:
+        print(
+            f"  {pinned:.0%} of pixels are pinned to the pedestal, so the "
+            "measured number is the pedestal-to-source gap, not a sky width; "
+            "the prediction is the width of the spike and the two are not "
+            "comparable here."
+        )
+        print(
+            f"  sigma_min is set from the measured {stats['sky_scatter']:.3f}, "
+            "which is the conservative end: it keeps the smallest noise level "
+            "above the spike rather than asking the model to resolve it."
+        )
+    elif not 0.5 * predicted < stats["sky_scatter"] < 2.0 * predicted:
         print(
             "  WARNING: measured sky scatter is far from prediction -- the "
             + ("floor or the softening scale is probably wrong." if floor
                else "softening scale is probably wrong.")
         )
+    elif pinned == pinned and floor:
+        print(f"  {pinned:.0%} of pixels are pinned to the pedestal")
 
     # -- sigma_max, the standard way -------------------------------------
     #

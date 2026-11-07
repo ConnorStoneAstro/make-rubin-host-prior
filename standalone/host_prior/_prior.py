@@ -39,6 +39,12 @@ def _softplus(u, xp):
     return np.logaddexp(0.0, u)
 
 
+def _sigmoid(u, xp):
+    if xp is not np:
+        return jax.nn.sigmoid(u)
+    return 0.5 * (np.tanh(0.5 * u) + 1.0)
+
+
 # -- the flux transform ----------------------------------------------------
 
 
@@ -51,6 +57,10 @@ class LogFluxTransform:
     """
 
     softening: float
+    #: Hand ``floor - pedestal`` back above the knee so bright flux is exact.
+    #: Read from the checkpoint; absent in one written before the term
+    #: existed, where it is False and the map is what it always was.
+    restore_bright_end: bool = False
 
     def soften(self, flux, floor=0.0, pedestal=None):
         """``pedestal + s * softplus((f - floor) / s)``: nJy in, nJy out.
@@ -62,16 +72,24 @@ class LogFluxTransform:
         the whole set.  ``pedestal = None`` means "the same as floor".
 
         **The bright end is not the identity** when they differ: the map tends
-        to ``f - (floor - pedestal)``, about 6.5 nJy low at the trained
-        scales.  So ``inverse`` (``exp(x)``) is that much under the real flux
-        however bright the pixel, and ``inverse_exact`` is the one that
-        recovers a measurement.
+        to ``f - (floor - pedestal)``, about 13 nJy low at the trained scales.
+        So ``inverse`` (``exp(x)``) is that much under the real flux however
+        bright the pixel, and ``inverse_exact`` is the one that recovers a
+        measurement.
+
+        Unless ``restore_bright_end`` is set, which adds ``(floor - pedestal)
+        * sigmoid((f - floor) / s)`` -- zero at the floor, the whole offset
+        above it -- and makes the bright end exact again.  It costs a gain
+        above one in a ring around the floor, and the closed-form inverse.
         """
         xp = _xp(flux)
         if pedestal is None:
             pedestal = floor
-        return pedestal + self.softening * _softplus(
-            (flux - floor) / self.softening, xp)
+        u = (flux - floor) / self.softening
+        out = pedestal + self.softening * _softplus(u, xp)
+        if self.restore_bright_end:
+            out = out + (floor - pedestal) * _sigmoid(u, xp)
+        return out
 
     def forward(self, flux, floor=0.0, pedestal=None):
         """nJy -> the model's space.  Finite for every real input, negative sky
@@ -88,7 +106,11 @@ class LogFluxTransform:
             pedestal = floor
         u = (flux - floor) / s
         val = self.soften(flux, floor, pedestal)
-        limit = u + math.log(s)
+        # ``span`` is what ``soften - pedestal`` is proportional to as
+        # ``u -> -inf``; ``sigmoid`` decays like ``e^u`` just as ``softplus``
+        # does, so the restoration term adds to the coefficient.
+        span = s + (floor - pedestal) if self.restore_bright_end else s
+        limit = u + xp.log(xp.asarray(span))
         # The pedestal, not the floor, decides this: it is what the output
         # cannot go below, so it is what stops the log underflowing.
         degenerate = (xp.asarray(pedestal) == 0) & (u < _LINEAR_BELOW)
@@ -116,6 +138,8 @@ class LogFluxTransform:
         s = self.softening
         if pedestal is None:
             pedestal = floor
+        if self.restore_bright_end:
+            return self._inverse_restored(x, floor, pedestal)
         zero_floor = xp.asarray(pedestal) == 0
         v = xp.where(zero_floor, xp.exp(x - math.log(s)),
                      (xp.exp(xp.where(zero_floor, 0.0, x)) - pedestal) / s)
@@ -129,6 +153,30 @@ class LogFluxTransform:
         mid = xp.where(big | small, 1.0, v)
         direct = xp.log(xp.expm1(mid))
         return floor + s * xp.where(big, v, xp.where(small, cx, direct))
+
+    def _inverse_restored(self, x, floor, pedestal):
+        """``inverse_exact`` for the restored map, by Newton on the residual.
+
+        Solves ``s * softplus(t) + lift * sigmoid(t) == exp(x) - pedestal``
+        for ``t = (f - floor) / s``; there is no closed form.  Both starting
+        points are exact asymptotes of the residual, so four steps already
+        reach the forward map's own precision -- 20 is margin, not need.
+        """
+        xp = _xp(x)
+        s = self.softening
+        lift = floor - pedestal
+        span = s + lift
+        target = xp.exp(x) - pedestal
+        cx = xp.log(xp.where(target > 0, target, 1e-300) / span)
+        small = cx < _LINEAR_BELOW
+        start = xp.where(target > span, (target - lift) / s, cx)
+        t = xp.where(small, 0.0, start)
+        for _ in range(20):
+            z = _sigmoid(t, xp)
+            phi = s * _softplus(t, xp) + lift * z - target
+            dphi = s * z + lift * z * (1.0 - z)
+            t = t - phi / xp.where(dphi > 1e-300, dphi, 1e-300)
+        return floor + s * xp.where(small, cx, t)
 
     def jacobian(self, x):
         """``df/dx`` for the model map, which is simply ``f`` itself."""
@@ -434,12 +482,16 @@ def _input_offset(tr_cfg: dict) -> float:
     pedestal = _pedestal_of(tr_cfg)
     if pedestal is None:
         pedestal = c
-    # log(soften(0)) = log(pedestal + s * softplus(-c/s)).  It read
-    # log(c + s * log 2) until the pedestal landed, which is this only at
-    # c = 0 and was 0.13 nats out at the trained scales.
+    # log(soften(0)) = log(pedestal + s * softplus(-c/s)), plus the
+    # restoration term when it is on.  It read log(c + s * log 2) until the
+    # pedestal landed, which is this only at c = 0 and was 0.13 nats out at
+    # the trained scales.
     u = -c / s
     sp = math.log1p(math.exp(-abs(u))) + max(u, 0.0)
-    return math.log(pedestal + s * sp)
+    val = pedestal + s * sp
+    if tr_cfg.get("restore_bright_end"):
+        val = val + (c - pedestal) / (1.0 + math.exp(-u))
+    return math.log(val)
 
 
 def load_prior(directory, which: str = "ema") -> Prior:
@@ -477,7 +529,10 @@ def load_prior(directory, which: str = "ema") -> Prior:
 
     net_cfg = NCSNppConfig.from_dict(cfg.get("ncsnpp", {}))
     net_cfg.check()
-    transform = LogFluxTransform(softening=float(tr_cfg["softening"]))
+    transform = LogFluxTransform(
+        softening=float(tr_cfg["softening"]),
+        restore_bright_end=bool(tr_cfg.get("restore_bright_end")),
+    )
     sde = VESDE(float(sde_cfg["sigma_min"]), float(sde_cfg["sigma_max"]),
                 float(sde_cfg.get("data_mean") or 0.0))
     input_offset = _input_offset(tr_cfg)
