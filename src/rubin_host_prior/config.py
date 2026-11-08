@@ -245,7 +245,7 @@ class NCSNppConfig:
     #: size must be divisible by ``2 ** (len(ch_mult) - 1)``.  Rising, because
     #: 86% of the arithmetic is at the two finest levels and almost none of it
     #: at the two coarsest.
-    ch_mult: tuple[int, ...] = (1, 2, 4, 4)
+    ch_mult: tuple[int, ...] = (1, 2, 2, 4, 4)
     num_blocks: int = 2  # residual blocks per resolution on the way down
     activation: str = "silu"
     #: ``1e-2``, so every block's last convolution and every pyramid output
@@ -857,13 +857,13 @@ class AugmentConfig:
 @dataclass
 class TrainConfig:
     batch_size: int = 128
-    steps: int = 200_000
+    steps: int = 1_000_000
     learning_rate: float = 1e-4
     warmup_steps: int = 2_000
     cosine_decay: bool = False
     weight_decay: float = 0.0
     grad_clip: float = 1.0
-    ema_decay: float = 0.998
+    ema_decay: float = 0.999
     log_every: int = 1000
     seed: int = 0
     #: Validation cadence and size.  Here rather than as a default on
