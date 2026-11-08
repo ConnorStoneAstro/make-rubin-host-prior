@@ -82,10 +82,13 @@ class NCSNppConfig:
     treedef to key its jit cache.
     """
 
-    # These must match the trainer's NCSNppConfig defaults, and a test there
-    # asserts they do: a field absent from a config.json falls back to them,
-    # and two different fallbacks would build two different models from one
-    # file.
+    # Fallbacks, not a second copy of the trainer's defaults -- and the test
+    # over there checks *presence*, not values, on purpose.  The trainer's
+    # defaults are where experiments happen and they move; a real checkpoint
+    # writes every field explicitly, so a value here can never reach a loaded
+    # model.  A missing *field* can, which is what is asserted.  This comment
+    # used to claim the values were pinned by a test, and they were not: by
+    # the time anyone read it ``ch_mult`` had already drifted.
     in_channels: int = 1
     nf: int = 32
     ch_mult: tuple[int, ...] = (1, 2, 4, 4)

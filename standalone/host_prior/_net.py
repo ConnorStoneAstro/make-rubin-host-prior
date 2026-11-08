@@ -727,7 +727,9 @@ class NCSNppEncoderEnergy(EnergyModel):
     ``skip_rescale``, ``progressive_input`` -- then a scalar instead of an
     upsampling path.  Measured against ``NCSNppEnergy`` at ``nf=32,
     ch_mult=(1,2,4,4)`` on 128 px: 2.79M parameters against 7.20M, and a score
-    for 9.96 GFLOP against 42.34, a **4.25x** saving.  The decoder is 77% of
+    for 9.96 GFLOP against 42.34, a **4.25x** saving.  The ratio belongs to the
+    architecture rather than to that shape: at the current default
+    ``(1,2,2,4,4)`` it is 7.88 against 32.48, **4.12x**.  The decoder is 77% of
     the U-Net rather than half, because its levels run ``num_blocks + 1``
     blocks against ``num_blocks`` and each takes a concatenated skip, so twice
     the input channels.

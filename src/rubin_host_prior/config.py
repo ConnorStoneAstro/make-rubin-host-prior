@@ -201,21 +201,37 @@ class NCSNppConfig:
     inner loop, where one ``score`` call is a gradient of the network and
     therefore 2.03x its forward pass.
 
-    ``nf = 32`` with ``ch_mult = (1, 2, 4, 4)`` rather than the reference's
+    ``nf = 32`` with ``ch_mult = (1, 2, 2, 4, 4)`` rather than the reference's
     ``128`` and ``(2, 2, 2, 2)`` (four levels of 256 channels, ~100M
     parameters), and rather than this file's previous ``64`` / ``(1, 2, 2, 2)``
     (10.5M parameters, 112.9 GFLOP per score on a 128 px grid).  It is
-    **2.64x cheaper at 7.2M parameters** -- against 2.6M for a flat ``nf = 32``
-    at the same four levels.
+    **3.5x cheaper at 8.0M parameters**.
 
     The shape follows from where the work is.  On a 128 px grid the FLOPs sit
     almost entirely at the two finest levels -- 50.5% at 128 px and 35.4% at
-    64 px, against 11.0% and 3.1% at 32 and 16 px (an analytic walk over the
-    convolutions lands within 0.2% of XLA's measured total, so that attribution
-    is the whole cost).  Capacity at the coarse levels is therefore nearly free
-    and capacity at the fine ones is not: halving ``nf`` cuts the expensive
-    levels, and raising the multiplier to 4 buys most of the parameters back
-    where they cost little.
+    64 px, against 11.0% and 3.1% at 32 and 16 px, measured at the four-level
+    ``(1, 2, 4, 4)`` this replaced (an analytic walk over the convolutions
+    lands within 0.2% of XLA's measured total, so that attribution is the whole
+    cost).  Capacity at the coarse levels is therefore nearly free and capacity
+    at the fine ones is not: halving ``nf`` cuts the expensive levels, and
+    raising the multiplier to 4 buys most of the parameters back where they
+    cost little.
+
+    **A fifth level is not a fifth level's worth of cost, which is the
+    measurement worth carrying away.**  Per score on a 128 px grid, encoder,
+    off XLA's cost analysis:
+
+        ch_mult           widths                     params   GFLOP
+        (1, 2, 4, 4)      32, 64, 128, 128        2,795,907   10.23
+        (1, 2, 4, 4, 4)   32, 64, 128, 128, 128   3,931,274    9.89
+        (1, 2, 2, 4, 4)   32, 64, 64, 128, 128    3,093,258    7.88
+
+    Appending a level *saves* 3% while adding 1.1M parameters: the bottleneck
+    moves from 16 px to 8 px and takes its attention and mid blocks down with
+    it, so the level pays for itself before it costs anything.  Narrowing the
+    32 px level from 128 channels to 64 is the other 20%.  Together the current
+    shape is 23% cheaper per step than the four-level one and 11% larger --
+    both directions at once, which is why it is the default.
 
     What that trades away is fine-scale *capacity* -- the finest level is 32
     channels, not 64 -- which is the half of the model doing texture.  That was
@@ -242,9 +258,10 @@ class NCSNppConfig:
     #: values build at all.
     nf: int = 32
     #: One entry per resolution; the grid halves between them, so the training
-    #: size must be divisible by ``2 ** (len(ch_mult) - 1)``.  Rising, because
-    #: 86% of the arithmetic is at the two finest levels and almost none of it
-    #: at the two coarsest.
+    #: size must be divisible by ``2 ** (len(ch_mult) - 1)`` -- 16 at five
+    #: levels, which is the constraint ``_ncsnpp_size_warnings`` enforces.
+    #: Rising, because 86% of the arithmetic is at the two finest levels and
+    #: almost none of it at the coarse ones.
     ch_mult: tuple[int, ...] = (1, 2, 2, 4, 4)
     num_blocks: int = 2  # residual blocks per resolution on the way down
     activation: str = "silu"
@@ -622,7 +639,7 @@ class TransformConfig:
     #:     2.5     1.6%        108         97.6%       0.76%
     #:     3.0     0.9%         34         94.0%       0.22%
     #:     4.0     0.5%          4         64.1%       0.02%
-    despeckle_sigma: float | None = None
+    despeckle_sigma: float | None = 1
 
     def __post_init__(self) -> None:
         if self.floor_sigma < 0:
