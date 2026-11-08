@@ -174,7 +174,7 @@ def write_synthetic_shards(
     noise = sky_noise_by_band or {
         "u": 28.0, "g": 11.0, "r": 12.0, "i": 16.0, "z": 24.0, "y": 40.0
     }
-    hosts = []
+    hosts, manifest = [], []
     with ShardWriter(
         out_dir,
         native_size=native_size,
@@ -213,6 +213,18 @@ def write_synthetic_shards(
                     "r_blendedness": float(rng.beta(1.2, 8)),
                 }
             )
+            manifest.append(
+                {
+                    "status": "accepted",
+                    "host_id": i,
+                    "band": band,
+                    "diag_frac_no_data": float(frac),
+                    "diag_frac_SATURATED": 0.0,
+                    "diag_inner_frac_SATURATED": 0.0,
+                    "diag_frac_INTERPOLATED": 0.0,
+                    "diag_frac_COSMIC_RAY": 0.0,
+                }
+            )
             w.add(
                 p["image"],
                 meta={
@@ -238,7 +250,26 @@ def write_synthetic_shards(
                 },
             )
     _write_synthetic_hosts(Path(out_dir) / "hosts.parquet", hosts, rng)
+    _write_synthetic_manifest(Path(out_dir).parent / "manifest.parquet", manifest)
     return w.paths
+
+
+def _write_synthetic_manifest(path: Path, rows: list[dict]) -> None:
+    """Mirror the ``manifest.parquet`` extraction writes, one level up.
+
+    Outside ``out_dir`` because that is where the real thing lives: extraction
+    writes shards to ``<out>/shards`` and the manifest to ``<out>/``, and
+    ``manifest_path`` looks two parents up from a shard file.  Without it the
+    loader's ``max_frac_saturated`` / ``max_frac_interpolated`` cuts have
+    nothing to join against and refuse to run at all -- which is the intended
+    behaviour on real data and useless in a fixture.
+
+    Every stamp is clean here.  A test that wants a star writes its own
+    manifest over this one.
+    """
+    import pandas as pd
+
+    pd.DataFrame(rows).to_parquet(path, index=False)
 
 
 def _write_synthetic_hosts(path: Path, rows: list[dict], rng) -> None:

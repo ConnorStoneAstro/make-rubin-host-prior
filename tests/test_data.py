@@ -1,5 +1,6 @@
 """The log transform, pooling, augmentation, shards and loader."""
 
+import dataclasses
 import math
 from pathlib import Path
 
@@ -9,6 +10,7 @@ import pytest
 from rubin_host_prior.config import BANDS, Config, PatchConfig, TransformConfig
 from rubin_host_prior.data import (
     LogFluxTransform,
+    usable_rows,
     PatchDataset,
     ShardSet,
     area_resample,
@@ -1894,3 +1896,235 @@ def test_shards_without_the_column_are_refused_rather_than_passed(tmp_path):
         PatchDataset.from_shards(
             ss, config, LogFluxTransform.from_config(config.transform),
             max_in_memory_gb=16.0)
+
+
+def _manifest_beside(shards_dir, ss, saturated):
+    """Write a manifest matching ``ss`` row for row, one level up."""
+    import pandas as pd
+
+    names = np.asarray(BANDS)
+    pd.DataFrame({
+        "status": ["accepted"] * len(ss),
+        "host_id": np.asarray(ss.meta["host_id"]),
+        "band": [str(names[b]) for b in np.asarray(ss.meta["band_idx"], dtype=int)],
+        "diag_frac_SATURATED": np.asarray(saturated, dtype=float),
+        "diag_frac_INTERPOLATED": np.zeros(len(ss)),
+    }).to_parquet(shards_dir.parent / "manifest.parquet", index=False)
+
+
+def test_the_loader_can_tighten_a_saturation_cut_without_re_extracting(tmp_path):
+    """The fractions that catch a saturated star live in the manifest, not in
+    the shards, so the loader joins rather than reads a column.
+
+    That is the whole point of the cut being here: ``frac_SATURATED`` is
+    recorded at extraction under whatever gate was in force then, and a star
+    small enough to show interpolation stripes is one to two orders of
+    magnitude below that gate.  Tightening it should not mean collecting the
+    set again.
+    """
+    out = tmp_path / "out"
+    d = out / "shards"
+    d.mkdir(parents=True)
+    write_synthetic_shards(d, n_patches=24, native_size=112,
+                           patches_per_shard=12, seed=0)
+    ss = ShardSet.from_dir(d)
+    # Every fourth stamp carries a star; the rest are clean.
+    sat = np.where(np.arange(len(ss)) % 4 == 0, 0.002, 0.0)
+    _manifest_beside(d, ss, sat)
+
+    # Cuts off, so ``n_all`` really is every row whatever the config's own
+    # limits happen to be -- this test is about the join, not about them.
+    base = Config(patch=PatchConfig(native_size=ss.native_size, out_size=24,
+                                    pool_factor=3, max_frac_saturated=None,
+                                    max_frac_interpolated=None))
+    base.transform.softening = 5.0
+    base.transform.pooled_noise_ratio = 1.0
+    n_all = len(usable_rows(ss, base))
+
+    tight = dataclasses.replace(base)
+    tight.patch = dataclasses.replace(base.patch, max_frac_saturated=0.001)
+    kept = usable_rows(ss, tight)
+    assert len(kept) == n_all - int((sat > 0.001).sum())
+    assert not np.any(sat[kept] > 0.001)
+
+    # A limit above every stamp keeps the lot, so the cut is the limit's doing
+    # and not the join's.
+    loose = dataclasses.replace(base)
+    loose.patch = dataclasses.replace(base.patch, max_frac_saturated=0.01)
+    assert len(usable_rows(ss, loose)) == n_all
+
+
+def test_a_manifest_cut_refuses_to_pass_what_it_cannot_look_up(tmp_path):
+    """Missing manifest, or one from another run: raise, never pass silently.
+
+    A cut whose whole value is exactness has to fail loudly when it cannot be
+    applied -- the same reasoning as the ``-1`` fill check in the no-data cut.
+    """
+    out = tmp_path / "out"
+    d = out / "shards"
+    d.mkdir(parents=True)
+    write_synthetic_shards(d, n_patches=12, native_size=112,
+                           patches_per_shard=12, seed=1)
+    ss = ShardSet.from_dir(d)
+    # The fixture writes one; take it away to get the case where extraction's
+    # output directory was not what the loader was pointed at.
+    (out / "manifest.parquet").unlink()
+    cfg = Config(patch=PatchConfig(native_size=ss.native_size, out_size=24,
+                                   pool_factor=3, max_frac_saturated=0.001,
+                                   max_frac_interpolated=None))
+    cfg.transform.softening = 5.0
+    cfg.transform.pooled_noise_ratio = 1.0
+
+    with pytest.raises(FileNotFoundError, match="no manifest.parquet"):
+        usable_rows(ss, cfg)
+
+    # Present, but describing different stamps.
+    import pandas as pd
+    pd.DataFrame({"status": ["accepted"], "host_id": [-999], "band": ["r"],
+                  "diag_frac_SATURATED": [0.0],
+                  "diag_frac_INTERPOLATED": [0.0]}).to_parquet(
+        out / "manifest.parquet", index=False)
+    with pytest.raises(ValueError, match="no accepted row"):
+        usable_rows(ss, cfg)
+
+
+# -- despeckling -----------------------------------------------------------
+
+
+def test_the_despeckler_takes_small_blobs_and_leaves_big_ones():
+    """Size is the only thing it looks at, once a pixel is over the threshold.
+
+    Built by hand rather than measured, because the point is the rule: a blob
+    at the limit goes, one pixel larger stays, and nothing below the threshold
+    is touched however small and isolated it is.
+    """
+    from rubin_host_prior.data import despeckle
+
+    floor, bright = -2.0, 5.0
+    im = np.full((1, 16, 16), floor, dtype=np.float32)
+    im[0, 2, 2] = bright                       # 1 px
+    im[0, 5, 5:9] = bright                     # 4 px, a bar
+    im[0, 9, 2:7] = bright                     # 5 px, one over
+    im[0, 12:14, 12:14] = bright               # 4 px, a square
+    im[0, 0, 15] = 0.0                         # lit but under the threshold
+
+    out, rep = despeckle(im, threshold=1.0, fill=floor, max_pixels=4)
+    assert out[0, 2, 2] == floor               # the single pixel
+    assert (out[0, 5, 5:9] == floor).all()     # the bar of four
+    assert (out[0, 12:14, 12:14] == floor).all()
+    assert (out[0, 9, 2:7] == bright).all()    # five survives
+    assert out[0, 0, 15] == 0.0                # never a candidate
+    assert rep["n_blobs"] == 4
+    assert rep["n_blobs_removed"] == 3
+    assert rep["n_pixels_removed"] == 1 + 4 + 4
+    # It does not modify its input.
+    assert im[0, 2, 2] == bright
+
+
+def test_the_despeckler_counts_diagonal_neighbours_as_one_blob():
+    """Eight-connectivity, which is the conservative reading: a diagonal pair
+    is one blob of two rather than two blobs of one, so *fewer* things fall
+    under the size limit."""
+    from rubin_host_prior.data import despeckle
+
+    im = np.full((1, 12, 12), -2.0, dtype=np.float32)
+    for i in range(5):                          # a diagonal chain of five
+        im[0, 3 + i, 3 + i] = 5.0
+    out, rep = despeckle(im, threshold=1.0, fill=-2.0, max_pixels=4)
+    assert rep["n_blobs"] == 1
+    assert rep["n_pixels_removed"] == 0
+    np.testing.assert_array_equal(out, im)
+
+
+def test_the_despeckler_thresholds_and_fills_each_stamp_at_its_own_level():
+    """The usual call passes ``(B, 1, 1)``: every cutout is judged against its
+    own sky noise and filled at its own sky level, the same way the floor is.
+    """
+    from rubin_host_prior.data import despeckle
+
+    im = np.zeros((2, 10, 10), dtype=np.float32)
+    im[0] = -2.0
+    im[1] = -1.0
+    im[0, 4, 4] = 3.0
+    im[1, 4, 4] = 3.0
+    thr = np.array([1.0, 9.0], dtype=np.float32)[:, None, None]
+    fill = np.array([-2.0, -1.0], dtype=np.float32)[:, None, None]
+
+    out, rep = despeckle(im, thr, fill, max_pixels=4)
+    assert out[0, 4, 4] == -2.0          # over its threshold, removed, own fill
+    assert out[1, 4, 4] == 3.0           # under its threshold, kept
+    assert rep["n_pixels_removed"] == 1
+
+
+def test_the_despeckler_agrees_with_scipys_labelling_on_random_fields():
+    """The rule stated independently: a pixel goes iff ``ndimage.label`` says
+    its component is small enough.  Guards the bookkeeping -- the background
+    label, the size histogram, the per-stamp fill -- against a reshuffle."""
+    from scipy import ndimage
+
+    from rubin_host_prior.data import despeckle
+
+    rng = np.random.default_rng(0)
+    im = rng.normal(size=(4, 48, 48)).astype(np.float32)
+    for max_pixels in (1, 4, 9):
+        out, _ = despeckle(im, threshold=1.5, fill=-99.0, max_pixels=max_pixels)
+        for a, b in zip(im, out):
+            lab, n = ndimage.label(a > 1.5, structure=np.ones((3, 3), bool))
+            sizes = np.bincount(lab.ravel(), minlength=n + 1)
+            small = sizes <= max_pixels
+            small[0] = False
+            np.testing.assert_array_equal(b == -99.0, small[lab])
+
+
+def test_a_zero_limit_leaves_the_batch_exactly_alone():
+    """Off is off: the same array back, not a copy that happens to match."""
+    from rubin_host_prior.data import despeckle
+
+    im = np.random.default_rng(1).normal(size=(2, 8, 8)).astype(np.float32)
+    out, rep = despeckle(im, threshold=-10.0, fill=0.0, max_pixels=0)
+    assert out is im
+    assert rep["n_pixels_removed"] == 0
+
+
+def test_the_loader_despeckles_where_it_floors(shard_dir):
+    """End to end, and in the one place the floor is applied -- so the
+    transform figure shows what the network is handed rather than a cleaner
+    picture of it.
+
+    What it removes has to come off the *faint* end: the blobs are defined by
+    a threshold in sky noise, so the bright end of the histogram cannot move.
+    """
+    import dataclasses
+
+    ss, on = _floored_config(shard_dir)
+    on.transform = dataclasses.replace(on.transform, despeckle_max_pixels=4,
+                                       despeckle_sigma=None)
+    off = dataclasses.replace(on)
+    off.transform = dataclasses.replace(on.transform, despeckle_max_pixels=0)
+
+    def batch(cfg):
+        ds = PatchDataset.from_shards(
+            ss, cfg, LogFluxTransform.from_config(cfg.transform),
+            max_in_memory_gb=16.0)
+        try:
+            b = ds.make_batch(np.arange(min(16, len(ds))),
+                              rng=np.random.default_rng(0), augment=False)
+            return b[:, 0], dict(ds._last_despeckle)
+        finally:
+            ds.close()
+
+    plain, plain_rep = batch(off)
+    clean, rep = batch(on)
+    assert plain_rep["n_pixels_removed"] == 0
+    assert rep["n_pixels_removed"] > 0
+    assert rep["n_blobs_removed"] <= rep["n_blobs"]
+
+    moved = plain != clean
+    assert moved.any()
+    # Every change is downward, and onto one of the per-stamp sky levels.
+    assert (clean[moved] < plain[moved]).all()
+    assert len(np.unique(clean[moved])) <= len(plain)
+    # The bright end is untouched: the threshold is a few sigma of sky.
+    assert clean.max() == plain.max()
+    assert np.percentile(clean, 99.9) == pytest.approx(
+        np.percentile(plain, 99.9), rel=1e-6)

@@ -19,7 +19,7 @@ from typing import Iterator
 
 import numpy as np
 
-from ..config import Config
+from ..config import BANDS, Config
 from .augment import random_dihedral
 from .diagnostics import correlation_length
 from .pooling import pool_to_training_grid
@@ -28,8 +28,91 @@ from .shards import ShardSet
 from .transform import LogFluxTransform
 
 
+#: Manifest columns the loader can cut on, and the ``PatchConfig`` field that
+#: sets each limit.  These planes are measured at extraction and written to
+#: ``manifest.parquet``, but **not** into the shards -- unlike ``frac_no_data``,
+#: which has its own column.  Joining to the manifest is what makes them a
+#: loader knob anyway, so a set collected under a looser gate can be tightened
+#: without re-extracting it.
+MANIFEST_CUTS: dict[str, str] = {
+    "diag_frac_SATURATED": "max_frac_saturated",
+    "diag_frac_INTERPOLATED": "max_frac_interpolated",
+}
+
+
+def manifest_path(shards: ShardSet) -> "Path | None":
+    """``manifest.parquet`` for a shard set, or None if it is not there.
+
+    Extraction writes the shards into ``<out>/shards`` and the manifest to
+    ``<out>/manifest.parquet``, so it is one level up from the shard files.
+    """
+    from pathlib import Path
+
+    paths = getattr(shards, "paths", None)
+    if not paths:
+        return None
+    candidate = Path(paths[0]).resolve().parent.parent / "manifest.parquet"
+    return candidate if candidate.exists() else None
+
+
+def manifest_fractions(shards: ShardSet, columns: list[str]) -> dict[str, np.ndarray]:
+    """Per-shard-row values of ``columns``, read from the manifest.
+
+    Joined on ``(host_id, band)``, which identifies a stamp: the shards carry
+    ``host_id`` and a ``band_idx`` into the global ``BANDS``, the manifest
+    carries ``host_id`` and the band name.
+
+    Raises rather than filling, on a missing manifest or an unmatched row.  A
+    cut that silently passed the stamps it could not look up would be worse
+    than no cut, because the whole point of these is exactness -- the same
+    reasoning as the ``-1`` check in ``usable_rows``.
+    """
+    import pandas as pd
+
+    path = manifest_path(shards)
+    if path is None:
+        raise FileNotFoundError(
+            "no manifest.parquet beside these shards, so the saturation and "
+            "interpolation cuts cannot be applied -- those fractions are "
+            "recorded at extraction and live in the manifest, not in the "
+            "shards. Point at the extraction output directory, or set the "
+            "patch.max_frac_* limits to None to disable the cuts."
+        )
+    man = pd.read_parquet(path)
+    missing = [c for c in columns if c not in man.columns]
+    if missing:
+        raise ValueError(
+            f"{path} has no {missing}; it predates these diagnostics. "
+            f"Re-extract, or set the matching patch.max_frac_* limits to None."
+        )
+    man = man[man.get("status", "accepted") == "accepted"]
+    key = list(zip(man["host_id"].to_numpy(), man["band"].astype(str).to_numpy()))
+    lookup = {k: i for i, k in enumerate(key)}
+
+    host = np.asarray(shards.meta["host_id"])
+    band = np.asarray(shards.meta["band_idx"], dtype=int)
+    names = np.asarray(BANDS)
+    rows = np.array([lookup.get((int(h), str(names[b])), -1)
+                     for h, b in zip(host, band)])
+    if (rows < 0).any():
+        n = int((rows < 0).sum())
+        raise ValueError(
+            f"{n} of {len(rows)} shard rows have no accepted row in {path}, "
+            f"so the fraction cuts cannot be applied to them. The manifest "
+            f"and the shards are from different runs; re-extract, or set the "
+            f"patch.max_frac_* limits to None to disable the cuts."
+        )
+    return {c: man[c].to_numpy(dtype=float)[rows] for c in columns}
+
+
 def usable_rows(shards: ShardSet, config: Config) -> np.ndarray:
-    """Shard rows that survive the no-data cut: ``frac_no_data <= max_no_data``.
+    """Shard rows that survive the loader's cuts.
+
+    Always ``frac_no_data <= max_no_data``, from the shards' own column; and,
+    when ``patch.max_frac_saturated`` or ``patch.max_frac_interpolated`` is
+    set, the matching fraction read from ``manifest.parquet``.  All of them
+    are loader cuts rather than extraction ones, so a set collected under a
+    looser gate can be tightened without re-extracting it.
 
     **The metadata is the only honest handle on these.**  A no-data pixel in
     DP2 carries no sentinel -- measured across 1093 flagged stamps, not one is
@@ -39,14 +122,16 @@ def usable_rows(shards: ShardSet, config: Config) -> np.ndarray:
     what there is, is a per-stamp fraction recorded at extraction, and a cut on
     it is exact.
 
-    Note what this does **not** catch.  ``frac_no_data`` comes from the
-    inf-variance plane, which marks pixels where *zero* exposures contributed.
-    A star that saturates in only some exposures still has the rest, so its
-    variance is finite and its ``frac_no_data`` is zero -- while its core is
-    built from the subset that did not saturate, which is the worse-seeing one,
-    so the peak reads low.  That is a different defect with a different flag:
-    ``SATURATED``, which extraction records as ``diag_frac_SATURATED`` in
-    ``manifest.parquet`` and not in the shards.
+    Note what the no-data cut does **not** catch, and why the other two are
+    here.  ``frac_no_data`` comes from the inf-variance plane, which marks
+    pixels where *zero* exposures contributed.  A star that saturates in only
+    some exposures still has the rest, so its variance is finite and its
+    ``frac_no_data`` is zero -- while its core is built from the subset that
+    did not saturate, which is the worse-seeing one, so the peak reads low and
+    the interpolation across it shows as structure that is not in the sky.
+    That is a different defect with a different flag: ``SATURATED``, which
+    extraction records as ``diag_frac_SATURATED`` in ``manifest.parquet`` and
+    not in the shards -- hence the join rather than a column read.
     """
     frac = np.asarray(shards.meta["frac_no_data"], dtype=float)
     if config.patch.max_no_data < 0:
@@ -62,7 +147,19 @@ def usable_rows(shards: ShardSet, config: Config) -> np.ndarray:
             f"These shards predate the column: re-extract them, or set "
             f"patch.max_no_data below zero to disable the cut."
         )
-    return np.flatnonzero(frac <= config.patch.max_no_data)
+    keep = frac <= config.patch.max_no_data
+
+    # The manifest cuts, if any are set.  Read together so a set with both
+    # limits on costs one parquet read rather than two.
+    wanted = {col: getattr(config.patch, field)
+              for col, field in MANIFEST_CUTS.items()
+              if getattr(config.patch, field, None) is not None}
+    if wanted:
+        values = manifest_fractions(shards, list(wanted))
+        for col, limit in wanted.items():
+            keep &= values[col] <= limit
+
+    return np.flatnonzero(keep)
 
 
 class PatchDataset:
@@ -76,6 +173,7 @@ class PatchDataset:
         pool_shards: int = 8,
         pool_refill_every: int = 64,
         prefetch_depth: int = 3,
+        rows: np.ndarray | None = None,
     ):
         if shards is None and native is None:
             raise ValueError("need shards or native stamps")
@@ -95,7 +193,14 @@ class PatchDataset:
         #: indexing goes through here, so a dataset index is a position in this
         #: array and never a raw shard row -- which is what keeps the cut from
         #: having to be repeated at every call site.
-        self._rows = usable_rows(shards, config) if shards is not None else None
+        # Taken from the caller when it has already computed them, because
+        # with a manifest cut on this reads a parquet file and `from_shards`
+        # needs the same array to cut `band_idx` to match.
+        self._rows = (rows if rows is not None
+                      else (usable_rows(shards, config) if shards is not None
+                            else None))
+        #: What the last batch's despeckler took, for the same reason.
+        self._last_despeckle: dict = {}
         #: What the last batch's no-data fill touched.  A report rather than
         #: state: if a future release writes its holes with a value the
         #: detector does not know, every count here stays zero, and that is
@@ -119,17 +224,28 @@ class PatchDataset:
         return self._native is not None
 
     def storage_note(self, max_in_memory_gb: float | None = None) -> str:
-        """One line on where batches come from."""
+        """One line on where batches come from, and what is not in it.
+
+        The cut used to be invisible: ``n_rejected`` said "reported, never
+        silent" and nothing printed it.  That was survivable while the only
+        cut was ``max_no_data`` at its default, which removes 3.3%; it is not
+        once a saturation limit can remove a third of the set from a line in
+        the config.
+        """
         gb = self.shards.nbytes("image") / 1024**3 if self.shards else 0.0
+        cut = self.n_rejected
+        held_back = (f"{cut:,} of {cut + len(self):,} stamps held back by the "
+                     f"loader's cuts; " if cut else "")
         if self.in_memory:
-            return (f"dataset: {gb:.2f} GiB of stamps cached in RAM, "
-                    f"prefetch depth {self.prefetch_depth}")
+            return (f"dataset: {held_back}{gb:.2f} GiB of stamps cached in "
+                    f"RAM, prefetch depth {self.prefetch_depth}")
         over = (f", over the {max_in_memory_gb:g} GiB cap"
                 if max_in_memory_gb is not None else "")
         held = min(self.pool_shards, len(self.shards.paths))
         per = self.shards.nbytes("image") / max(len(self.shards.paths), 1) / 1024**3
         return (
-            f"dataset: {gb:.2f} GiB of stamps in {len(self.shards.paths)} "
+            f"dataset: {held_back}{gb:.2f} GiB of stamps in "
+            f"{len(self.shards.paths)} "
             f"shards{over}; batches come from a pool of {held} resident "
             f"(~{held * per:.1f} GiB), one replaced every "
             f"{self.pool_refill_every} batches by a background sequential read, "
@@ -166,13 +282,15 @@ class PatchDataset:
         if in_memory == "auto":
             in_memory = gb <= max_in_memory_gb
         native = shards.load("image") if in_memory else None
+        rows = usable_rows(shards, config)
         return cls(
             config=config,
             transform=transform,
             # Cut to match: `band_idx` is indexed by *dataset* position and
             # `__len__` reads its length, so handing over the uncut array would
             # put every index out by however many rows the cut removed.
-            band_idx=np.asarray(shards.meta["band_idx"])[usable_rows(shards, config)],
+            band_idx=np.asarray(shards.meta["band_idx"])[rows],
+            rows=rows,
             shards=shards,
             native=native,
             pool_shards=pool_shards,
@@ -185,7 +303,12 @@ class PatchDataset:
 
     @property
     def n_rejected(self) -> int:
-        """Shard rows the no-data cut removed.  Reported, never silent."""
+        """Shard rows the loader's cuts removed.  Reported, never silent.
+
+        All of them together -- no-data, saturation, interpolation -- since
+        what matters to a training run is how many stamps it is not seeing.
+        ``usable_rows`` is where they are applied separately.
+        """
         if self._rows is None or self.shards is None:
             return 0
         return len(self.shards.meta["band_idx"]) - len(self._rows)
@@ -230,7 +353,16 @@ class PatchDataset:
         t = self.config.transform
         if not t.floors_enabled:
             return 0.0
-        ratio = t.pooled_noise_ratio
+        return t.floor_sigma * self.pooled_sky_noise(sky_noise)
+
+    def pooled_sky_noise(self, sky_noise: np.ndarray) -> np.ndarray:
+        """Each stamp's sky noise on the *training* grid, ``(B, 1, 1)`` in nJy.
+
+        Split out of ``sky_floor`` because the floor is no longer the only
+        thing measured in these units: ``despeckle_sigma`` is too, and it has
+        to mean the same sigma or the two knobs are not comparable.
+        """
+        ratio = self.config.transform.pooled_noise_ratio
         if ratio is None:
             raise ValueError(
                 "the config has no transform.pooled_noise_ratio, so a native "
@@ -239,8 +371,7 @@ class PatchDataset:
                 "measures the pooled noise and the ratio together."
             )
         sigma = np.asarray(sky_noise, dtype=np.float64) / self.config.patch.pool_factor
-        sigma = sigma * float(ratio)
-        return (t.floor_sigma * sigma)[:, None, None]
+        return (sigma * float(ratio))[:, None, None]
 
     def _pool_stamps(
         self,
@@ -300,7 +431,38 @@ class PatchDataset:
         # `floors_enabled = False` is still the original one-parameter map.
         pedestal = (self.config.transform.floor_pedestal
                     if self.config.transform.floors_enabled else 0.0)
-        return self.transform.forward(pooled, floor, pedestal), floor
+        x = self.transform.forward(pooled, floor, pedestal)
+        return self.despeckled(x, floor, pedestal, sky_noise), floor
+
+    def despeckled(self, x, floor, pedestal, sky_noise):
+        """``x`` with the sky's small bright blobs pushed back to the floor.
+
+        Here rather than anywhere earlier because the threshold is a statement
+        about the *representation*: it is where ``despeckle_sigma`` of sky
+        noise lands after the map, so it moves when the map does and the two
+        cannot drift apart.  And here rather than anywhere later because
+        ``to_log_space`` is what every path goes through -- the loader and
+        ``plots.plot_transform`` alike -- so the figure shows the data the
+        network is actually handed.
+
+        A no-op without ``sky_noise``: the threshold is per stamp and there is
+        nothing to set it from.  The count of what it took goes to
+        ``_last_despeckle``, the way ``fill_no_data``'s does.
+        """
+        from .despeckle import NOTHING_REMOVED, despeckle
+
+        t = self.config.transform
+        self._last_despeckle = dict(NOTHING_REMOVED, n_stamps=len(x),
+                                    n_pixels=x.size)
+        k = t.floor_sigma if t.despeckle_sigma is None else t.despeckle_sigma
+        if t.despeckle_max_pixels <= 0 or sky_noise is None or k <= 0:
+            return x
+        threshold = self.transform.forward(
+            k * self.pooled_sky_noise(sky_noise), floor, pedestal)
+        x, self._last_despeckle = despeckle(
+            x, threshold, self.transform.sky_level_at(floor, pedestal),
+            t.despeckle_max_pixels)
+        return x
 
     def batch_from_stamps(
         self,
@@ -567,6 +729,10 @@ class PatchDataset:
         rng = np.random.default_rng(seed)
         idx = np.sort(rng.choice(len(self), size=min(n, len(self)), replace=False))
         x = self.make_batch(idx, rng=rng, augment=False)[:, 0]
+        # Captured from the batch just made, before anything else overwrites
+        # it: the despeckler is the one step whose effect cannot be measured
+        # from `x` afterwards, because what it took is gone.
+        despeckled = dict(self._last_despeckle)
         # Most pixels in a patch are sky, so the 16-84 half-width is the sky
         # scatter.  Taken across all the bands at once, which is meaningful
         # again now there is a single softening scale: every band's sky sits at
@@ -597,6 +763,7 @@ class PatchDataset:
             deepest_sigma = float((flux[good].min(axis=(1, 2)) / sigma_pooled[good]).min())
         return {
             "n": int(len(idx)),
+            "despeckled": despeckled,
             "mean": float(x.mean()),
             "std": float(x.std()),
             "percentiles": {

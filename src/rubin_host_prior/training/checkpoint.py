@@ -55,7 +55,17 @@ def load_checkpoint(
     path = d / name
     if not path.exists():  # e.g. trained with ema disabled
         path = d / "model.eqx"
-    model = eqx.tree_deserialise_leaves(path, skeleton)
+    try:
+        model = eqx.tree_deserialise_leaves(path, skeleton)
+    except Exception as e:  # equinox names the leaf, not the cause
+        raise ValueError(
+            f"{path} does not fit the model {d / 'config.json'} describes. "
+            f"Equinox matches leaves by position, so a checkpoint written "
+            f"before a change to the architecture's module fields cannot be "
+            f"read back however well the config matches -- the weights are "
+            f"there, the pytree is not the same shape. Retrain, or check out "
+            f"the revision that wrote it."
+        ) from e
     return model, config, step
 
 

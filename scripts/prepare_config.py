@@ -352,6 +352,22 @@ def main() -> None:
     # pedestal up to the sources instead, and a mismatch means nothing.
     if pinned == pinned and floor:
         print(f"  {pinned:.0%} of pixels are pinned to the pedestal")
+    sp = stats.get("despeckled") or {}
+    if sp.get("n_pixels_removed"):
+        cut = tc.despeckle_sigma if tc.despeckle_sigma is not None else tc.floor_sigma
+        print(
+            f"  despeckler: {sp['n_blobs_removed']:,} of {sp['n_blobs']:,} "
+            f"blobs above {cut:g} sigma were {tc.despeckle_max_pixels} px or "
+            f"smaller and went back to the sky level -- "
+            f"{sp['n_pixels_removed'] / max(sp['n_pixels'], 1):.2%} of pixels, "
+            f"{sp['n_pixels_removed'] / max(sp['n_stamps'], 1):.0f} per stamp"
+        )
+        print(
+            "  that is the sky's positive tail, and marginal point sources "
+            "with it; raise despeckle_sigma to take only the bright ones"
+        )
+    elif tc.despeckle_max_pixels:
+        print(f"  despeckler: on at {tc.despeckle_max_pixels} px, nothing to take")
     if pinned == pinned and pinned > 0.5:
         print(
             "  past half, so the measured number is the pedestal-to-source "

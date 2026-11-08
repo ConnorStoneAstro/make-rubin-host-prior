@@ -425,7 +425,15 @@ def test_forward_patches_shows_the_same_scenes_either_way(dataset):
     # pixels, but it is the same scenes and so the same overall level.
     np.testing.assert_array_equal(plain, again)
     assert not np.array_equal(plain, aug)
-    assert aug.mean() == pytest.approx(plain.mean(), rel=0.2)
+    # Against the data's own spread, not as a fraction of the mean.  The mean
+    # of x is wherever the transform puts it and it crosses zero: under a
+    # sharp knee the pinned sky pulls it to about -0.5, where `rel=0.2` is a
+    # tolerance of 0.09 and a crop landing on a little more or less sky
+    # breaks it.  The claim is "the same overall level", so the yardstick is
+    # the level's own scale.
+    scale = float(plain.std())
+    assert abs(float(aug.mean()) - float(plain.mean())) < 0.2 * scale, (
+        float(aug.mean()), float(plain.mean()), scale)
 
 
 def test_band_power_beats_a_box_filter_at_attribution():

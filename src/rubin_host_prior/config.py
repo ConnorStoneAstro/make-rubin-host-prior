@@ -595,9 +595,43 @@ class TransformConfig:
     #: being handled.
     fill_no_data: bool = False
 
+    #: Blobs of at most this many connected pixels above ``despeckle_sigma``
+    #: are pushed back down to the stamp's own sky level.  Zero disables it.
+    #:
+    #: **The floor is pointwise and this is not**, which is the whole reason
+    #: it exists: ``floor_sigma`` decides whether a pixel is believed, and
+    #: nothing in a pointwise map can tell the sky's positive tail from a
+    #: faint compact source.  Extent can.  Measured on pooled Rubin-like
+    #: stamps with the floor at 2 sigma, 98% of the blobs poking through are
+    #: four pixels or smaller and essentially no real source is; by 4 sigma
+    #: only 64% are, because by then what is left is mostly sources.  See
+    #: ``data.despeckle``.
+    #:
+    #: It removes marginal point sources along with the noise.  That is the
+    #: trade, not an oversight -- at four pixels the two are the same object.
+    despeckle_max_pixels: int = 4
+    #: How bright a pixel has to be before the size question is asked, in
+    #: units of the cutout's own pooled sky noise.  ``None`` means
+    #: ``floor_sigma``: exactly the pixels that poke above the floor, which is
+    #: the reading that needs no second number.  Raising it leaves the faint
+    #: speckle in place and takes only the bright ones; what each setting
+    #: costs, on synthetic stamps at the defaults:
+    #:
+    #:     cut     lit    blobs/stamp   <= 4 px   pixels removed
+    #:     2.0     3.7%        312         98.1%       2.47%
+    #:     2.5     1.6%        108         97.6%       0.76%
+    #:     3.0     0.9%         34         94.0%       0.22%
+    #:     4.0     0.5%          4         64.1%       0.02%
+    despeckle_sigma: float | None = None
+
     def __post_init__(self) -> None:
         if self.floor_sigma < 0:
             raise ValueError(f"need floor_sigma >= 0, got {self.floor_sigma}")
+        if self.despeckle_max_pixels < 0:
+            raise ValueError(
+                f"need despeckle_max_pixels >= 0, got "
+                f"{self.despeckle_max_pixels}; 0 switches it off"
+            )
 
     @property
     def floors_enabled(self) -> bool:
@@ -664,6 +698,34 @@ class PatchConfig:
     #: in the image distinguishes them, so the metadata is the only honest
     #: handle and the cut is all-or-nothing.  It costs 3.3% of the set.
     max_no_data: float = 0.0
+
+    #: Reject a stamp whose whole-frame ``SATURATED`` / ``INTERPOLATED``
+    #: fraction exceeds this.  ``None`` disables both.
+    #:
+    #: **Loader cuts like ``max_no_data``, but read from
+    #: ``manifest.parquet``**, joined on ``(host_id, band)`` -- the shards
+    #: carry only ``frac_no_data``, ``frac_inexact_psf`` and ``frac_rejected``.
+    #: So these are tunable against stamps you already have, and the manifest
+    #: has to sit beside the shards for them to work at all.
+    #: ``SelectionConfig.max_plane_fraction`` is the matching gate for future
+    #: extractions.
+    #:
+    #: **Sizes, because the numbers are not intuitive.**  On a 512 px stamp a
+    #: saturated star core 5 px across is 20 px, or 0.008% of the frame; 20 px
+    #: across is 314 px, or 0.12%.  The extraction gate is 0.5% for SATURATED
+    #: and 2% for INTERPOLATED -- a disc 41 px across and one 82 px across --
+    #: so a star of the size that actually shows interpolation stripes is one
+    #: to two orders of magnitude below either.  A cut aimed at those is
+    #: therefore close to zero tolerance, and ``SATURATED`` is the more
+    #: targeted plane of the two: it marks the star, where ``INTERPOLATED``
+    #: also covers benign repairs elsewhere in the frame.
+    #:
+    #: Set at the 5 px disc itself -- ``pi * 2.5**2 / 512**2 = 7.5e-5``, rounded
+    #: up so that disc passes and anything larger does not.  It is a yield
+    #: trade and the yield is the thing to watch: the startup line reports how
+    #: many stamps the cut held back before the first step runs.
+    max_frac_saturated: float | None = 8e-5
+    max_frac_interpolated: float | None = 8e-5
     native_size: int = 512  # pixels cut from the coadd
     out_size: int = 128  # the training grid, in pooled pixels
     pool_factor: int = 2

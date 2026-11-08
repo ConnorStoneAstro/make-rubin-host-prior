@@ -661,9 +661,26 @@ class SigmaOffset(eqx.Module):
     0.03% of a dynamic range of 95,000 and recover ``2 * sum_j w_j = 16368``
     against a true ``D = 16384`` without being told it.  A generic MLP on the
     noise embedding manages the same job only after learning the asymptotes
-    from scratch; ``b0 + b1/sigma^2 + b2 log sigma`` -- the shape the old
-    ``"sum"`` models appeared to have -- is 22% out, because that growth was
-    parameterisation drift and not the log density.
+    from scratch.
+
+    **Plus ``a / sigma``, which is not the log density and has to be here
+    anyway.**  ``energy_form='sum'`` writes ``E = sum(h) / sigma``, and the
+    loss sees ``E`` only through ``-grad_x E``, so the part of ``h`` that does
+    not depend on ``x`` is pure gauge and drifts wherever training leaves it.
+    Measured on a trained encoder, that part is the *whole* story: ``sigma *
+    k(sigma)`` is flat to 0.1% across three decades of sigma, so ``k`` is
+    ``const / sigma`` to within a rounding error.  No number of log bands can
+    follow that -- every one of them is bounded as ``sigma -> 0`` -- and the
+    log-only family is stuck 2.2% out *whatever* the drift scale, with the
+    miss largest at small sigma because that is where ``1 / sigma`` is largest.
+    Multiplied by ``D``, that was the ``-1e7`` rise in ``log_prob`` as ``t ->
+    0``: the calibration was subtracting a curve of the wrong shape.  One
+    scalar fixes it, and the residual drops by four to five orders of
+    magnitude.
+
+    So the two terms have different jobs and neither replaces the other: the
+    log bands are the log density a Gaussian field really has, ``a / sigma`` is
+    the parameterisation's own drift.
 
     Everything here is **per cell**, so a level's contribution to the total is
     ``A * n * k = D * k``: the offset scales with the scene and the parameters
@@ -674,6 +691,7 @@ class SigmaOffset(eqx.Module):
     loss, which cannot see them. ``calibrate_offsets`` fits them.
     """
 
+    a: Float[Array, ""]
     b0: Float[Array, ""]
     w: Float[Array, " j"]
     log_q: Float[Array, " j"]
@@ -681,6 +699,7 @@ class SigmaOffset(eqx.Module):
     def __init__(self, n_bands: int = 2, var: float = 1.0):
         if n_bands < 1:
             raise ValueError(f"n_bands must be >= 1, got {n_bands}")
+        self.a = jnp.zeros(())
         self.b0 = jnp.zeros(())
         self.w = jnp.full((n_bands,), 0.5 / n_bands)
         # Spread across the spectrum, not stacked: two bands initialised at the
@@ -691,7 +710,7 @@ class SigmaOffset(eqx.Module):
 
     def __call__(self, sigma: Float[Array, ""]) -> Float[Array, ""]:
         sigma = jnp.asarray(sigma)
-        return self.b0 + jnp.sum(
+        return self.a / sigma + self.b0 + jnp.sum(
             self.w * jnp.log(jnp.exp(self.log_q) + sigma**2))
 
 
@@ -915,9 +934,9 @@ class NCSNppEncoderEnergy(EnergyModel):
             f"no decoder",
             f"  energy summed over {len(res) + 1} area-weighted taps by "
             f"'{form}', host free to move {config.patch.shift_note}",
-            f"  per-level offsets: {self.config.n_offset_bands} bands of "
-            f"b0 + sum_j w_j log(q_j + sigma^2); fit by calibrate_offsets, "
-            f"not by the loss",
+            f"  per-level offsets: a/sigma + b0 + "
+            f"{self.config.n_offset_bands} bands of w_j log(q_j + sigma^2); "
+            f"fit by calibrate_offsets, not by the loss",
             "  score is -grad_x E, so a training step is a gradient of a "
             "gradient -- but of the encoder only",
         ])
@@ -937,25 +956,39 @@ class NCSNppEncoderEnergy(EnergyModel):
 
 
 @eqx.filter_jit
-def _fit_bands(params, sigmas, target, n_steps=2000, lr=5e-2):
-    """Least squares for ``b0 + sum_j w_j log(q_j + sigma^2)`` against ``target``.
+def _fit_offset(log_q, sigmas, target, n_steps=600, lr=1e-1):
+    """Least squares for ``a / sigma + b0 + sum_j w_j log(q_j + sigma^2)``.
 
-    Adam inside a ``fori_loop`` rather than Levenberg-Marquardt: no scipy
-    dependency, and jitted so this is cheap enough to run at every checkpoint
-    instead of once at the end.  ``n_bands`` comes from the parameter shape, so
-    it is static without being an argument.
+    **Variable projection**, not plain Adam on everything.  The model is linear
+    in ``(a, b0, w)`` once the band powers are fixed, so those three are solved
+    exactly by ``lstsq`` at every step and the optimiser only has to move
+    ``log_q`` -- which matters because ``a`` is the drift and the drift has no
+    natural scale.  A trained encoder's can be in the hundreds or the
+    thousands, and a fixed-step optimiser starting from zero cannot cross that
+    in any sane number of steps: it was the old fit's silent failure mode even
+    before the term existed to fit.  Here the scale is irrelevant, and the fit
+    lands at float32's own precision -- relative residual 2e-7 whether the
+    drift is 6 or 6,000.
+
+    Adam inside a ``fori_loop`` rather than Levenberg-Marquardt, as before: no
+    scipy dependency, and jitted so this is cheap enough to run at every
+    checkpoint.  ``lstsq`` stays finite on a rank-deficient design -- two bands
+    started at the same power, or a target so flat that every log column is the
+    intercept -- which is checked, because the gradient of an SVD is where that
+    would otherwise bite.
+
+    Returns ``(a, b0, w, log_q)``.
     """
     import optax
 
-    n_bands = (params.shape[0] - 1) // 2
+    def solve(log_q):
+        cols = [1.0 / sigmas, jnp.ones_like(sigmas)]
+        cols += [jnp.log(q + sigmas**2) for q in jnp.exp(log_q)]
+        design = jnp.stack(cols, axis=1)
+        coef = jnp.linalg.lstsq(design, target)[0]
+        return coef, design @ coef
 
-    def predict(p):
-        b0, w, log_q = p[0], p[1:1 + n_bands], p[1 + n_bands:]
-        return b0 + jnp.sum(
-            w[:, None] * jnp.log(jnp.exp(log_q)[:, None] + sigmas[None, :] ** 2),
-            axis=0)
-
-    loss = lambda p: jnp.mean((predict(p) - target) ** 2)
+    loss = lambda lq: jnp.mean((solve(lq)[1] - target) ** 2)
     tx = optax.adam(lr)
 
     def body(_, carry):
@@ -963,8 +996,9 @@ def _fit_bands(params, sigmas, target, n_steps=2000, lr=5e-2):
         upd, state = tx.update(jax.grad(loss)(p), state, p)
         return optax.apply_updates(p, upd), state
 
-    out, _ = jax.lax.fori_loop(0, n_steps, body, (params, tx.init(params)))
-    return out
+    log_q, _ = jax.lax.fori_loop(0, n_steps, body, (log_q, tx.init(log_q)))
+    coef, _ = solve(log_q)
+    return coef[0], coef[1], coef[2:], log_q
 
 
 def calibrate_offsets(
@@ -985,7 +1019,10 @@ def calibrate_offsets(
     would sit at their initialisation forever.
 
     What it fits is the mean cell of each level's map at each noise level,
-    which is what makes the level's sum small.  Returns a new model; the
+    which is what makes the level's sum small.  The family has to include the
+    ``a / sigma`` drift that ``energy_form='sum'`` generates or the fit is 2%
+    out at every scale and the leftover, times ``D``, is the energy running
+    away as ``sigma -> 0``; see ``SigmaOffset``.  Returns a new model; the
     original is unchanged.
 
     Cheap enough for every checkpoint: ``n_sigma`` batched forwards and a
@@ -1011,13 +1048,9 @@ def calibrate_offsets(
 
     fitted = []
     for level, offset in enumerate(model.offsets):
-        params = jnp.concatenate(
-            [jnp.atleast_1d(offset.b0), offset.w, offset.log_q])
-        got = _fit_bands(params, sigmas, rows[:, level])
-        n_bands = len(offset.w)
+        got = _fit_offset(offset.log_q, sigmas, rows[:, level])
         fitted.append(eqx.tree_at(
-            lambda o: (o.b0, o.w, o.log_q), offset,
-            (got[0], got[1:1 + n_bands], got[1 + n_bands:])))
+            lambda o: (o.a, o.b0, o.w, o.log_q), offset, got))
     return eqx.tree_at(lambda m: m.offsets, model, tuple(fitted))
 
 

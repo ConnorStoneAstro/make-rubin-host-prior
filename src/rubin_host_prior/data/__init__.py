@@ -1,9 +1,11 @@
 from .augment import N_DIHEDRAL, dihedral, random_dihedral
+from .despeckle import despeckle
 from .dataset import (
     PatchDataset,
     pool_shards,
     suggest_n_steps,
     suggest_sigma_range,
+    usable_rows,
 )
 from .pool import ShardPool, prefetch
 from .diagnostics import autocorrelation, reach_advice, correlation_length
@@ -15,6 +17,7 @@ from .transform import (LogFluxTransform, estimate_softening, measure_transform,
 
 __all__ = [
     "ShardPool",
+    "usable_rows",
     "prefetch",
     "META_DTYPES",
     "N_DIHEDRAL",
@@ -28,6 +31,7 @@ __all__ = [
     "center_crop",
     "reach_advice",
     "correlation_length",
+    "despeckle",
     "dihedral",
     "log_softplus",
     "soften",

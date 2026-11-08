@@ -81,7 +81,7 @@ NEVER_REJECT: tuple[str, ...] = COVARIATE_PLANES
 
 
 #: Block side for the variance floors, as a fraction of the stamp.  At the
-#: nominal 416 px stamp this is 52 px: well under a 150 px coadd cell, so at
+#: nominal 512 px stamp this is 64 px: well under a 150 px coadd cell, so at
 #: least one block falls wholly inside each cell and a step between cells shows
 #: up as a difference between blocks; and well over a galaxy -- a 1 arcsec
 #: half-light radius is 5 native px -- so no source can fill a block and lift its

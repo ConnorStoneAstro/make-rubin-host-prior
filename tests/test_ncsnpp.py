@@ -450,8 +450,9 @@ def test_the_sigma_offset_cannot_move_the_score(encoder_config):
     before = np.asarray(model.score(x, sigma))
 
     wild = tuple(
-        eqx.tree_at(lambda o: (o.b0, o.w, o.log_q), off,
-                    (jnp.float32(1e4), off.w * -37.0, off.log_q + 5.0))
+        eqx.tree_at(lambda o: (o.a, o.b0, o.w, o.log_q), off,
+                    (jnp.float32(-5e3), jnp.float32(1e4), off.w * -37.0,
+                     off.log_q + 5.0))
         for off in model.offsets
     )
     moved = eqx.tree_at(lambda m: m.offsets, model, wild)
@@ -497,10 +498,15 @@ def test_calibration_flattens_the_energy_and_leaves_the_score_alone(encoder_conf
                     jnp.float32)
     fitted = calibrate_offsets(model, x, sde, n_sigma=8)
 
-    sigmas = [0.05, 0.5, 5.0]
-    before = max(abs(float(model(x[0], jnp.float32(s)))) for s in sigmas)
-    after = max(abs(float(fitted(x[0], jnp.float32(s)))) for s in sigmas)
-    assert after < before
+    # Across the ladder the model is actually trained on, and reported against
+    # the energy it started from rather than against a number: what has to be
+    # true is that almost all of it is gone, at *every* sigma and not on
+    # average.  `after < before` was the old assertion and it passed happily
+    # while the small-sigma end was out by a factor of a thousand.
+    sigmas = np.asarray(sde.sigma(np.linspace(0.0, 1.0, 12)))
+    before = np.array([abs(float(model(x[0], jnp.float32(s)))) for s in sigmas])
+    after = np.array([abs(float(fitted(x[0], jnp.float32(s)))) for s in sigmas])
+    assert (after < 0.02 * before).all(), dict(zip(sigmas.round(3), after / before))
 
     # Provably, not approximately: the score is untouched.
     for s in sigmas:
@@ -511,6 +517,70 @@ def test_calibration_flattens_the_energy_and_leaves_the_score_alone(encoder_conf
     got = offset_residual(fitted, x, sde, n_sigma=8)
     assert len(got["levels"]) == len(model.offsets)
     assert all(np.isfinite(L["max_residual"]) for L in got["levels"])
+    # The fit is the thing that decides all of the above, so hold it to the
+    # span it is fitting rather than to an absolute residual -- the energy
+    # scale is whatever training drifted to.
+    assert all(L["fraction_of_span"] < 1e-2 for L in got["levels"]), got
+
+
+def test_the_offset_follows_the_drift_the_sum_form_makes(encoder_config):
+    """``E = sum(h) / sigma`` with an ``x``-independent part of ``h`` that the
+    loss cannot see is an energy with a ``const / sigma`` term in it.
+
+    The regression this pins: the family was ``b0 + sum_j w_j log(q_j +
+    sigma^2)``, every term of which is *bounded* as ``sigma -> 0``, so it could
+    not represent that drift at all.  The fit sat ~2% out at every drift scale,
+    the miss was largest at the small-sigma end, and multiplied by the number
+    of cells it came back as ``log_prob`` running to -1e7 as ``t -> 0``.
+    """
+    from rubin_host_prior.nn.ncsnpp import SigmaOffset, _fit_offset
+
+    sde = VESDE.from_config(encoder_config.sde)
+    sigmas = jnp.asarray(sde.sigma(jnp.linspace(0.0, 1.0, 24)), jnp.float32)
+    off = SigmaOffset(2, var=0.49)
+
+    # Pure drift, which is what a trained encoder very nearly is: `sigma * k`
+    # measures flat to 0.1% across three decades.
+    for scale in (1.0, 1e3):
+        target = jnp.asarray(-6.1 * scale / sigmas, jnp.float32)
+        a, b0, w, log_q = _fit_offset(off.log_q, sigmas, target)
+        fitted = eqx.tree_at(lambda o: (o.a, o.b0, o.w, o.log_q), off,
+                             (a, b0, w, log_q))
+        got = jnp.asarray([fitted(s) for s in sigmas])
+        span = float(target.max() - target.min())
+        assert float(jnp.abs(got - target).max()) < 1e-5 * span
+        # Recovered as the drift it is, not smeared over the log bands.
+        assert float(a) == pytest.approx(-6.1 * scale, rel=1e-3)
+
+    # The log bands still do their own job: a pure Gaussian-field curve with no
+    # drift in it comes back with `a` at zero.
+    q = jnp.asarray([0.5, 40.0], jnp.float32)
+    target = 0.2 * jnp.log(q[0] + sigmas**2) + 0.1 * jnp.log(q[1] + sigmas**2)
+    a, b0, w, log_q = _fit_offset(off.log_q, sigmas, target)
+    fitted = eqx.tree_at(lambda o: (o.a, o.b0, o.w, o.log_q), off,
+                         (a, b0, w, log_q))
+    got = jnp.asarray([fitted(s) for s in sigmas])
+    span = float(target.max() - target.min())
+    assert float(jnp.abs(got - target).max()) < 5e-3 * span
+    # The one that matters: no drift in the target, none in the fit.  Loose on
+    # the residual because this is the case the band powers have to be *found*
+    # for, and `a` can always paper over a slow band -- that it does not is
+    # the statement.
+    assert abs(float(a)) < 1e-2 * span
+
+    # Rank-deficient designs, where the SVD inside `lstsq` has no unique answer
+    # and its gradient is where NaN would come from: bands started stacked, a
+    # single band, and a target so flat that the log columns *are* the
+    # intercept.  All three have to come back finite, because the fit runs
+    # unattended at every checkpoint.
+    flat = jnp.full_like(sigmas, 3.0)
+    for lq0, tgt in (
+        (jnp.log(jnp.asarray([1.0, 1.0], jnp.float32)), target),
+        (jnp.log(jnp.asarray([1.0], jnp.float32)), target),
+        (off.log_q, flat),
+    ):
+        got = _fit_offset(lq0, sigmas, tgt)
+        assert all(bool(jnp.all(jnp.isfinite(g))) for g in got), got
 
 
 def test_the_encoder_refuses_the_dae_form(encoder_config):
