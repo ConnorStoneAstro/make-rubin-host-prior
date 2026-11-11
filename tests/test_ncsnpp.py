@@ -479,6 +479,28 @@ def test_any_depth_of_context_is_still_an_energy(encoder_config, n_blocks):
     assert model.score(jnp.zeros((1, 24, 24)), jnp.float32(1.0)).shape == (1, 24, 24)
 
 
+def test_a_single_head_reads_the_whole_energy_at_full_resolution(encoder_config):
+    """``progressive="none"``: one map, one offset, and every level still in
+    it -- by way of the context stream, since nothing else leads there."""
+    c = dataclasses.replace(encoder_config)
+    c.ncsnpp = dataclasses.replace(encoder_config.ncsnpp, progressive="none")
+    model = c.build_model(jax.random.key(0))
+    x = jax.random.normal(jax.random.key(6), (1, SIZE, SIZE))
+    sigma = jnp.float32(1.0)
+    maps = model.energy_maps(x, sigma)
+    assert [m.shape[-1] for m in maps] == [SIZE]
+    assert len(model.offsets) == 1 and model.head_conv is None
+    assert float(model(x, sigma)) == pytest.approx(
+        float((maps[0] - model.offsets[0](sigma)).sum()), rel=1e-4)
+
+    g = eqx.filter_grad(lambda m: m(x, sigma))(model)
+    assert float(jnp.abs(g.mid_block2.conv0.weight).max()) > 0
+
+    small = jax.random.normal(jax.random.key(7), (1, 8, 8))
+    jac = np.asarray(jax.jacrev(model.score)(small, sigma)).reshape(64, 64)
+    assert np.abs(jac - jac.T).max() / np.abs(jac).max() < 1e-4
+
+
 def test_a_negative_depth_of_context_is_refused():
     with pytest.raises(ValueError, match="context_blocks"):
         NCSNppConfig(context_blocks=-1)

@@ -780,6 +780,18 @@ class NCSNppEncoderEnergy(EnergyModel):
     is that the U-Net energy trains in a small fraction of the steps the bare
     pyramid needs, and the decoder is the only thing that separates the two.
 
+    **Where the energy is read is ``progressive``, the U-Net's own switch.**
+    ``"output_skip"`` keeps a tap on every level and the bottleneck, each now
+    reading fused features.  That is not a leftover from the bare pyramid: it
+    is what the U-Net does under the same setting, where each decoder level
+    emits a map that is upsampled and added to the next -- and the sum of an
+    upsampled map *is* the area-weighted sum of the coarse one.  ``"none"``
+    reads the finest level alone, one full-resolution map summed once, which
+    is an ordinary U-Net's single head; everything coarser then reaches the
+    energy only through the stream.  Without the stream that form is the
+    bottleneck-only failure above turned upside down, so it is the stream
+    that makes it available at all.
+
     The stream is still one scalar's worth of computation, so the score stays
     an exact gradient, and it resamples by the same factors the trunk does,
     so the grid stays free.
@@ -808,8 +820,8 @@ class NCSNppEncoderEnergy(EnergyModel):
     level_convs: tuple[eqx.nn.Conv2d, ...]
     context_convs: tuple[eqx.nn.Conv2d, ...]
     context_blocks: tuple[tuple[ResnetBlockBigGANpp, ...], ...]
-    head_norm: eqx.nn.GroupNorm
-    head_conv: eqx.nn.Conv2d
+    head_norm: eqx.nn.GroupNorm | None
+    head_conv: eqx.nn.Conv2d | None
     offsets: tuple[SigmaOffset, ...]
     config: NCSNppConfig = eqx.field(static=True)
     log_sigma_min: float = eqx.field(static=True)
@@ -854,6 +866,10 @@ class NCSNppEncoderEnergy(EnergyModel):
                 fir_kernel=config.fir_kernel, skip_rescale=config.skip_rescale,
                 init_scale=config.init_scale, key=next_key(), **kw)
 
+        # Which levels the energy is read from.  "output_skip" is every
+        # level and the bottleneck; "none" is the finest alone, which the
+        # context stream has by then filled with everything coarser.
+        pyramid = config.progressive == "output_skip"
         self.conv_in = _conv(config.in_channels, nf, 3, key=next_key())
         ch = nf
         down, norms, convs, widths = [], [], [], []
@@ -864,8 +880,9 @@ class NCSNppEncoderEnergy(EnergyModel):
                 ch = nf * mult[level]
             # The tap: read off the trunk, do not divert it.  `h` carries on
             # into the downsample unchanged.
-            norms.append(_group_norm(ch))
-            convs.append(_conv(ch, 1, 3, 1.0, key=next_key()))
+            if pyramid or level == 0:
+                norms.append(_group_norm(ch))
+                convs.append(_conv(ch, 1, 3, 1.0, key=next_key()))
             widths.append(ch)
             resample = combine = None
             if level != n_levels - 1:
@@ -886,8 +903,9 @@ class NCSNppEncoderEnergy(EnergyModel):
         self.mid_block2 = block(ch, None)
         # init_scale 1, not 1e-2: as in NCSNpp's out_conv, this is a sole path
         # to the output and starting it near zero starts the score at zero.
-        self.head_norm = _group_norm(ch)
-        self.head_conv = _conv(ch, 1, 3, 1.0, key=next_key())
+        self.head_norm = _group_norm(ch) if pyramid else None
+        self.head_conv = (_conv(ch, 1, 3, 1.0, key=next_key())
+                          if pyramid else None)
 
         # -- context, coarse to fine ---------------------------------------
         # One 1x1 per level, taking whatever is above it to this level's
@@ -911,7 +929,7 @@ class NCSNppEncoderEnergy(EnergyModel):
         var = self.data_std**2 if self.data_std else 1.0
         self.offsets = tuple(
             SigmaOffset(config.n_offset_bands, var)
-            for _ in range(n_levels + 1))     # one per tap, plus the bottleneck
+            for _ in range(len(convs) + pyramid))  # per tap, plus the bottleneck
 
     # -- forward -----------------------------------------------------------
 
@@ -922,7 +940,9 @@ class NCSNppEncoderEnergy(EnergyModel):
     def energy_maps(
         self, x: Float[Array, "c h w"], sigma: Float[Array, ""]
     ) -> tuple[Float[Array, "1 e e"], ...]:
-        """Every level's per-cell energy map, finest first, bottleneck last.
+        """Every tap's per-cell energy map, finest first, bottleneck last.
+
+        One map, the full-resolution one, under ``progressive="none"``.
 
         The diagnostic view, and what ``calibrate_offsets`` measures.
         """
@@ -946,9 +966,9 @@ class NCSNppEncoderEnergy(EnergyModel):
         if self.mid_attn is not None:
             h = self.mid_attn(h)
         h = self.mid_block2(h, temb)
-        bottleneck = energy_map(
+        bottleneck = () if self.head_conv is None else (energy_map(
             self.head_conv(self.act(self.head_norm(h))),
-            sigma, self.config.energy_form, self.data_std)
+            sigma, self.config.energy_form, self.data_std),)
 
         # Back up, coarse to fine.  `context` is everything above the level
         # being read: the bottleneck first, then each level's own fused
@@ -964,10 +984,12 @@ class NCSNppEncoderEnergy(EnergyModel):
                 context = context / SQRT2
             for blk in self.context_blocks[i]:
                 context = blk(context, temb)
-            maps.append(energy_map(
-                self.level_convs[i](self.act(self.level_norms[i](context))),
-                sigma, self.config.energy_form, self.data_std))
-        return (*reversed(maps), bottleneck)
+            if i < len(self.level_convs):     # all of them, or only the finest
+                maps.append(energy_map(
+                    self.level_convs[i](
+                        self.act(self.level_norms[i](context))),
+                    sigma, self.config.energy_form, self.data_std))
+        return (*reversed(maps), *bottleneck)
 
     def __call__(
         self, x: Float[Array, "c h w"], sigma: Float[Array, ""],
@@ -1013,7 +1035,8 @@ class NCSNppEncoderEnergy(EnergyModel):
             f"  context stream back up: 1x1 + upsample + add into every "
             f"tap, {self.config.context_blocks} block(s) per level after "
             f"the add",
-            f"  energy summed over {len(res) + 1} area-weighted taps by "
+            f"  energy summed over {len(self.offsets)} area-weighted "
+            f"tap(s) by "
             f"'{form}', host free to move {config.patch.shift_note}",
             f"  per-level offsets: a/sigma + b0 + "
             f"{self.config.n_offset_bands} bands of w_j log(q_j + sigma^2); "
@@ -1030,6 +1053,7 @@ class NCSNppEncoderEnergy(EnergyModel):
             "num_blocks": self.config.num_blocks,
             "attention": self.config.attention,
             "context_blocks": self.config.context_blocks,
+            "progressive": self.config.progressive,
             "energy_form": self.config.energy_form,
             "n_offset_bands": self.config.n_offset_bands,
             "data_std": self.data_std,

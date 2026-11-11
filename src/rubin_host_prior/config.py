@@ -285,6 +285,8 @@ class NCSNppConfig:
     #: emits a map, each finer level upsamples it and adds a correction.  This
     #: is the direct path from coarse features to the output.  ``"none"`` uses a
     #: single head at full resolution, i.e. an ordinary U-Net.
+    #: ``"ncsnpp_encoder"`` reads it the same way: a tap on every level, or
+    #: the energy summed once from the full-resolution map.
     progressive: str = "output_skip"
     #: ``"input_skip"`` feeds an FIR-downsampled copy of the scene in at every
     #: resolution.  ``"none"`` feeds it only at full resolution.
