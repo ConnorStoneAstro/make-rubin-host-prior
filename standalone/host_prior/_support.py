@@ -109,6 +109,7 @@ class NCSNppConfig:
     #: checkpoint's architecture is ``"ncsnpp_energy"``.
     energy_form: str = "sum"
     n_offset_bands: int = 2
+    context_blocks: int = 1
 
     def check(self) -> None:
         if self.progressive not in ("output_skip", "none"):

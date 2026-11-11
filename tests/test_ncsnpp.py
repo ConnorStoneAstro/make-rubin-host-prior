@@ -439,6 +439,51 @@ def test_the_encoder_energy_is_not_size_locked(encoder_config):
         assert model.score(x, jnp.float32(1.0)).shape == (1, size, size)
 
 
+def test_the_bottleneck_reaches_the_finest_tap(encoder_config):
+    """What the context stream is for.  Without it the finest tap is a function
+    of the first level's blocks alone, and nothing below can move it.
+
+    Asked of the weights, not the pixels: GroupNorm's whole-grid statistics
+    already make every feature depend on every pixel through two scalars per
+    group, so a far-away pixel moving the finest map proves nothing."""
+    model = encoder_config.build_model(jax.random.key(0))
+    x = jax.random.normal(jax.random.key(4), (1, SIZE, SIZE))
+
+    def reach(m):
+        g = eqx.filter_grad(
+            lambda m: jnp.sum(m.energy_maps(x, jnp.float32(1.0))[0]))(m)
+        return (float(jnp.abs(g.mid_block2.conv0.weight).max()),
+                float(jnp.abs(g.down_levels[-1].blocks[0].conv0.weight).max()))
+
+    assert min(reach(model)) > 0
+    # ... and the stream is the only way there: cut it and both vanish
+    # exactly, which is the architecture this replaced.
+    cut = eqx.tree_at(
+        lambda m: [c.weight for c in m.context_convs], model,
+        [jnp.zeros_like(c.weight) for c in model.context_convs])
+    assert reach(cut) == (0.0, 0.0)
+
+
+@pytest.mark.parametrize("n_blocks", [0, 2])
+def test_any_depth_of_context_is_still_an_energy(encoder_config, n_blocks):
+    """``context_blocks`` is how much runs on the fused features before the
+    tap reads them.  None of it may cost the exact gradient or the free grid."""
+    c = dataclasses.replace(encoder_config)
+    c.ncsnpp = dataclasses.replace(
+        encoder_config.ncsnpp, context_blocks=n_blocks)
+    model = c.build_model(jax.random.key(0))
+    assert [len(b) for b in model.context_blocks] == [n_blocks] * 2
+    x = jax.random.normal(jax.random.key(5), (1, 8, 8))
+    jac = np.asarray(jax.jacrev(model.score)(x, jnp.float32(1.0))).reshape(64, 64)
+    assert np.abs(jac - jac.T).max() / np.abs(jac).max() < 1e-4
+    assert model.score(jnp.zeros((1, 24, 24)), jnp.float32(1.0)).shape == (1, 24, 24)
+
+
+def test_a_negative_depth_of_context_is_refused():
+    with pytest.raises(ValueError, match="context_blocks"):
+        NCSNppConfig(context_blocks=-1)
+
+
 def test_the_sigma_offset_cannot_move_the_score(encoder_config):
     """The whole licence for subtracting it. A function of sigma alone has no
     gradient in x, so the offsets are free to be anything at all."""

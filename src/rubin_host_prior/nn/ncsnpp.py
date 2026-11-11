@@ -724,7 +724,9 @@ class NCSNppEncoderEnergy(EnergyModel):
     ch_mult=(1,2,4,4)`` on 128 px: 2.79M parameters against 7.20M, and a score
     for 9.96 GFLOP against 42.34, a **4.25x** saving.  The ratio belongs to the
     architecture rather than to that shape: at the current default
-    ``(1,2,2,4,4)`` it is 7.88 against 32.48, **4.12x**.  The decoder is 77% of
+    ``(1,2,2,4,4)`` it is 7.88 against 32.48, **4.12x**.  Those are the bare
+    pyramid; the context stream below gives some of it back, by an amount
+    ``context_blocks`` sets.  The decoder is 77% of
     the U-Net rather than half, because its levels run ``num_blocks + 1``
     blocks against ``num_blocks`` and each takes a concatenated skip, so twice
     the input channels.
@@ -745,6 +747,37 @@ class NCSNppEncoderEnergy(EnergyModel):
     already complete on its own, so the total is a scalar and the score is
     still an exact gradient.  It is the same construction ``ConvEnergyNet``
     used across dilations, moved across resolutions.
+
+    **Context comes back up, and the taps read it.**  The pyramid alone is an
+    additive model across scales.  The finest tap sees an 11 px window through
+    five convolutions and nothing else; the coarse taps have the context and
+    not the resolution; and what they know reaches the fine-scale score only
+    through the adjoint of the trunk.  No term computes on fine detail *given*
+    context, which is what the U-Net spends its decoder on.  So after the
+    bottleneck a stream runs back up -- a 1x1 on the coarser grid, an
+    upsample, an add onto that level's trunk features -- and each tap reads
+    the sum instead of the trunk.  ``context_blocks`` is how many residual
+    blocks run on the sum first.  Per score at the default shape on 128 px,
+    off XLA's cost analysis::
+
+        context_blocks      params   score GFLOP   step GFLOP
+        (no stream)      3,093,258          7.88        23.02
+        0                3,140,778          7.91        23.48
+        1                3,952,650         11.13        33.13
+        2                4,764,522         14.38        42.87
+        NCSNppEnergy     8,003,685         32.09        95.84
+
+    At 0 the stream is free, and context meets detail in exactly one place:
+    the tap's own GroupNorm and activation.  At 1 it is a thin decoder -- one
+    block per level on an *added* skip, against the U-Net's three on a
+    concatenated one -- for 1.41x the bare pyramid and still 2.9x under the
+    U-Net.  **Neither has been trained to convergence.**  What motivates them
+    is that the U-Net energy trains in a small fraction of the steps the bare
+    pyramid needs, and the decoder is the only thing that separates the two.
+
+    The stream is still one scalar's worth of computation, so the score stays
+    an exact gradient, and it resamples by the same factors the trunk does,
+    so the grid stays free.
 
     **Area weighting.**  A cell at level ``l`` stands for ``4 ** l`` pixels, so
     its map value is a density and the level's sum is weighted by that area.
@@ -768,6 +801,8 @@ class NCSNppEncoderEnergy(EnergyModel):
     mid_block2: ResnetBlockBigGANpp
     level_norms: tuple[eqx.nn.GroupNorm, ...]
     level_convs: tuple[eqx.nn.Conv2d, ...]
+    context_convs: tuple[eqx.nn.Conv2d, ...]
+    context_blocks: tuple[tuple[ResnetBlockBigGANpp, ...], ...]
     head_norm: eqx.nn.GroupNorm
     head_conv: eqx.nn.Conv2d
     offsets: tuple[SigmaOffset, ...]
@@ -816,7 +851,7 @@ class NCSNppEncoderEnergy(EnergyModel):
 
         self.conv_in = _conv(config.in_channels, nf, 3, key=next_key())
         ch = nf
-        down, norms, convs = [], [], []
+        down, norms, convs, widths = [], [], [], []
         for level in range(n_levels):
             blocks = []
             for _ in range(config.num_blocks):
@@ -826,6 +861,7 @@ class NCSNppEncoderEnergy(EnergyModel):
             # into the downsample unchanged.
             norms.append(_group_norm(ch))
             convs.append(_conv(ch, 1, 3, 1.0, key=next_key()))
+            widths.append(ch)
             resample = combine = None
             if level != n_levels - 1:
                 resample = block(ch, None, down=True)
@@ -847,6 +883,25 @@ class NCSNppEncoderEnergy(EnergyModel):
         # to the output and starting it near zero starts the score at zero.
         self.head_norm = _group_norm(ch)
         self.head_conv = _conv(ch, 1, 3, 1.0, key=next_key())
+
+        # -- context, coarse to fine ---------------------------------------
+        # One 1x1 per level, taking whatever is above it to this level's
+        # width.  It runs on the *coarser* grid, before the upsample, where
+        # it costs a quarter of what it would after.  Small init, like every
+        # other branch that joins a trunk here: the taps start out reading
+        # their own level and learn how much of the rest to let in.
+        context, above = [], ch
+        for level in reversed(range(n_levels)):
+            width = widths[level]
+            context.append((
+                _conv(above, width, 1, config.init_scale, key=next_key()),
+                tuple(block(width, None)
+                      for _ in range(config.context_blocks)),
+            ))
+            above = width
+        context.reverse()                     # stored finest first, like the taps
+        self.context_convs = tuple(c for c, _ in context)
+        self.context_blocks = tuple(b for _, b in context)
 
         var = self.data_std**2 if self.data_std else 1.0
         self.offsets = tuple(
@@ -872,13 +927,11 @@ class NCSNppEncoderEnergy(EnergyModel):
         raw = x - self.input_offset
         h = self.conv_in(raw)
         down_x = raw
-        maps = []
-        for i, level in enumerate(self.down_levels):
+        trunk = []
+        for level in self.down_levels:
             for blk in level.blocks:
                 h = blk(h, temb)
-            maps.append(energy_map(
-                self.level_convs[i](self.act(self.level_norms[i](h))),
-                sigma, self.config.energy_form, self.data_std))
+            trunk.append(h)
             if level.down is not None:
                 h = level.down(h, temb)
                 if level.combine is not None:
@@ -888,10 +941,28 @@ class NCSNppEncoderEnergy(EnergyModel):
         if self.mid_attn is not None:
             h = self.mid_attn(h)
         h = self.mid_block2(h, temb)
-        maps.append(energy_map(
+        bottleneck = energy_map(
             self.head_conv(self.act(self.head_norm(h))),
-            sigma, self.config.energy_form, self.data_std))
-        return tuple(maps)
+            sigma, self.config.energy_form, self.data_std)
+
+        # Back up, coarse to fine.  `context` is everything above the level
+        # being read: the bottleneck first, then each level's own fused
+        # features handed on to the next one down.
+        maps, context, last = [], h, len(trunk) - 1
+        for i in range(last, -1, -1):
+            context = self.context_convs[i](context)
+            if i != last:                     # the coarsest shares its grid
+                context = (fir_upsample(context, self.config.fir_kernel)
+                           if self.config.fir else naive_upsample(context))
+            context = trunk[i] + context
+            if self.config.skip_rescale:
+                context = context / SQRT2
+            for blk in self.context_blocks[i]:
+                context = blk(context, temb)
+            maps.append(energy_map(
+                self.level_convs[i](self.act(self.level_norms[i](context))),
+                sigma, self.config.energy_form, self.data_std))
+        return (*reversed(maps), bottleneck)
 
     def __call__(
         self, x: Float[Array, "c h w"], sigma: Float[Array, ""],
@@ -934,6 +1005,9 @@ class NCSNppEncoderEnergy(EnergyModel):
             f"({grid * config.patch.pool_factor} native); attention "
             f"{'at the bottleneck' if self.config.attention else 'off'}, "
             f"no decoder",
+            f"  context stream back up: 1x1 + upsample + add into every "
+            f"tap, {self.config.context_blocks} block(s) per level after "
+            f"the add",
             f"  energy summed over {len(res) + 1} area-weighted taps by "
             f"'{form}', host free to move {config.patch.shift_note}",
             f"  per-level offsets: a/sigma + b0 + "
@@ -950,6 +1024,7 @@ class NCSNppEncoderEnergy(EnergyModel):
             "ch_mult": list(self.config.ch_mult),
             "num_blocks": self.config.num_blocks,
             "attention": self.config.attention,
+            "context_blocks": self.config.context_blocks,
             "energy_form": self.config.energy_form,
             "n_offset_bands": self.config.n_offset_bands,
             "data_std": self.data_std,

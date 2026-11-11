@@ -218,8 +218,9 @@ class NCSNppConfig:
     cost little.
 
     **A fifth level is not a fifth level's worth of cost, which is the
-    measurement worth carrying away.**  Per score on a 128 px grid, encoder,
-    off XLA's cost analysis:
+    measurement worth carrying away.**  Per score on a 128 px grid, encoder
+    (the bare pyramid, before ``context_blocks`` adds its share), off XLA's
+    cost analysis:
 
         ch_mult           widths                     params   GFLOP
         (1, 2, 4, 4)      32, 64, 128, 128        2,795,907   10.23
@@ -306,6 +307,14 @@ class NCSNppConfig:
     #: exact Gaussian curve over a dynamic range of 95,000; one is 0.5%.  They
     #: are not trained by the loss -- see ``nn.ncsnpp.SigmaOffset``.
     n_offset_bands: int = 2
+    #: Residual blocks per level on the way back *up*, for
+    #: ``"ncsnpp_encoder"`` only.  The context stream itself is not optional
+    #: -- a 1x1, an upsample and an add carry everything coarser into every
+    #: tap -- and this is how much is computed on the result before the tap
+    #: reads it.  ``0`` is the add alone: context reaches the energy through
+    #: the tap's one nonlinearity.  ``1`` is a thin decoder.  See
+    #: ``nn.ncsnpp.NCSNppEncoderEnergy`` for what each costs.
+    context_blocks: int = 1
 
     def __post_init__(self) -> None:
         if self.progressive not in ("output_skip", "none"):
@@ -337,6 +346,11 @@ class NCSNppConfig:
             )
         if self.num_blocks < 1:
             raise ValueError("num_blocks must be at least 1")
+        if self.context_blocks < 0:
+            raise ValueError(
+                f"need context_blocks >= 0, got {self.context_blocks}; 0 "
+                f"feeds context into the taps with nothing computed on it"
+            )
 
     def check(self) -> None:
         """Re-run validation on an instance built by other means."""
@@ -639,7 +653,7 @@ class TransformConfig:
     #:     2.5     1.6%        108         97.6%       0.76%
     #:     3.0     0.9%         34         94.0%       0.22%
     #:     4.0     0.5%          4         64.1%       0.02%
-    despeckle_sigma: float | None = 1
+    despeckle_sigma: float | None = None
 
     def __post_init__(self) -> None:
         if self.floor_sigma < 0:
