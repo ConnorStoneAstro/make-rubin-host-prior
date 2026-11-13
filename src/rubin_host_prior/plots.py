@@ -741,9 +741,9 @@ def plot_transform(dataset, n: int = 4, seed: int = 0, out: Path | None = None):
 
     t = t_cfg
     # Where zero flux lands, for the same patches the histogram is drawn from.
-    # Not one line any more: the floor is a multiple of each cutout's own sky
-    # noise, so the sky level is a spread, and that spread is deliberate -- it
-    # is what stops the prior memorising a single sky value.
+    # Per stamp, because the knee is a multiple of each cutout's own sky
+    # noise.  With a sharp knee they all land on the pedestal and the band is
+    # a line, which is the intent: flat sky at one value for the whole set.
     hist_floor = dataset.sky_floor(dataset._sky_noise(hist_idx))
     # The same pedestal `to_log_space` applies, read from the same place, so
     # the marked sky position cannot drift from the data it is drawn over.

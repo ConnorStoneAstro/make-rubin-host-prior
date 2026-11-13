@@ -130,9 +130,10 @@ class Prior:
         this is the training map only up to that shift -- see
         ``data.transform.soften``.
 
-        Nor is ``despeckle_max_pixels``, for the same reason and one more: it
-        is a statement about a *scene*, not about a pixel, so there is nothing
-        to apply to a flux handed over on its own.  The prior was trained
+        Nor are ``sky_smooth_pixels`` and ``despeckle_max_pixels``, for the
+        same reason and one more: each is a statement about a *scene*, not
+        about a pixel, so there is nothing to apply to a flux handed over on
+        its own.  The prior was trained
         without the sky's small bright blobs in it and will not put them in a
         sample; a forward model that compares against unfiltered pixels is
         comparing against something the prior does not claim to generate.

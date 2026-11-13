@@ -431,6 +431,16 @@ class PatchDataset:
         # `floors_enabled = False` is still the original one-parameter map.
         pedestal = (self.config.transform.floor_pedestal
                     if self.config.transform.floors_enabled else 0.0)
+        # Before the map, because it is the map's input that is noisy: the
+        # knee turns a 1.5 sigma pixel into something five in x above the
+        # pedestal, and no cut in x afterwards can tell that from a source.
+        # The threshold is the floor itself, so with floors off (or no noise
+        # to set one from) there is nothing to smooth below.
+        if self.config.transform.floors_enabled and sky_noise is not None:
+            from .smooth import smooth_sky
+
+            pooled = smooth_sky(pooled, floor,
+                                self.config.transform.sky_smooth_pixels)
         x = self.transform.forward(pooled, floor, pedestal)
         return self.despeckled(x, floor, pedestal, sky_noise), floor
 

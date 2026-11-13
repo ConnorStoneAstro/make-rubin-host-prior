@@ -499,20 +499,26 @@ class TransformConfig:
     term sets whether a detected pixel reads its true flux.  Only the first
     two decide what is thrown away.
 
-    **The floor still varies from stamp to stamp**, because the sky noise it
-    multiplies does, so no two cutouts floor at the same flux.  That matters: a
-    single shared floor would put an atom in the data distribution, and the
-    prior would then insist on one exact sky value with curvature limited only
-    by ``sigma_min``, which in posterior sampling is a stiff direction and
-    costs HMC its step size.  ``k`` used to be *also* drawn per stamp, from
-    ``[floor_sigma_lo, floor_sigma_hi]``; that was a second source of the same
-    variation, and it made every number quoted about the floor a midpoint of a
-    range nobody was choosing deliberately.  One value now.
+    **The sky is meant to be exactly flat, and exactly the same in every
+    stamp.**  The prior is to say two things about a scene -- objects as they
+    are in the data, and faint flat sky everywhere else -- and a sky with
+    texture in it is a third thing the model has to spend itself learning and
+    will then put into its samples.  So the knee is sharp, ``sky_smooth_pixels``
+    averages the noise down before the knee sees it, the despeckler takes what
+    still pokes through, and what is left sits on ``floor_pedestal``, which is
+    one constant for the whole set.  This docstring used to argue the
+    opposite: that a shared sky value is an atom in the data distribution,
+    that the prior would then hold sky pixels with a curvature limited only by
+    ``sigma_min``, and that the soft floor's per-pixel spread was what
+    prevented it.  The stiffness is real and is accepted; the spread was the
+    speckle.
 
-    Neither randomisation is what fixes the atom, in any case -- within one
-    scene every sky pixel would still be exactly equal, which is thousands of
-    exact constraints and still a singular distribution.  What fixes it is the
-    *soft* floor, which leaves a real per-pixel spread.
+    The *knee* still varies from stamp to stamp, because the sky noise
+    ``floor_sigma`` multiplies does -- so what counts as sky is decided per
+    cutout, and what sky is mapped to is not.  ``k`` used to be drawn per
+    stamp as well, from ``[floor_sigma_lo, floor_sigma_hi]``, which made every
+    number quoted about the floor a midpoint of a range nobody was choosing
+    deliberately.  One value now.
 
     **One scale, for every band.**  It used to be a dict per band, which bought
     the transform nothing once ``forward`` became ``log(f_s)`` -- see
@@ -645,6 +651,27 @@ class TransformConfig:
     #: being handled.
     fill_no_data: bool = False
 
+    #: Width, in pixels of the training grid, of the Gaussian that pixels
+    #: below the floor are averaged with before the map is applied; pixels at
+    #: or above ``floor_sigma`` are left exactly alone.  **Pixels, not sky
+    #: sigma** -- the only field here that is.  Zero disables it.
+    #:
+    #: It is what flattens the band the pointwise floor cannot: between one
+    #: and two sky sigma the sharp knee hands back graded values up to five
+    #: in ``x`` above the pedestal, 14% of the sky, and the despeckler's
+    #: threshold is above all of it.  Averaged first, that sky sits at a few
+    #: tenths of a sigma and lands on the pedestal.  Wider is flatter and
+    #: leaks bright cores further into their surroundings; correlated noise
+    #: wants more than white noise does, and coadd noise is correlated.
+    #: ``data.smooth`` has the measured series, the leak, and the two
+    #: alternatives that were tried or set aside -- Rubin's ``DETECTED``
+    #: footprints among them.
+    #:
+    #: The threshold is ``floor_sigma`` and nothing else, so with the floor
+    #: off there is nothing to smooth below and this does nothing, exactly as
+    #: the despeckler does.
+    sky_smooth_pixels: float = 1.5
+
     #: Blobs of at most this many connected pixels above ``despeckle_sigma``
     #: are pushed back down to the stamp's own sky level.  Zero disables it.
     #:
@@ -677,6 +704,11 @@ class TransformConfig:
     def __post_init__(self) -> None:
         if self.floor_sigma < 0:
             raise ValueError(f"need floor_sigma >= 0, got {self.floor_sigma}")
+        if self.sky_smooth_pixels < 0:
+            raise ValueError(
+                f"need sky_smooth_pixels >= 0, got {self.sky_smooth_pixels}; "
+                f"it is a Gaussian width in pixels and 0 switches it off"
+            )
         if self.despeckle_max_pixels < 0:
             raise ValueError(
                 f"need despeckle_max_pixels >= 0, got "

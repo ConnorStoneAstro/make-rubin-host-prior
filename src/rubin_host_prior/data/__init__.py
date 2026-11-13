@@ -1,5 +1,6 @@
 from .augment import N_DIHEDRAL, dihedral, random_dihedral
 from .despeckle import despeckle
+from .smooth import smooth_sky
 from .dataset import (
     PatchDataset,
     pool_shards,
@@ -17,6 +18,7 @@ from .transform import (LogFluxTransform, estimate_softening, measure_transform,
 
 __all__ = [
     "ShardPool",
+    "smooth_sky",
     "usable_rows",
     "prefetch",
     "META_DTYPES",

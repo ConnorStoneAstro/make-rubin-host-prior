@@ -1991,6 +1991,86 @@ def test_a_manifest_cut_refuses_to_pass_what_it_cannot_look_up(tmp_path):
 # -- despeckling -----------------------------------------------------------
 
 
+def test_sky_smoothing_leaves_everything_at_the_threshold_and_above_alone():
+    """Bit for bit.  The smooth image is only ever *read* below the threshold,
+    so nothing the prior is supposed to keep can be blurred by it."""
+    from rubin_host_prior.data import smooth_sky
+
+    rng = np.random.default_rng(0)
+    im = rng.normal(0, 1, (3, 32, 32)).astype(np.float32)
+    im[1, 10:14, 10:14] = 50.0
+    out = smooth_sky(im, 2.0, 1.5)
+    assert out.dtype == im.dtype and out is not im
+    kept = im >= 2.0
+    assert kept.any() and (out[kept] == im[kept]).all()
+    # ... and below it the noise is averaged down, away from any source.
+    assert out[0][im[0] < 2.0].std() < 0.5 * im[0][im[0] < 2.0].std()
+
+
+def test_sky_smoothing_is_a_mean_all_the_way_into_the_corners():
+    """A constant below the threshold has to come back as that constant at
+    every pixel.  Zero padding would pull the border towards zero and
+    reflection would feed it a symmetry; the kernel is renormalised by the
+    weight that fell inside the stamp instead."""
+    from rubin_host_prior.data import smooth_sky
+
+    im = np.full((1, 16, 16), -3.0, np.float32)
+    out = smooth_sky(im, 0.0, 2.0)
+    assert np.abs(out + 3.0).max() < 1e-5
+
+
+def test_sky_smoothing_thresholds_each_stamp_at_its_own_level():
+    from rubin_host_prior.data import smooth_sky
+
+    rng = np.random.default_rng(1)
+    one = rng.normal(0, 1, (16, 16)).astype(np.float32)
+    im = np.stack([one, one])
+    thr = np.array([-100.0, 100.0])[:, None, None]
+    out = smooth_sky(im, thr, 1.0)
+    assert (out[0] == one).all()            # nothing is below -100
+    assert (out[1] != one).all()            # everything is below +100
+
+
+def test_sky_smoothing_of_zero_width_is_off_and_a_negative_one_is_refused():
+    from rubin_host_prior.config import TransformConfig
+    from rubin_host_prior.data import smooth_sky
+
+    im = np.random.default_rng(2).normal(0, 1, (2, 8, 8)).astype(np.float32)
+    assert smooth_sky(im, 10.0, 0.0) is im
+    with pytest.raises(ValueError, match="sky_smooth_pixels"):
+        TransformConfig(sky_smooth_pixels=-1.0)
+
+
+def test_the_loader_smooths_the_sky_and_not_the_sources(shard_dir):
+    """End to end, where the floor is applied.  What moves is what was below
+    the floor; the bright end cannot, because those pixels are never read
+    from the smooth image."""
+    import dataclasses
+
+    ss, on = _floored_config(shard_dir)
+    on.transform = dataclasses.replace(on.transform, sky_smooth_pixels=1.5)
+    off = dataclasses.replace(on)
+    off.transform = dataclasses.replace(on.transform, sky_smooth_pixels=0.0)
+
+    def batch(cfg):
+        ds = PatchDataset.from_shards(
+            ss, cfg, LogFluxTransform.from_config(cfg.transform),
+            max_in_memory_gb=16.0)
+        try:
+            return ds.make_batch(np.arange(min(16, len(ds))),
+                                 rng=np.random.default_rng(0),
+                                 augment=False)[:, 0]
+        finally:
+            ds.close()
+
+    rough, flat = batch(off), batch(on)
+    assert (rough != flat).any()
+    assert flat.max() == rough.max()
+    floor = np.log(on.transform.floor_pedestal)
+    lifted = lambda x: np.mean(x > floor + 0.1)
+    assert lifted(flat) < lifted(rough)
+
+
 def test_the_despeckler_takes_small_blobs_and_leaves_big_ones():
     """Size is the only thing it looks at, once a pixel is over the threshold.
 
