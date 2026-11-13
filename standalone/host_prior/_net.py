@@ -355,6 +355,17 @@ class NCSNpp(eqx.Module):
     must be divisible by ``2 ** (len(ch_mult) - 1)``.  ``Config.check_sizes``
     reports a training size that does not, because the failure otherwise
     surfaces as a shape mismatch in the skip concatenation on the way back up.
+
+    **One departure from the reference: the upsampling blocks change width.**
+    A resampling block resamples first and convolves after, so the reference's
+    ``in_ch -> in_ch`` block on the way up runs both of its 3x3 convolutions
+    at the *finer* resolution with the *coarser* level's width.  Here it is
+    ``in_ch -> the finer level's width``, the same convention the down path
+    already has by construction.  No layer is removed; what goes is a width
+    used nowhere else at that resolution, and the concatenation that follows
+    is narrower by the same amount.  Where two neighbouring levels share a
+    width the block is the reference's exactly, which is the only place
+    ``scripts/crosscheck_ncsnpp.py`` can still compare the two.
     """
 
     time_fourier: FourierFeatures
@@ -463,7 +474,16 @@ class NCSNpp(eqx.Module):
                 norm = _group_norm(ch)
                 conv = _conv(ch, config.in_channels, 3, config.init_scale,
                              key=next_key())
-            resample = block(ch, None, up=True) if level != 0 else None
+            resample = None
+            if level != 0:
+                # Narrows to the finer level's width as it upsamples.  The
+                # reference keeps the coarse width here, and since the block
+                # resamples before its first convolution that ran both 3x3s at
+                # the fine resolution and the coarse width -- 64 channels on
+                # the 128 px grid, where every other convolution is 32.  One
+                # block was 16% of the network; see the class docstring.
+                resample = block(ch, nf * mult[level - 1], up=True)
+                ch = nf * mult[level - 1]
             up.append(_UpLevel(tuple(blocks), norm, conv, resample))
         assert not skip_channels, skip_channels
         self.up_levels = tuple(up)
@@ -728,10 +748,11 @@ class NCSNppEncoderEnergy(EnergyModel):
     upsampling path.  Measured against ``NCSNppEnergy`` at ``nf=32,
     ch_mult=(1,2,4,4)`` on 128 px: 2.79M parameters against 7.20M, and a score
     for 9.96 GFLOP against 42.34, a **4.25x** saving.  The ratio belongs to the
-    architecture rather than to that shape: at the current default
-    ``(1,2,2,4,4)`` it is 7.88 against 32.48, **4.12x**.  Those are the bare
-    pyramid; the context stream below gives some of it back, by an amount
-    ``context_blocks`` sets.  The decoder is 77% of
+    architecture rather than to that shape: at ``(1,2,2,4,4)`` it is 7.88
+    against 32.48, **4.12x**.  Those are the bare pyramid against the U-Net
+    as the reference builds it; the context stream below gives some of it
+    back, by an amount ``context_blocks`` sets, and the U-Net's upsampling
+    blocks have since been narrowed (see ``NCSNpp``).  The decoder is 77% of
     the U-Net rather than half, because its levels run ``num_blocks + 1``
     blocks against ``num_blocks`` and each takes a concatenated skip, so twice
     the input channels.
@@ -762,8 +783,9 @@ class NCSNppEncoderEnergy(EnergyModel):
     bottleneck a stream runs back up -- a 1x1 on the coarser grid, an
     upsample, an add onto that level's trunk features -- and each tap reads
     the sum instead of the trunk.  ``context_blocks`` is how many residual
-    blocks run on the sum first.  Per score at the default shape on 128 px,
-    off XLA's cost analysis::
+    blocks run on the sum first.  Per score at ``ch_mult = (1, 2, 2, 4, 4)``
+    on 128 px, off XLA's cost analysis, the U-Net row with the reference's
+    upsampling blocks (27.29 and 81.47 with ``NCSNpp``'s narrowed ones)::
 
         context_blocks      params   score GFLOP   step GFLOP
         (no stream)      3,093,258          7.88        23.02

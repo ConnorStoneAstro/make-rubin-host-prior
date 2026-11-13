@@ -10,7 +10,15 @@ self-consistent, so it is worth keeping runnable::
     python scripts/crosscheck_ncsnpp.py --reference score_models/src
 
 Last run: seven configurations, three noise levels each, worst relative
-difference **1.6e-6** -- float32 round-off.
+difference **1.2e-6** -- float32 round-off.
+
+**Every case is flat-width, because of the one deliberate departure from the
+reference**: our upsampling blocks narrow to the finer level's width (see
+``nn.ncsnpp.NCSNpp``) and the reference's keep the coarser one.  The two are
+the same network only where neighbouring levels share a width, so the cases
+are ``(2, 2, 2)`` where they were ``(1, 2, 2)``.  What that gives up is the
+check on a width step, on the way down as well as up; everything else is
+still compared.
 
 The mapping below is the reference's module *order*, since it keeps everything
 in one flat ``nn.ModuleList`` and walks it with a counter.  If this script stops
@@ -40,7 +48,7 @@ def _stub_optional_imports() -> None:
     sys.modules.setdefault("peft", peft)
 
 
-def compare(TorchNCSNpp, *, nf=16, ch_mult=(1, 2, 2), num_blocks=2,
+def compare(TorchNCSNpp, *, nf=16, ch_mult=(2, 2, 2), num_blocks=2,
             attention=True, fir=True, progressive="output_skip",
             progressive_input="input_skip", combine_method="cat", size=32):
     import equinox as eqx
@@ -182,7 +190,7 @@ def compare(TorchNCSNpp, *, nf=16, ch_mult=(1, 2, 2), num_blocks=2,
 CASES = [
     ("defaults", {}),
     ("no attention", dict(attention=False)),
-    ("4 levels, 64 px grid", dict(ch_mult=(1, 2, 2, 2), size=64)),
+    ("4 levels, 64 px grid", dict(ch_mult=(2, 2, 2, 2), size=64)),
     ("naive resampling", dict(fir=False)),
     ("plain U-Net (no pyramid)", dict(progressive="none",
                                       progressive_input="none")),

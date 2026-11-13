@@ -201,11 +201,11 @@ class NCSNppConfig:
     inner loop, where one ``score`` call is a gradient of the network and
     therefore 2.03x its forward pass.
 
-    ``nf = 32`` with ``ch_mult = (1, 2, 2, 4, 4)`` rather than the reference's
+    ``nf = 32`` with ``ch_mult = (1, 1, 2, 4, 4)`` rather than the reference's
     ``128`` and ``(2, 2, 2, 2)`` (four levels of 256 channels, ~100M
     parameters), and rather than this file's previous ``64`` / ``(1, 2, 2, 2)``
     (10.5M parameters, 112.9 GFLOP per score on a 128 px grid).  It is
-    **3.5x cheaper at 8.0M parameters**.
+    **5.8x cheaper at 7.1M parameters**.
 
     The shape follows from where the work is.  On a 128 px grid the FLOPs sit
     almost entirely at the two finest levels -- 50.5% at 128 px and 35.4% at
@@ -232,7 +232,24 @@ class NCSNppConfig:
     it, so the level pays for itself before it costs anything.  Narrowing the
     32 px level from 128 channels to 64 is the other 20%.  Together the current
     shape is 23% cheaper per step than the four-level one and 11% larger --
-    both directions at once, which is why it is the default.
+    both directions at once, which is why it was the default.
+
+    **The 64 px level is 32 channels too, since.**  It was the next largest
+    share after the 128 px level and for the same reason, and the U-Net
+    energy is where it was measured, per score and per training step on a
+    128 px grid::
+
+        ch_mult           upsampling blocks      params   score   step
+        (1, 2, 2, 4, 4)   reference's width   8,003,685   32.09   95.84
+        (1, 2, 2, 4, 4)   narrowed            7,698,789   27.29   81.47
+        (1, 1, 2, 4, 4)   narrowed            7,108,517   19.30   57.60
+
+    40% off the step for 11% of the parameters, taken together; the
+    upsampling blocks are ``nn.ncsnpp.NCSNpp``'s own change and the last row
+    is this default.  The encoder at this shape is 3,673,674 parameters and
+    8.07 / 24.02.  **Costs only.**  The top row is the one with a training
+    record -- it converges in about 20,000 steps -- and neither narrowed row
+    had been trained when this was written.
 
     What that trades away is fine-scale *capacity* -- the finest level is 32
     channels, not 64 -- which is the half of the model doing texture.  That was
@@ -263,7 +280,7 @@ class NCSNppConfig:
     #: levels, which is the constraint ``_ncsnpp_size_warnings`` enforces.
     #: Rising, because 86% of the arithmetic is at the two finest levels and
     #: almost none of it at the coarse ones.
-    ch_mult: tuple[int, ...] = (1, 2, 2, 4, 4)
+    ch_mult: tuple[int, ...] = (1, 1, 2, 4, 4)
     num_blocks: int = 2  # residual blocks per resolution on the way down
     activation: str = "silu"
     #: ``1e-2``, so every block's last convolution and every pyramid output

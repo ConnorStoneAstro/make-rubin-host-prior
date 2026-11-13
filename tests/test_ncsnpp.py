@@ -197,6 +197,25 @@ def test_progressive_can_be_switched_off(tiny_config):
     assert model(x, jnp.float32(1.0)).shape == x.shape
 
 
+def test_the_upsampling_blocks_narrow_to_the_level_they_feed(tiny_model,
+                                                            tiny_config):
+    """A resampling block resamples before it convolves, so on the way up
+    both of its 3x3s run on the *finer* grid.  Left at the coarser level's
+    width, as the reference has it, the block into full resolution was 16% of
+    the whole network at a width nothing else there uses."""
+    cfg = tiny_config.ncsnpp
+    widths = [cfg.nf * m for m in cfg.ch_mult]
+    assert len(set(widths)) > 1, "needs a width step to mean anything"
+    # ``up_levels`` runs coarsest first.
+    for level, up in zip(reversed(range(len(widths))), tiny_model.up_levels):
+        if level == 0:
+            assert up.up is None
+            continue
+        fine, coarse = widths[level - 1], widths[level]
+        assert up.up.conv0.weight.shape[:2] == (fine, coarse)
+        assert up.up.conv1.weight.shape[:2] == (fine, fine)
+
+
 def test_a_rejected_progressive_mode_says_which_ones_exist():
     with pytest.raises(ValueError, match="not ported"):
         NCSNppConfig(progressive="residual")
