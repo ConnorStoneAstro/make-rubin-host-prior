@@ -158,9 +158,9 @@ def test_the_transform_figure_shows_exactly_what_the_loader_produces(dataset,
 
     This figure's whole job is to say whether the transform is set up right, so
     a figure drawing a *different* transform from the one in use is worse than
-    no figure.  It did: it called ``transform.forward(pooled)`` with no floor
-    and went on labelling ``log(s*softplus(f/s))`` for a dataset that had been
-    floored for a week.  Comparing the rendered pixels against a real batch is
+    no figure.  It did: it called ``transform.forward(pooled)`` on its own
+    and went on labelling ``log(s*softplus(f/s))`` for a dataset the loader had
+    been flooring for a week.  Comparing the rendered pixels against a real batch is
     what makes that impossible to repeat -- anything the loader does to the
     representation has to show up here too, or this fails.
     """
@@ -184,15 +184,13 @@ def test_the_transform_figure_shows_exactly_what_the_loader_produces(dataset,
     np.testing.assert_allclose(drawn, want, rtol=1e-6, atol=1e-6)
 
 
-def test_transform_figure_marks_the_floored_sky_position(dataset, tmp_path):
-    """The red marks have to describe the floored sky, not the unfloored one.
+def test_transform_figure_marks_where_zero_flux_lands(dataset, tmp_path):
+    """The red line has to sit where the loader actually puts zero flux.
 
-    With a per-stamp floor the sky level is a *spread*, so there is a band over
-    the floors in the sample as well as a line at the median -- and that spread
-    is the point, since it is what stops the prior memorising one sky value.
+    Checked through the loader's own path rather than the figure's formula --
+    otherwise this would mirror whatever ``plot_transform`` does and could not
+    catch the two drifting apart, which is what it is here to catch.
     """
-    from rubin_host_prior.data import expected_sky_scatter
-
     fig, path = plots.plot_transform(dataset, n=2, out=tmp_path)
     try:
         assert path.exists()
@@ -201,38 +199,16 @@ def test_transform_figure_marks_the_floored_sky_position(dataset, tmp_path):
         marked = [ln.get_xdata()[0] for ln in hist_ax.lines]
         assert len(marked) == 1
 
-        t = dataset.config.transform
-        rng = np.random.default_rng(0)
-        hist_idx = np.sort(rng.choice(len(dataset),
-                                      size=min(256, len(dataset)), replace=False))
         # plot_transform draws its row sample first, so advance the stream the
         # same way before asking for the histogram's indices.
         rng = np.random.default_rng(0)
         rng.choice(len(dataset), size=min(2, len(dataset)), replace=False)
         hist_idx = np.sort(rng.choice(len(dataset),
                                       size=min(256, len(dataset)), replace=False))
-        # Where zero flux lands for those stamps, through the loader's own
-        # path rather than the figure's formula -- otherwise this would mirror
-        # whatever `plot_transform` does and could not catch it dropping the
-        # floor or the pedestal, which is what it is here to catch.
-        zeros = np.zeros((len(hist_idx), 2, 2), dtype=np.float32)
-        logged, _ = dataset.to_log_space(zeros, dataset._sky_noise(hist_idx))
+        zeros = np.zeros((len(hist_idx), 4, 4), dtype=np.float32)
+        logged = dataset.to_log_space(zeros, dataset._sky_noise(hist_idx))
         levels = np.asarray(logged)[:, 0, 0]
-
-        assert marked[0] == pytest.approx(float(np.median(levels)))
-        # Whatever the floor is set to, the figure must describe *that* floor
-        # and not the unfloored transform it used to draw.  Nothing here pins
-        # how large the difference is, or which way it goes -- the floor, the
-        # pedestal and the softening are knobs to experiment with, and with a
-        # pedestal below the floor the sky moves *down* rather than up.  An
-        # assertion on the magnitude or the sign is one that fights the
-        # experiment; that they differ at all is the claim.
-        if t.floors_enabled:
-            assert marked[0] != pytest.approx(dataset.transform.sky_level)
-            assert t.predicted_sky_scatter != pytest.approx(
-                expected_sky_scatter(t.softening_sigma))
-        else:
-            assert marked[0] == pytest.approx(dataset.transform.sky_level)
+        assert marked[0] == pytest.approx(float(np.median(levels)), abs=1e-5)
     finally:
         plt.close(fig)
 

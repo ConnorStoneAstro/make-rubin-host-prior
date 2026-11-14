@@ -476,6 +476,50 @@ def test_prepare_config_keeps_a_value_you_set_yourself(tmp_path, shard_dir,
     assert "sde.sigma_max = 7.5" in capsys.readouterr().out
 
 
+def test_prepare_config_refuses_a_softening_that_contradicts_its_sigma(
+        tmp_path, shard_dir, monkeypatch):
+    """``softening`` in nJy is what the loader reads; ``softening_sigma`` is
+    only how the script arrives at it.  Edit the second in a config that still
+    carries the first and nothing changes -- the old data, and a config that
+    describes different data.  That happened, so the pair is checked.
+    """
+    import importlib.util
+    import sys
+
+    root = Path(__file__).resolve().parent.parent
+    spec = importlib.util.spec_from_file_location(
+        "prepare_config", root / "scripts" / "prepare_config.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    def run(base, out):
+        base.save(tmp_path / "base.json")
+        monkeypatch.setattr(sys, "argv", [
+            "prepare_config.py", "--shards", str(shard_dir), "--out", str(out),
+            "--base-config", str(tmp_path / "base.json"), "--n-stats", "32",
+        ])
+        module.main()
+        return Config.load(out)
+
+    base = Config(energy=TINY_ENERGY)
+    base.patch = PatchConfig(native_size=112, out_size=32, pool_factor=3)
+    measured = run(base, tmp_path / "first.json")
+
+    # The same config with only the sigma changed: stale, and refused.
+    stale = Config.load(tmp_path / "first.json")
+    stale.transform.softening_sigma = 8.0 * measured.transform.softening_sigma
+    with pytest.raises(SystemExit, match="softening_sigma"):
+        run(stale, tmp_path / "stale.json")
+
+    # Cleared, it is re-measured at the new sigma; left consistent, it is kept.
+    stale.transform.softening = None
+    again = run(stale, tmp_path / "again.json")
+    assert again.transform.softening == pytest.approx(
+        8.0 * measured.transform.softening, rel=1e-6)
+    kept = run(Config.load(tmp_path / "first.json"), tmp_path / "kept.json")
+    assert kept.transform.softening == measured.transform.softening
+
+
 def test_band_counts_reads_the_global_index_not_the_shard_subset(tmp_path):
     """Regression: a run extracting a subset of bands had its counts shifted.
 
@@ -1336,10 +1380,10 @@ def test_sky_scatter_matches_the_prediction(shard_dir):
                                           out_size=32,
                                           pool_factor=3))
         config.transform.softening_sigma = ss_val
-        # Unfloored: `expected_sky_scatter` is 0.721 / softening_sigma, which is
-        # the c = 0 relation.  With a floor the sky scatter is set by the floor
-        # instead -- that is the whole point of having one -- so this check is
-        # about the softening and has to switch the floor off to see it.
+        # `expected_sky_scatter` is raw sky through the unfloored map, so the
+        # blend and the floor both have to be off for the two to be the same
+        # number.
+        config.transform.sky_smooth_pixels = 0.0
         config.transform.floor_sigma = 0.0
         pooled, pooled_bands = pool_shards(ss, config)
         config.transform.softening = estimate_softening(pooled, ss_val)
@@ -1425,7 +1469,7 @@ def test_softplus_comes_from_the_library_and_agrees_across_backends():
     assert log_softplus(u)[0] == pytest.approx(-800.0)
 
 
-# -- the per-stamp sky floor -----------------------------------------------
+# -- the sky floor -----------------------------------------------------------
 
 
 def test_the_floor_is_a_strict_generalisation_of_the_softening():
@@ -1485,132 +1529,52 @@ def test_a_per_stamp_floor_broadcasts_over_a_batch():
     np.testing.assert_allclose(t.inverse_exact(x, floor=c), f, atol=1e-9)
 
 
-def test_the_restoration_term_makes_the_bright_end_exact():
-    """What ``restore_bright_end`` is for: the pedestal leaves the plain map a
-    flat ``floor - pedestal`` low at every flux, however bright, and this hands
-    it back above the knee."""
-    from rubin_host_prior.data.transform import LogFluxTransform
+def test_the_floor_is_what_the_map_bends_over_to_and_nothing_else():
+    """``x = log(c + s * softplus((f - c) / s))``, written out independently.
 
-    s, c, p = 1.572, 13.1, 0.1
-    plain = LogFluxTransform(softening=s)
-    restored = LogFluxTransform(softening=s, restore_bright_end=True)
-    bright = np.array([30.0 * c, 300.0 * c, 3e5])
-
-    # the plain map is low by exactly c - p, and stays that way forever
-    np.testing.assert_allclose(plain.soften(bright, c, p), bright - (c - p),
-                               rtol=1e-12)
-    # the restored one is the identity, to double precision
-    np.testing.assert_allclose(restored.soften(bright, c, p), bright, rtol=1e-12)
-    # and both still bend over to the same pedestal
-    for t in (plain, restored):
-        assert float(t.soften(np.array([-50.0 * c]), c, p)[0]) == pytest.approx(p)
-
-
-def test_the_restoration_term_leaves_the_floor_where_it_was():
-    """It must be dead at zero flux or it would lift the sky off the pedestal,
-    which is the whole constraint that forces the gain at the knee."""
-    from rubin_host_prior.data.transform import LogFluxTransform
-
-    s, c, p = 13.1 * 0.12, 13.1, 0.1
-    restored = LogFluxTransform(softening=s, restore_bright_end=True)
-    sky = float(restored.soften(np.array([0.0]), c, p)[0])
-    assert sky == pytest.approx(p, rel=0.05), sky
-
-    # The sky then lands within a tenth of a nat of the pedestal whatever that
-    # stamp's noise is -- `softening` is one number for the whole set and only
-    # the floor is per stamp, so c/s is what varies, and the level approaches
-    # log(p) from above as it grows.  That one-sidedness is the point: the
-    # stamps cannot straddle the pedestal, only sit above it.
-    levels = [float(restored.sky_level_at(np.array([1.0 * sig]), p)[0])
-              for sig in (11.0, 13.1, 16.0)]
-    assert max(levels) - min(levels) < 0.12, levels
-    assert levels == sorted(levels, reverse=True), levels
-    assert min(levels) > np.log(p), levels
-
-
-def test_the_restored_map_is_monotone_and_invertible():
-    """No closed-form inverse, so ``inverse_exact`` goes to Newton. It is still
-    a true inverse: both terms of the derivative are positive, so the root is
-    unique."""
-    from rubin_host_prior.data.transform import LogFluxTransform
-
-    s, c, p = 1.572, 13.1, 0.1
-    t = LogFluxTransform(softening=s, restore_bright_end=True)
-
-    f = np.linspace(-5.0 * s, 500.0, 200001)
-    assert np.all(np.diff(t.soften(f, c, p)) >= 0.0)
-
-    # round trip wherever the floor has not thrown the value away
-    f = np.concatenate([np.linspace(-5.0, 300.0, 5001), np.logspace(2.5, 9, 300)])
-    back = t.inverse_exact(t.forward(f, floor=c, pedestal=p), floor=c, pedestal=p)
-    np.testing.assert_allclose(back, f, rtol=1e-9, atol=1e-5)
-
-    # A per-stamp floor broadcasts through the Newton path, and it is no less
-    # accurate than the closed form on the same inputs.  Held as a comparison
-    # rather than an absolute tolerance because both lose the same precision
-    # the same way: `exp(x) - pedestal` cancels for a pixel tens of sigma
-    # below the floor, where the floor has thrown the value away in any case.
-    plain = LogFluxTransform(softening=s)
-    g = np.random.default_rng(0).normal(0.0, 13.1, (4, 8, 8))
-    cs = np.array([9.0, 11.0, 13.0, 17.0])[:, None, None]
-    worst = []
-    for tr in (t, plain):
-        back = tr.inverse_exact(tr.forward(g, floor=cs, pedestal=p),
-                                floor=cs, pedestal=p)
-        assert back.shape == g.shape
-        worst.append(float(np.abs(back - g).max()))
-    assert worst[0] <= 2.0 * worst[1], worst
-
-
-def test_the_restoration_gain_cannot_be_tuned_below_its_bound():
-    """The claim the ``soften`` docstring rests on: pinning the floor to the
-    pedestal forces a peak gain of at least ~2.3, whatever the two scales are.
-
-    If this ever fails, the docstring's "and the cost cannot be tuned away" is
-    wrong and the field comment that repeats it is too.
+    There was a separate pedestal below the knee for a while, and a sigmoid
+    term to hand the difference back; this is what says both are gone rather
+    than switched off.  Zero flux reads a little over the floor, bright flux
+    reads itself, and the slope never exceeds one -- which is what having no
+    step between sky and object means.
     """
-    from rubin_host_prior.data.transform import LogFluxTransform
+    from rubin_host_prior.data.transform import LogFluxTransform, soften
 
-    sigma, c, p = 13.1, 13.1, 0.1
-    f = np.linspace(-3.0 * sigma, 20.0 * sigma, 200001)
-    for ss in (0.08, 0.12, 0.2, 0.3, 0.5, 1.0, 2.0):
-        t = LogFluxTransform(softening=ss * sigma, restore_bright_end=True)
-        g = t.soften(f, c, p)
-        gain = float(np.diff(g).max() / (f[1] - f[0]))
-        pinned = float(t.soften(np.array([0.0]), c, p)[0]) < 1.1 * p
-        if pinned:
-            assert gain > 2.0, (ss, gain)
-        else:
-            # the escape is real but it costs the floor, which is the trade
-            assert gain < 2.0, (ss, gain)
+    s, c = 13.1, 13.1
+    t = LogFluxTransform(softening=s)
+    f = np.linspace(-200.0, 2000.0, 20001)
+    want = c + s * np.logaddexp(0.0, (f - c) / s)
+    np.testing.assert_allclose(soften(f, s, np, c), want, rtol=1e-13)
+    np.testing.assert_allclose(t.forward(f, c), np.log(want), rtol=1e-13)
+    assert float(np.exp(t.sky_level_at(c))) == pytest.approx(
+        c + s * np.log1p(np.exp(-1.0)))
+    gain = np.diff(soften(f, s, np, c)) / np.diff(f)
+    assert gain.min() > 0 and gain.max() <= 1.0 + 1e-9
+    with pytest.raises(TypeError):
+        t.forward(f, c, 0.1)                    # no pedestal argument to pass
 
 
-def test_expected_sky_scatter_reports_half_the_16_84_range():
-    """It is compared against ``stats()["sky_scatter"]``, which measures half
-    the 16-84 range, and ``prepare_config`` warns on a factor of two between
-    them.  It used to return a standard deviation: the same number for a
-    near-Gaussian x, and wildly different once the floor bites."""
-    from rubin_host_prior.data.transform import expected_sky_scatter, soften
+def test_expected_sky_scatter_is_the_slope_at_zero_flux():
+    """``0.721 / softening_sigma``, checked against the map itself: the 16-84
+    half-range of ``x`` over a unit Gaussian of sky."""
+    from rubin_host_prior.data import expected_sky_scatter
+    from rubin_host_prior.data.transform import SKY_SLOPE, soften
 
     u = np.linspace(-8.0, 8.0, 400001)
     w = np.exp(-0.5 * u ** 2)
     w /= w.sum()
-    for ss, k, ped in ((2.0, 1.0, 0.0076), (0.25, 4.0, 0.0076),
-                       (1 / 3, 1.5, None)):
-        x = np.log(soften(u, ss, np, k, ped))
-        lo, hi = np.interp([0.16, 0.84], np.cumsum(w), x)
-        assert expected_sky_scatter(ss, k, ped) == pytest.approx(
-            0.5 * (hi - lo), abs=2e-3), (ss, k, ped)
-
-    # and the two statistics really do come apart once the sky is pinned
-    x = np.log(soften(u, 0.25, np, 4.0, 0.0076))
-    mean = float((w * x).sum())
-    std = float(np.sqrt((w * (x - mean) ** 2).sum()))
-    assert std > 0.04 and expected_sky_scatter(0.25, 4.0, 0.0076) < 0.01
+    for ss in (1.0, 2.0, 5.0):
+        assert expected_sky_scatter(ss) == pytest.approx(SKY_SLOPE / ss)
+        lo, hi = np.interp([0.16, 0.84], np.cumsum(w), np.log(soften(u, ss)))
+        # a floor only ever tightens it
+        lo_c, hi_c = np.interp([0.16, 0.84], np.cumsum(w),
+                               np.log(soften(u, ss, np, 1.0)))
+        assert hi_c - lo_c < hi - lo
+        assert expected_sky_scatter(ss) == pytest.approx(0.5 * (hi - lo), rel=0.05)
 
 
-def _floored_config(shard_dir):
-    """A config with everything the floor needs measured, like prepare_config."""
+def _measured_config(shard_dir):
+    """A config with the pooled sky noise measured, like prepare_config."""
     ss = ShardSet.from_dir(shard_dir)
     config = Config(energy=TINY_ENERGY,
                     patch=PatchConfig(native_size=ss.native_size, out_size=24,
@@ -1622,109 +1586,11 @@ def _floored_config(shard_dir):
     return ss, config
 
 
-def test_the_loader_floors_each_stamp_at_its_own_level(shard_dir):
-    """End to end: switching the floor on moves the sky by what
-    ``predicted_sky_scatter`` says it should, and every cutout floors somewhere
-    slightly different.
-
-    It used to assert that the floor *flattens* -- ``scatter_on < 0.5 *
-    scatter_off`` -- and that was true while the map bent over to the floor
-    itself, because the flattening came from the ``+c`` inside ``log(c + ...)``
-    rather than from the knee.  With ``floor_pedestal`` well below the floor
-    there is no ``+c`` to compress with, and the sky scatters slightly *wider*
-    than unfloored.  So the direction is now a config choice and this holds the
-    loader to the prediction instead of to a direction, which is also what
-    ``prepare_config`` warns on.
-    """
-    import dataclasses
-
-    ss, config = _floored_config(shard_dir)
-    transform = LogFluxTransform.from_config(config.transform)
-    n = min(24, len(ss))
-
-    def measure(cfg):
-        ds = PatchDataset.from_shards(ss, cfg, transform, max_in_memory_gb=16.0)
-        try:
-            b = ds.make_batch(np.arange(n), rng=np.random.default_rng(0),
-                              augment=False)
-        finally:
-            ds.close()
-        # Half the 16-84 range, which is what `stats()["sky_scatter"]`
-        # measures and therefore what `predicted_sky_scatter` predicts.  It
-        # was a per-patch standard deviation of the faint 40%, and that was
-        # fine only while x stayed near-Gaussian: once the floor pins the sky
-        # the distribution is a spike plus a one-sided tail and the two
-        # statistics stop tracking each other, so the ratio below stopped
-        # cancelling the difference between them.
-        p16, p84 = np.percentile(b, [16, 84])
-        return float(0.5 * (p84 - p16)), b.reshape(len(b), -1).min(axis=1)
-
-    off = dataclasses.replace(config)
-    off.transform = dataclasses.replace(config.transform, floor_sigma=0.0)
-    scatter_off, _ = measure(off)
-    scatter_on, mins = measure(config)
-
-    t = config.transform
-    pooled_sigma = t.softening / t.softening_sigma
-    c, s, pedestal = t.floor_sigma * pooled_sigma, t.softening, t.floor_pedestal
-    # Reaching the pedestal to within 10% needs `c / s > log(10 (c - p) / p)`;
-    # above that the sky is a spike on the pedestal rather than a peak with a
-    # width.  Read off whatever the config is set to -- nothing here pins it.
-    pinned = c / s > math.log(10.0 * (c - pedestal) / pedestal)
-
-    if not pinned:
-        # The measured ratio against the predicted one.  A ratio rather than
-        # the value because `expected_sky_scatter` integrates over one
-        # Gaussian at one noise level while the loader floors each stamp at a
-        # multiple of its own, against a single shared softening scale; the
-        # ratio cancels most of that.
-        want = (t.predicted_sky_scatter / off.transform.predicted_sky_scatter)
-        assert scatter_on / scatter_off == pytest.approx(want, rel=0.25), (
-            scatter_off, scatter_on, want)
-    else:
-        # Pinned: `expected_sky_scatter` predicts the width of the spike while
-        # this measures the 16-84 range of every pixel, which now spans the
-        # gap from the pedestal up to the sources.  Not comparable, the same
-        # split `prepare_config` makes.  What is still checkable is that the
-        # floor bites at all, which unfloored it does not.
-        assert scatter_on < scatter_off, (scatter_on, scatter_off)
-
-    # Bounded below by the pedestal, which is the point of having one.  The
-    # slack is float32, which is what the batch is: with the floor pinned
-    # every stamp sits *exactly* on the pedestal rather than somewhere above
-    # it, so the bound is tight and `log(0.1)` does not round the same way in
-    # single precision.
-    assert float(np.exp(mins.min())) >= pedestal * (1.0 - 1e-5), mins.min()
-
-    # Each cutout floors at a multiple of *its own* sky noise, so one fixed
-    # flux reads differently in a noisy stamp than in a quiet one, ordered by
-    # that stamp's noise.  Asserted on the map rather than on the spread of
-    # `mins`, which that used to do: once the floor is pinned every stamp
-    # bottoms out on the one shared pedestal and that spread goes to zero.
-    # The per-stamp floor is still there, it just stops showing at the bottom
-    # of the frame -- and the atom it was introduced to prevent is then back,
-    # by choice, which is a config question and not this test's business.
-    ds = PatchDataset.from_shards(ss, config, transform, max_in_memory_gb=16.0)
-    try:
-        noise = ds._sky_noise(np.arange(n))
-        floors = np.asarray(ds.sky_floor(noise)).reshape(-1)
-    finally:
-        ds.close()
-    uniq = np.unique(floors)
-    assert uniq.size > 1, floors
-    # More noise -> higher floor -> the probe sits further below the knee ->
-    # lower x.  Over the distinct floors, because several cutouts can share a
-    # sky noise and then share a floor; that is a tie, not a failure.
-    x_probe = np.asarray(transform.forward(np.full(uniq.size, c), floor=uniq,
-                                           pedestal=pedestal))
-    assert np.all(np.diff(x_probe) < 0), (uniq, x_probe)
-
-
-def test_the_floor_refuses_to_guess_the_pooled_noise_ratio(shard_dir):
+def test_the_smoothing_refuses_to_guess_the_pooled_noise_ratio(shard_dir):
     """It is measured, not 1: coadd noise is correlated, so pooling reduces it
-    by less than ``pool_factor`` and an assumed 1 would put every floor too
-    low.  Better to refuse than to silently floor in the wrong place."""
-    ss, config = _floored_config(shard_dir)
+    by less than ``pool_factor`` and an assumed 1 would put every threshold
+    too low.  Better to refuse than to silently cut in the wrong place."""
+    ss, config = _measured_config(shard_dir)
     config.transform.pooled_noise_ratio = None
     ds = PatchDataset.from_shards(
         ss, config, LogFluxTransform.from_config(config.transform),
@@ -1734,49 +1600,6 @@ def test_the_floor_refuses_to_guess_the_pooled_noise_ratio(shard_dir):
             ds.make_batch(np.arange(4), rng=np.random.default_rng(0))
     finally:
         ds.close()
-
-
-def test_expected_sky_scatter_tracks_the_floor(self_check=None):
-    """The numbers the ``TransformConfig`` docstring quotes, checked against the
-    function rather than against the config.
-
-    The config's values are where experiments happen, so nothing here pins
-    them -- only that ``expected_sky_scatter`` still says what the comment next
-    to those values says it says, which is what makes the comment usable for
-    choosing one.
-    """
-    from rubin_host_prior.data import expected_sky_scatter
-
-    quoted = {0.25: 0.69, 0.5: 0.37, 0.75: 0.20, 1.0: 0.102, 1.5: 0.021}
-    for k, want in quoted.items():
-        assert expected_sky_scatter(1 / 3, k) == pytest.approx(want, abs=0.01), k
-    # monotone: with the map bending over to the floor itself, a higher floor
-    # always flattens harder
-    got = [expected_sky_scatter(1 / 3, k) for k in sorted(quoted)]
-    assert got == sorted(got, reverse=True)
-
-    # And the other series the same comment quotes: with the pedestal well
-    # below the floor the direction reverses, because the flattening came from
-    # the `+c` and the pedestal is what stands in its place.  This is the one
-    # that applies to the shipped default, so it is the one worth holding.
-    low = {0.0: 0.361, 0.5: 0.375, 1.0: 0.392, 3.0: 0.441}
-    for k, want in low.items():
-        assert expected_sky_scatter(2.0, k, 0.0076) == pytest.approx(
-            want, abs=0.01), k
-    rising = [expected_sky_scatter(2.0, k, 0.0076) for k in sorted(low)]
-    assert rising == sorted(rising)
-
-
-def test_expected_sky_scatter_is_unchanged_without_a_floor():
-    """The closed form is what every pre-floor caller and test means."""
-    from rubin_host_prior.data import expected_sky_scatter
-    from rubin_host_prior.data.transform import SKY_SLOPE
-
-    for ss in (0.25, 1.0, 2.0, 5.0):
-        assert expected_sky_scatter(ss) == pytest.approx(SKY_SLOPE / ss)
-        assert expected_sky_scatter(ss, 0.0) == pytest.approx(SKY_SLOPE / ss)
-    # and a floor always tightens it
-    assert expected_sky_scatter(1 / 3, 1.5) < expected_sky_scatter(1 / 3)
 
 
 # -- the no-data cut -------------------------------------------------------
@@ -1991,84 +1814,167 @@ def test_a_manifest_cut_refuses_to_pass_what_it_cannot_look_up(tmp_path):
 # -- despeckling -----------------------------------------------------------
 
 
-def test_sky_smoothing_leaves_everything_at_the_threshold_and_above_alone():
-    """Bit for bit.  The smooth image is only ever *read* below the threshold,
-    so nothing the prior is supposed to keep can be blurred by it."""
-    from rubin_host_prior.data import smooth_sky
+def test_the_blend_is_the_smooth_image_in_the_sky_and_the_pixels_on_a_source():
+    """``lam * flux + (1 - lam) * smooth``, with the weight off the *smoothed*
+    flux: zero where the neighbourhood is empty, one where it holds something.
+    """
+    from rubin_host_prior.data import blend_sky
 
     rng = np.random.default_rng(0)
     im = rng.normal(0, 1, (3, 32, 32)).astype(np.float32)
-    im[1, 10:14, 10:14] = 50.0
-    out = smooth_sky(im, 2.0, 1.5)
-    assert out.dtype == im.dtype and out is not im
-    kept = im >= 2.0
-    assert kept.any() and (out[kept] == im[kept]).all()
-    # ... and below it the noise is averaged down, away from any source.
-    assert out[0][im[0] < 2.0].std() < 0.5 * im[0][im[0] < 2.0].std()
+    im[1, 8:20, 8:20] += 50.0
+    out, lam = blend_sky(im, 1.0, 1.5, 1.5, 0.3)
+    assert out.dtype == im.dtype and lam.dtype == im.dtype and out is not im
+    assert lam.min() >= 0 and lam.max() <= 1
+
+    # Well inside the source the pixels are themselves, noise and all ...
+    core = (slice(1, 2), slice(11, 17), slice(11, 17))
+    assert lam[core].min() > 0.9999
+    np.testing.assert_allclose(out[core], im[core], rtol=1e-4)
+    # ... and in empty sky they are the local mean, which is much quieter.
+    assert lam[0].max() < 0.2 and np.median(lam[0]) < 0.02
+    assert out[0].std() < 0.5 * im[0].std()
 
 
-def test_sky_smoothing_is_a_mean_all_the_way_into_the_corners():
-    """A constant below the threshold has to come back as that constant at
-    every pixel.  Zero padding would pull the border towards zero and
-    reflection would feed it a symmetry; the kernel is renormalised by the
-    weight that fell inside the stamp instead."""
-    from rubin_host_prior.data import smooth_sky
+def test_a_lone_bright_pixel_in_empty_sky_does_not_survive_the_blend():
+    """The whole reason the weight is taken off the smoothed image.
+
+    Switching on the pixel itself kept the sky's tail past two sigma at full
+    height -- 2.3% of the sky as isolated bright pixels.  One pixel does not
+    move its neighbourhood's mean, so here it is averaged away with the rest,
+    while the same height spread over a source's worth of pixels is kept.
+    """
+    from rubin_host_prior.data import blend_sky
+
+    im = np.zeros((2, 32, 32), np.float32)
+    im[0, 16, 16] = 4.0                      # a 4 sigma noise spike
+    im[1, 12:20, 12:20] = 4.0                # a 4 sigma source
+    out, lam = blend_sky(im, 1.0, 1.5, 1.5, 0.3)
+    assert out[0, 16, 16] < 0.1 * 4.0 and lam[0, 16, 16] < 0.02
+    assert out[1, 16, 16] == pytest.approx(4.0, rel=1e-3)
+
+
+def test_the_blend_is_a_mean_all_the_way_into_the_corners():
+    """A constant sky has to come back as that constant at every pixel.  Zero
+    padding would pull the border towards zero and reflection would feed it a
+    symmetry; the kernel is renormalised by the weight that fell inside the
+    stamp instead."""
+    from rubin_host_prior.data import blend_sky
 
     im = np.full((1, 16, 16), -3.0, np.float32)
-    out = smooth_sky(im, 0.0, 2.0)
+    out, lam = blend_sky(im, 1.0, 2.0, 1.5, 0.3)
     assert np.abs(out + 3.0).max() < 1e-5
+    assert np.ptp(lam) < 1e-6
 
 
-def test_sky_smoothing_thresholds_each_stamp_at_its_own_level():
-    from rubin_host_prior.data import smooth_sky
+def test_the_blend_weighs_each_stamp_against_its_own_noise():
+    from rubin_host_prior.data import blend_sky
 
     rng = np.random.default_rng(1)
-    one = rng.normal(0, 1, (16, 16)).astype(np.float32)
+    one = (5.0 + rng.normal(0, 1, (16, 16))).astype(np.float32)
     im = np.stack([one, one])
-    thr = np.array([-100.0, 100.0])[:, None, None]
-    out = smooth_sky(im, thr, 1.0)
-    assert (out[0] == one).all()            # nothing is below -100
-    assert (out[1] != one).all()            # everything is below +100
+    noise = np.array([0.5, 50.0])[:, None, None]
+    out, lam = blend_sky(im, noise, 1.0, 1.5, 0.3)
+    assert lam[0].min() > 0.999              # ten sigma of its own noise
+    assert lam[1].max() < 0.02               # a tenth of a sigma of its own
+    np.testing.assert_allclose(out[0], one, rtol=1e-2)
+    assert out[1].std() < 0.6 * one.std()
 
 
-def test_sky_smoothing_of_zero_width_is_off_and_a_negative_one_is_refused():
+def test_the_blend_settings_are_checked():
     from rubin_host_prior.config import TransformConfig
-    from rubin_host_prior.data import smooth_sky
+    from rubin_host_prior.data import blend_sky
 
-    im = np.random.default_rng(2).normal(0, 1, (2, 8, 8)).astype(np.float32)
-    assert smooth_sky(im, 10.0, 0.0) is im
+    im = np.zeros((1, 8, 8), np.float32)
+    with pytest.raises(ValueError, match="width"):
+        blend_sky(im, 1.0, 0.0, 1.5, 0.3)
     with pytest.raises(ValueError, match="sky_smooth_pixels"):
         TransformConfig(sky_smooth_pixels=-1.0)
+    with pytest.raises(ValueError, match="sky_blend_width"):
+        TransformConfig(sky_blend_width=0.0)
+    with pytest.raises(ValueError, match="floor_sigma"):
+        TransformConfig(floor_sigma=-1.0)
+    assert not TransformConfig(sky_smooth_pixels=0.0).smooths_sky
+    assert not TransformConfig(floor_sigma=0.0).floors_enabled
 
 
-def test_the_loader_smooths_the_sky_and_not_the_sources(shard_dir):
-    """End to end, where the floor is applied.  What moves is what was below
-    the floor; the bright end cannot, because those pixels are never read
-    from the smooth image."""
+def _batch(ss, cfg, n=16):
+    ds = PatchDataset.from_shards(
+        ss, cfg, LogFluxTransform.from_config(cfg.transform),
+        max_in_memory_gb=16.0)
+    try:
+        return ds.make_batch(np.arange(min(n, len(ds))),
+                             rng=np.random.default_rng(0), augment=False)[:, 0]
+    finally:
+        ds.close()
+
+
+def test_the_loader_blends_the_sky_and_not_the_sources(shard_dir):
+    """End to end, in the one place the chain is applied.  What moves is the
+    sky; the bright end stays where it was."""
     import dataclasses
 
-    ss, on = _floored_config(shard_dir)
-    on.transform = dataclasses.replace(on.transform, sky_smooth_pixels=1.5)
-    off = dataclasses.replace(on)
-    off.transform = dataclasses.replace(on.transform, sky_smooth_pixels=0.0)
+    ss, base = _measured_config(shard_dir)
+    on = dataclasses.replace(base)
+    on.transform = dataclasses.replace(base.transform, sky_smooth_pixels=1.5,
+                                       floor_sigma=0.0)
+    off = dataclasses.replace(base)
+    off.transform = dataclasses.replace(base.transform, sky_smooth_pixels=0.0,
+                                        floor_sigma=0.0)
 
-    def batch(cfg):
-        ds = PatchDataset.from_shards(
-            ss, cfg, LogFluxTransform.from_config(cfg.transform),
-            max_in_memory_gb=16.0)
-        try:
-            return ds.make_batch(np.arange(min(16, len(ds))),
-                                 rng=np.random.default_rng(0),
-                                 augment=False)[:, 0]
-        finally:
-            ds.close()
+    rough, quiet = _batch(ss, off), _batch(ss, on)
+    assert (rough != quiet).any()
+    assert quiet.max() == pytest.approx(rough.max(), rel=1e-4)
+    # The sky is the faint half of every frame, and it is what got quieter.
+    sky = rough < np.median(rough)
+    assert quiet[sky].std() < 0.7 * rough[sky].std()
+    # With both off it is the bare map: below zero flux is representable.
+    bare = LogFluxTransform.from_config(off.transform)
+    assert np.isfinite(rough).all() and rough.min() < bare.sky_level
 
-    rough, flat = batch(off), batch(on)
-    assert (rough != flat).any()
-    assert flat.max() == rough.max()
-    floor = np.log(on.transform.floor_pedestal)
-    lifted = lambda x: np.mean(x > floor + 0.1)
-    assert lifted(flat) < lifted(rough)
+
+def test_the_loader_floors_each_stamp_at_its_own_level(shard_dir):
+    """End to end: with the floor on nothing sits below its own cutout's
+    floor, the sky is flatter than without it, the bright end is where it
+    was, and ``input_offset`` -- where the padding has to sit -- follows."""
+    import dataclasses
+
+    ss, base = _measured_config(shard_dir)
+    on = dataclasses.replace(base)
+    on.transform = dataclasses.replace(base.transform, floor_sigma=1.0)
+    off = dataclasses.replace(base)
+    off.transform = dataclasses.replace(base.transform, floor_sigma=0.0)
+    plain, x = _batch(ss, off), _batch(ss, on)
+
+    transform = LogFluxTransform.from_config(on.transform)
+    ds = PatchDataset.from_shards(ss, on, transform, max_in_memory_gb=16.0)
+    try:
+        floors = np.asarray(ds.sky_floor(ds._sky_noise(np.arange(len(x)))))
+    finally:
+        ds.close()
+    assert np.unique(floors).size > 1, floors
+    # float32 slack: the batch is single precision and the bound is tight.
+    assert (x >= np.log(floors) - 1e-5).all()
+    assert x.max() == pytest.approx(plain.max(), rel=1e-4)
+    # Within each stamp, not across them: every cutout's sky sits at its own
+    # level, so pooled over the batch the floored sky is *wider* than the
+    # unfloored one, which shares ``log(s * log 2)``.
+    def sky_width(b):
+        flat = np.sort(b.reshape(len(b), -1), axis=1)
+        return np.median(flat[:, : flat.shape[1] // 2].std(axis=1))
+
+    assert sky_width(x) < sky_width(plain)
+
+    # The typical floor, in the arithmetic the vendored loader repeats.
+    t = on.transform
+    c = t.floor_sigma * t.softening / t.softening_sigma
+    assert on.input_offset == pytest.approx(
+        float(transform.sky_level_at(np.float64(c))))
+    assert off.input_offset == pytest.approx(transform.sky_level)
+    # More noise -> higher floor -> a fixed faint flux reads higher.
+    uniq = np.unique(floors)
+    probe = np.asarray(transform.forward(np.zeros(uniq.size), floor=uniq))
+    assert np.all(np.diff(probe) > 0), (uniq, probe)
 
 
 def test_the_despeckler_takes_small_blobs_and_leaves_big_ones():
@@ -2166,8 +2072,8 @@ def test_a_zero_limit_leaves_the_batch_exactly_alone():
     assert rep["n_pixels_removed"] == 0
 
 
-def test_the_loader_despeckles_where_it_floors(shard_dir):
-    """End to end, and in the one place the floor is applied -- so the
+def test_the_loader_despeckles_after_the_map(shard_dir):
+    """End to end, and in the one place the chain is applied -- so the
     transform figure shows what the network is handed rather than a cleaner
     picture of it.
 
@@ -2176,9 +2082,10 @@ def test_the_loader_despeckles_where_it_floors(shard_dir):
     """
     import dataclasses
 
-    ss, on = _floored_config(shard_dir)
+    ss, on = _measured_config(shard_dir)
     on.transform = dataclasses.replace(on.transform, despeckle_max_pixels=4,
-                                       despeckle_sigma=None)
+                                       despeckle_sigma=2.0,
+                                       sky_smooth_pixels=0.0)
     off = dataclasses.replace(on)
     off.transform = dataclasses.replace(on.transform, despeckle_max_pixels=0)
 

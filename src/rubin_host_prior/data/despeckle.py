@@ -1,22 +1,26 @@
-"""Pushing the sky's positive tail back down to the floor.
+"""Pushing the sky's positive tail back down to the sky level.
 
-The floor flattens the sky *pointwise*: a pixel below ``floor_sigma`` times its
-cutout's sky noise lands on the pedestal, and one above it does not.  For
-Gaussian sky at a 2 sigma floor that leaves about 2.3% of pixels poking
-through -- roughly 380 on a 128 px grid -- scattered as single pixels and pairs
-on an otherwise flat background.  They are not features of the sky, they are
-the tail of the noise the floor was drawn through, and a prior trained on them
-learns to put isolated bright pixels into its samples.
+**Off by default** -- see ``TransformConfig.despeckle_max_pixels``.  It was
+written for a sky pinned to a constant and still works as described, but what
+it fills with is one value, and the sky around it is no longer one.
+
+The map itself is *pointwise*: with nothing done about it, Gaussian sky has
+about 2.3% of its pixels above 2 sigma -- roughly 380 on a 128 px grid --
+scattered as single pixels and pairs.  They are not features of the sky, they
+are the tail of the noise, and a prior trained on them learns to put isolated
+bright pixels into its samples.  ``data.smooth`` now deals with them by
+weighing each pixel on its smoothed neighbourhood, which is the same idea by
+another route.
 
 A pointwise map cannot tell them from a faint compact source, because
 pointwise there is no difference.  What separates them is *extent*: measured on
-pooled Rubin-like stamps, 98% of the blobs above a 2 sigma floor are four
+pooled Rubin-like stamps, 98% of the blobs above 2 sigma are four
 pixels or smaller, and essentially none of the real sources are.  So the cut
 here is on blob size, and it is the one place in the representation where a
 pixel's neighbours decide what happens to it.
 
 **It removes faint compact sources too, and that is not a bug to be fixed
-here.** At the sizes involved a four-pixel blob at the floor and a marginal
+here.** At the sizes involved a four-pixel blob of noise and a marginal
 point source are the same object to any statistic; dropping both is the
 decision, and ``despeckle_sigma`` is the knob that says how bright something
 must be before the question is even asked.

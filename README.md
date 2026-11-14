@@ -206,16 +206,25 @@ they follow from the noise level and dynamic range. This measures them — from
 pooled patches, not the variance planes, since coadd noise is correlated — and
 prints two checks worth reading:
 
-- `sky_scatter` should match `expected_sky_scatter(softening_sigma)`
-  (= `0.721 / softening_sigma`). If not, the softening scale is wrong. It is a
-  *typical* width: one scale serves every band, so a deeper or shallower band
-  scatters proportionally less or more about the shared sky level.
+- `sky_scatter` should sit at or below `expected_sky_scatter(softening_sigma)`
+  (= `0.721 / softening_sigma`), which is the width of raw sky through the
+  unfloored map: the loader blends sky pixels into a Gaussian mean of their
+  neighbourhood before the log (`sky_smooth_pixels`, `sky_blend_sigma`,
+  `sky_blend_width`) and floors it at `floor_sigma` of each cutout's own
+  noise, both of which bring the scatter down, and nothing should take it
+  above. If it is above, the softening scale is wrong. It is a *typical* width: one scale
+  serves every band, so a deeper or shallower band scatters proportionally
+  less or more about the shared sky level.
 - the flux above which the exponential model map is accurate should sit below
-  anything you care about photometrically. The sky pedestal
-  (`0.693 × softening_sigma`, in σ) is *meant* to sit above 1σ — 1.39σ at the
-  default `softening_sigma = 2` — because suppressing the sky is the point of
-  the softening. An earlier version of this line said to keep it under one
-  sigma, from when the aim was to preserve the noise distribution.
+  anything you care about photometrically. Zero flux reads a little over
+  `floor_sigma` sky sigma — the script prints the figure — and the prior puts
+  that in every sky pixel: the floor is the faintest flux it can represent.
+
+`softening_sigma` is read once, by this script, to measure `softening` in nJy;
+the loader only ever uses `softening`. Changing `softening_sigma` in a config
+that already has `softening` set therefore changes nothing, and the script
+refuses such a pair rather than keeping the stale scale. Set `softening` to
+`null` to have it re-measured.
 
 It also reports the **correlation length** of the pooled log-space patches and
 compares it to the model's `2R` crop — this is the authoritative measurement, and

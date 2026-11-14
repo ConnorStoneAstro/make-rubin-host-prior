@@ -674,19 +674,17 @@ def plot_transform(dataset, n: int = 4, seed: int = 0, out: Path | None = None):
     """The chain from native flux to the training representation, plus the
     pixel-value histogram that says whether the transform is set up right.
 
-    ``x`` is absolute log flux, so the sky sits at ``log(p + s *
-    softplus(-c/s))`` with
-    ``c`` that cutout's own sky floor.  The sky should pile up inside the red
-    band -- which spans the floors in this sample, because they differ per
-    stamp -- with a spread near ``expected_sky_scatter``, and sources should sit
-    clearly above it.
+    ``x`` is absolute log flux, so the sky sits at ``log(c + s *
+    softplus(-c/s))`` with ``c`` that cutout's own sky floor.  The sky should
+    pile up inside the red band -- which spans the floors in this sample,
+    because they differ per stamp -- and sources should sit clearly above it.
 
     **It goes through the loader's own code path.**  ``to_log_space`` is the one
-    place the floor is applied, and this calls it rather than repeating it.  It
-    did repeat it once, and went on drawing ``log(s * softplus(f/s))`` for a
-    dataset that had been floored for a week -- a figure whose whole job is to
-    say whether the transform is set up right, quietly showing a different
-    transform from the one in use.
+    place the chain is applied, and this calls it rather than repeating it.  It
+    did repeat it once, and went on drawing one map for a dataset that had been
+    using another for a week -- a figure whose whole job is to say whether the
+    transform is set up right, quietly showing a different transform from the
+    one in use.
     """
     plt = _plt()
 
@@ -702,8 +700,7 @@ def plot_transform(dataset, n: int = 4, seed: int = 0, out: Path | None = None):
                                   scale_jitter=0.0)
     fill = dict(dataset._last_fill)
     noise = dataset._sky_noise(idx)
-    logged, _ = dataset.to_log_space(pooled, noise)
-    t_cfg = dataset.config.transform
+    logged = dataset.to_log_space(pooled, noise)
 
     fig = plt.figure(figsize=(10.5, 2.4 * n + 2.6))
     gs = fig.add_gridspec(n + 1, 3, height_ratios=[1] * n + [1.25])
@@ -718,9 +715,7 @@ def plot_transform(dataset, n: int = 4, seed: int = 0, out: Path | None = None):
                     True,
                 ),
                 (np.arcsinh(pooled[k] / sigma), "pooled flux (asinh)", "magma", True),
-                (logged[k], "x = log(soften(f))" if t_cfg.restore_bright_end
-                 else "x = log(p + s\u00b7softplus((f−c)/s))",
-                 "viridis", False),
+                (logged[k], "x = log(c + s\u00b7softplus((f\u2032\u2212c)/s))", "viridis", False),
             )
         ):
             ax = fig.add_subplot(gs[k, col])
@@ -739,30 +734,23 @@ def plot_transform(dataset, n: int = 4, seed: int = 0, out: Path | None = None):
     allx = dataset.make_batch(hist_idx, rng=None, augment=False)[:, 0].ravel()
     ax.hist(allx, bins=200, color="0.3")
 
-    t = t_cfg
+    t = dataset.config.transform
     # Where zero flux lands, for the same patches the histogram is drawn from.
-    # Per stamp, because the knee is a multiple of each cutout's own sky
-    # noise.  With a sharp knee they all land on the pedestal and the band is
-    # a line, which is the intent: flat sky at one value for the whole set.
+    # Per stamp, because the floor is a multiple of each cutout's own sky
+    # noise.  Read off the loader's own floor, so the marked sky position
+    # cannot drift from the data it is drawn over.
     hist_floor = dataset.sky_floor(dataset._sky_noise(hist_idx))
-    # The same pedestal `to_log_space` applies, read from the same place, so
-    # the marked sky position cannot drift from the data it is drawn over.
-    hist_pedestal = (t.floor_pedestal if t.floors_enabled else 0.0)
-    sky_levels = np.atleast_1d(
-        np.asarray(dataset.transform.sky_level_at(hist_floor, hist_pedestal),
-                   dtype=float)).ravel()
-    k = t.floor_sigma if t.floors_enabled else 0.0
-    scatter = t.predicted_sky_scatter
+    sky_levels = np.atleast_1d(np.asarray(
+        dataset.transform.sky_level_at(hist_floor), dtype=float)).ravel()
     lo, hi = float(sky_levels.min()), float(sky_levels.max())
     mid = float(np.median(sky_levels))
     if hi > lo:
         ax.axvspan(lo, hi, color="crimson", alpha=0.10,
                    label=f"zero flux, per stamp: x = {lo:.2f} .. {hi:.2f}")
     ax.axvline(mid, color="crimson", lw=1.2,
-               label=f"median zero flux: x = log(soften(0)) = {mid:.2f}")
-    ax.axvspan(mid - scatter, mid + scatter, color="crimson", alpha=0.15,
-               label=(f"predicted sky scatter $\\pm${scatter:.3f}"
-                      + (f" at k = {k:.2f}" if k else " (no floor)")))
+               label=(f"median zero flux: x = log(soften(0)) = {mid:.2f}"
+                      + (f" at k = {t.floor_sigma:g}" if t.floors_enabled
+                         else " (no floor)")))
     ax.set_yscale("log")
     ax.set_xlabel("x (log space)")
     ax.set_ylabel("pixels")

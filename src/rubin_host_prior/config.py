@@ -451,187 +451,85 @@ class TransformConfig:
     flux goes negative wherever noise takes it below the subtracted sky, and
     those pixels are smoothly carried towards zero instead.
 
-    **The map has three parameters and they do different jobs**, plus an
-    optional fourth term that does a fourth.
+    **Two parameters in the map, and one scene-level step before it.**
 
-        x = log(p + s * softplus((f - c) / s)
-                  + (c - p) * sigmoid((f - c) / s))   f = exp(x)
+        f'  = lam * f + (1 - lam) * smooth(f)        lam = sigmoid of smooth(f)
+        x   = log(c + s * softplus((f' - c) / s))    f = exp(x)
 
-    with the last line present only when ``restore_bright_end`` is set.
+    ``c = floor_sigma * that cutout's pooled sky noise`` is the **sky floor**:
+    where the map bends over and what it bends over to.  Below it ``x ->
+    log(c)``, above it ``x -> log(f)``, and the two meet, so there is no step
+    between sky and object.  ``s = softening_sigma * pooled sky noise`` is how
+    sharp the bend is.  At ``c = 0`` this is the one-parameter softening.
 
-    ``c`` is the **sky floor**, per stamp: ``floor_sigma * that cutout's
-    pooled sky noise``.  It is where the map bends over.  ``s =
-    softening_sigma * pooled sky noise`` is how *sharp* that bend is.  ``p =
-    floor_pedestal`` is what it bends over *to*: the faintest flux the prior
-    can represent, one constant for the whole set.  At ``c = 0, p = 0`` this
-    is the original one-parameter softening exactly.
+    The first line is what makes a low knee enough.  ``lam`` is zero in empty
+    sky and one on anything detected, so the flux reaching the map has had its
+    sky averaged down to a few tenths of a sigma, and a floor at one sigma is
+    then three or four sigma of what is left (``sky_smooth_pixels``,
+    ``sky_blend_sigma``, ``sky_blend_width``; ``data.smooth`` has the
+    measurements).
 
-    **Which one flattens the sky: both, and they do it differently.**  ``c /
-    s`` decides where zero flux lands -- below the pedestal's own 10% it has
-    to exceed ``log(10 (c - p) / p) = 7.2`` -- and ``c`` alone decides how
-    much of the sky escapes the floor by poking above the knee, which is what
-    the 16-84 spread actually measures.  Pinning without raising the knee is
-    not enough: at ``c = 1 sigma, s = 0.12 sigma`` zero flux sits on the
-    pedestal to four digits and the sky still scatters 2.14 in x, because a
-    sixth of it is above one sigma and rides the identity up.  At ``c = 2
-    sigma`` that fraction is 2% and the scatter is 0.041 at a sharp knee,
-    0.956 at the default one.
+    **The sky is flat, and it is not faint.**  It sits at about ``c`` -- a
+    measurable flux, in every sky pixel of every sample -- and it differs
+    from stamp to stamp as the noise does.  Sending it somewhere fainter was
+    tried twice, as a 0.1 nJy pedestal under a pointwise knee and again mixed
+    in by ``lam``, and both put a step of ``log(c / p)`` around every object;
+    ``data.transform`` has the account.  Measured on synthetic scenes at the
+    default blend (model flux read at 0, 1, 2, 3 and 5 sky sigma, in sigma;
+    std of ``x`` over empty sky; std of ``x``; largest distance between two
+    scenes):
 
-    The defaults are the second of those.  What they cost is everything
-    below two sky sigma, which is compressed into the floor: a 2-sigma pixel
-    reads about half its flux; see ``softening_sigma`` for the series.  Three
-    sigma comes through whole.
+        floor_sigma  softening_sigma    0     1     2     3     5    sky    std   pair
+        0.5          1/3              0.57  1.07  2.00  3.00  5.00  0.112  0.63   180
+        0.5          1                0.97  1.47  2.20  3.08  5.01  0.112  0.52   147
+        1            1/3              1.02  1.23  2.02  3.00  5.00  0.024  0.49   146
+        1            1                1.31  1.69  2.31  3.13  5.02  0.061  0.45   131
+        1.5          1/3              1.50  1.57  2.07  3.00  5.00  0.005  0.42   128
+        2            1                2.13  2.31  2.69  3.31  5.05  0.017  0.36   110
+        no floor     1                0.69  1.31  2.13  3.05  5.01  0.208  0.61   170
 
-    Both halves had to be rediscovered, because with ``p`` equal to ``c`` the
-    flattening came from the ``+c`` inside the logarithm instead, and raising
-    the knee was the whole lever -- 0.717 unfloored at ``softening_sigma =
-    1`` against 0.021 at ``c = 1.5 sigma, s = sigma/3``.  Dropping ``p`` to
-    0.1 nJy removed that mechanism, and for a while the conclusion drawn was
-    that ``softening_sigma`` was the only remaining lever, which is true only
-    while the knee is too blunt to pin anything.  See ``floor_sigma`` for all
-    three measured series.
-
-    **And ``restore_bright_end`` flattens nothing.**  It exists because the
-    pedestal leaves the map a constant ``c - p`` low at every flux, however
-    bright; the sigmoid term hands that back above the knee.  It is worth
-    keeping the three jobs apart: ``c`` sets what counts as sky, ``s`` sets
-    how hard what counts as sky is pinned to the pedestal, and the fourth
-    term sets whether a detected pixel reads its true flux.  Only the first
-    two decide what is thrown away.
-
-    **The sky is meant to be exactly flat, and exactly the same in every
-    stamp.**  The prior is to say two things about a scene -- objects as they
-    are in the data, and faint flat sky everywhere else -- and a sky with
-    texture in it is a third thing the model has to spend itself learning and
-    will then put into its samples.  So the knee is sharp, ``sky_smooth_pixels``
-    averages the noise down before the knee sees it, the despeckler takes what
-    still pokes through, and what is left sits on ``floor_pedestal``, which is
-    one constant for the whole set.  This docstring used to argue the
-    opposite: that a shared sky value is an atom in the data distribution,
-    that the prior would then hold sky pixels with a curvature limited only by
-    ``sigma_min``, and that the soft floor's per-pixel spread was what
-    prevented it.  The stiffness is real and is accepted; the spread was the
-    speckle.
-
-    The *knee* still varies from stamp to stamp, because the sky noise
-    ``floor_sigma`` multiplies does -- so what counts as sky is decided per
-    cutout, and what sky is mapped to is not.  ``k`` used to be drawn per
-    stamp as well, from ``[floor_sigma_lo, floor_sigma_hi]``, which made every
-    number quoted about the floor a midpoint of a range nobody was choosing
-    deliberately.  One value now.
+    So ``floor_sigma`` sets where the sky sits and how flat it is, and
+    ``softening_sigma`` sets how far above the knee a pixel has to be before
+    it reads its true flux.
 
     **One scale, for every band.**  It used to be a dict per band, which bought
     the transform nothing once ``forward`` became ``log(f_s)`` -- see
-    ``data.transform``.  With one scale the sky lands at ``log(p + s *
-    softplus(-c/s))`` everywhere, and the bands differ only in how wide the
-    sky is about it.
+    ``data.transform``.  With one scale the sky lands at ``log(s * log 2)``
+    everywhere, and the bands differ only in how wide the sky is about it.
     """
 
     #: nJy.  Measured by ``prepare_config.py``; None until then.
     softening: float | None = None
-    #: ``s`` in units of the pooled sky noise -- the **width of the knee**,
-    #: not its position.  ``floor_sigma`` sets the position.  With no floor it
-    #: is the only thing there is, and the sky scatter is ``0.721 / s``; with
-    #: a floor, the quantity that decides whether zero flux reaches the
-    #: pedestal is the ratio ``c / s``, so this and ``floor_sigma`` are two
-    #: halves of one choice and neither reads sensibly alone.
+    #: ``s`` in units of the pooled sky noise: how sharp the bend at the floor
+    #: is.  A wide one flattens the sky a little more and reads faint flux
+    #: high for longer -- at ``floor_sigma = 1``, three sigma reads 4% high at
+    #: 1 and true at 1/3; the class docstring has the series.  With no floor
+    #: it is the only thing there is, the sky scatters ``0.721 /
+    #: softening_sigma`` in x, and ``exp(x)`` is within 1% above 3.4 ``s``.
     #:
-    #: **Deliberately not written around whichever value is set here**, which
-    #: is a knob and moves.  What is fixed is the axis: sharpening buys a
-    #: flatter sky and pays for it in restoration gain, bluntening does the
-    #: reverse, and the turn is abrupt rather than gradual.  At ``floor_sigma
-    #: = 2`` the floor stops being pinned above s = 0.279 (that is ``c / s``
-    #: falling through the 7.2 of the bound), and the sky scatter goes from
-    #: 0.04 to 1.0 over the factor of two below it.  Measured there with the
-    #: restoration term on:
-    #:
-    #:     s      c/s   zero flux   sky scatter   peak gain   f at 2 sigma
-    #:     0.12   16.7   0.100 nJy      0.041        4.67         54%
-    #:     0.25    8.0   0.110          0.956        2.52         59%
-    #:     0.35    5.7   0.201          1.431        1.97         62%
-    #:     0.50    4.0   0.688          1.564        1.56         67%
-    #:
-    #: Measured instead with the floor doing no work (``floor_sigma = 1``,
-    #: 0.1 nJy pedestal): s = 2 gives scatter 0.392 and a 3-sigma source 12%
-    #: low; s = 3 gives 0.256 and 8% high; s = 4 gives 0.189 and 30% high.
-    softening_sigma: float = 0.12
-    #: What the soft floor bends over *to*, in nJy -- a single constant for
-    #: the whole set, not a per-stamp multiple of the noise.  The floor itself
-    #: (``floor_sigma`` times each cutout's own sky noise) is where the map
-    #: bends; this is how far down it is allowed to go.  They used to be the
-    #: same number, which put the prior's hard minimum at about 6.5 nJy -- a
-    #: *measurable* flux, so the prior could not represent a pixel the
-    #: likelihood wanted to put below it.  See ``data.transform.soften`` for
-    #: what lowering it costs.
-    floor_pedestal: float = 0.1
+    #: **Read once, by ``prepare_config.py``, to measure ``softening``.**
+    #: Nothing else looks at it, so editing it in a config whose ``softening``
+    #: is already set changes nothing the loader does -- which is how a
+    #: softer knee was once tried and appeared to make no difference.  Clear
+    #: ``softening`` as well and re-run the script; it refuses a pair that
+    #: disagree rather than keeping the stale one.
+    softening_sigma: float = 1.0
     #: The sky floor in units of each cutout's own pooled sky noise.  One
     #: number for the whole set; the floor itself still varies per stamp,
-    #: because the noise it multiplies does.  Zero disables the floor and
-    #: recovers the pre-floor transform exactly.
+    #: because the noise it multiplies does.  Zero disables it and leaves the
+    #: one-parameter softening.
     #:
-    #: **This is the lever on how much of the sky is thrown away, and with a
-    #: sharp knee it is also the lever on how flat the sky is.**  Two separate
-    #: effects, and keeping them apart is what stops the measured numbers
-    #: looking contradictory:
-    #:
-    #: * *Where zero flux lands* is set by the ratio ``c / s``.  Reaching the
-    #:   pedestal to within 10% needs ``c / s > log(10 (c - p) / p) = 7.2``,
-    #:   so raising this or sharpening ``softening_sigma`` both get you there.
-    #: * *How wide the sky is in x* is set by how much of the sky pokes above
-    #:   the knee, which only this controls.  At k = 1 a sixth of the sky sits
-    #:   above the knee and rides the identity, so the 16-84 range is wide
-    #:   however well the floor is pinned; at k = 2 it is 2%, and the whole
-    #:   16-84 range lies inside the floored region.
-    #:
-    #: Measured at ``softening_sigma = 0.12`` with the restoration term on:
-    #: scatter 2.14 at k = 1 against 0.041 at k = 2, with zero flux on the
-    #: pedestal in both.  That is the second effect alone, and it is why the
-    #: default is 2.  Its price is the first effect: the knee sits at two sky
-    #: sigma, so a 2-sigma pixel reads about half its flux -- 54% at
-    #: ``softening_sigma = 0.12``, 59% at 0.25 -- and everything fainter is
-    #: compressed into the floor.  3 sigma comes through at 100% and 99%.
-    #:
-    #: Measured instead with the knee too blunt to pin anything
-    #: (``softening_sigma = 2``, pedestal at 0.0076 sigma): 0.361 unfloored,
-    #: 0.376 at k = 0.5, 0.392 at k = 1, 0.441 at k = 3 -- *rising*, because
-    #: with nothing pinned, raising the floor only pushes the sky further down
-    #: the logarithm where it is steeper.  That series is what this comment
-    #: used to generalise from, and it does not generalise.  The older one
-    #: still (0.69 at k = 0.25 down to 0.021 at 1.5, at ``softening_sigma =
-    #: 1/3``) was for a pedestal equal to the floor; ``expected_sky_scatter``
-    #: reproduces all three when told which, and a test holds it to them.
-    floor_sigma: float = 2.0
-    #: Hand ``c - p`` back above the knee, with a
-    #: ``(c - p) * sigmoid((f - c) / s)`` term, so that bright flux comes
-    #: through at its true value.  Without it the map tends to ``f - (c - p)``
-    #: however bright the pixel: a flat 26 nJy low at the default
-    #: ``floor_sigma = 2``, 13 at 1, 52 at 4.
-    #:
-    #: **It does not move the knee, and the knee is what decides what is
-    #: lost.**  Sub-threshold structure is compressed into the floor by ``c``
-    #: and ``s``, and this term is zero down there by construction -- it has
-    #: to be, or it would lift the floor off the pedestal.  What it costs is a
-    #: gain above one in a narrow ring around ``c``: at least 2.3, and 4.67
-    #: at ``floor_sigma = 2, softening_sigma = 0.12``, where it is above 2
-    #: over 0.54 sky sigma and above 1.1 over 0.92, centred on the knee.
-    #: ``softening_sigma`` carries the series.  Pixels in that ring have their noise
-    #: amplified by that much; outside it the gain is 1.00 and the flux is
-    #: true.  The peak is ``0.5 + (c - p) / (4 s)``, so it is the joint price
-    #: of a sharp knee and a high floor, and it is what makes sharpening
-    #: ``softening_sigma`` cost something.  ``data.transform.soften`` derives the bound and why
-    #: widening the handback to escape it puts the sky back up at 17 nJy.
-    #:
-    #: Costs the closed-form inverse: ``inverse_exact`` switches to Newton.
-    #: ``inverse`` (``exp``) is untouched, so the model map is as cheap as it
-    #: ever was.
-    restore_bright_end: bool = True
+    #: It is where the sky sits -- zero flux reads a little over this many
+    #: sigma -- and the prior cannot represent a pixel fainter than it.  That
+    #: is the price of a sky with no step around the objects in it.
+    floor_sigma: float = 1.0
     #: Pooled sky noise over ``sky_noise / pool_factor``.  **Measured**, because
     #: it is not 1: coaddition warps exposures onto the skymap grid, so
     #: neighbouring pixels share flux and averaging ``P**2`` of them reduces the
     #: noise by less than ``P``.  The per-stamp ``sky_noise`` in the shards is a
     #: native-resolution number, so this is what turns it into the pooled one
-    #: the floor needs -- keeping each cutout's own variation, fixing the shared
-    #: scale from a measurement.
+    #: ``sky_blend_sigma`` is in units of -- keeping each cutout's own
+    #: variation, fixing the shared scale from a measurement.
     pooled_noise_ratio: float | None = None
     #: Inpaint no-data pixels instead of rejecting the stamp; see
     #: ``data.repair``.
@@ -651,64 +549,57 @@ class TransformConfig:
     #: being handled.
     fill_no_data: bool = False
 
-    #: Width, in pixels of the training grid, of the Gaussian that pixels
-    #: below the floor are averaged with before the map is applied; pixels at
-    #: or above ``floor_sigma`` are left exactly alone.  **Pixels, not sky
-    #: sigma** -- the only field here that is.  Zero disables it.
+    #: Width, in pixels of the training grid, of the Gaussian the sky is
+    #: blended into before the map is applied.  **Pixels, not sky sigma** --
+    #: the only field here that is.  Zero disables the blend.
     #:
-    #: It is what flattens the band the pointwise floor cannot: between one
-    #: and two sky sigma the sharp knee hands back graded values up to five
-    #: in ``x`` above the pedestal, 14% of the sky, and the despeckler's
-    #: threshold is above all of it.  Averaged first, that sky sits at a few
-    #: tenths of a sigma and lands on the pedestal.  Wider is flatter and
-    #: leaks bright cores further into their surroundings; correlated noise
-    #: wants more than white noise does, and coadd noise is correlated.
-    #: ``data.smooth`` has the measured series, the leak, and the two
-    #: alternatives that were tried or set aside -- Rubin's ``DETECTED``
+    #: Wider is quieter and leaks bright cores further into their
+    #: surroundings; correlated noise wants more than white noise does, and
+    #: coadd noise is correlated.  It also dilutes compact sources further
+    #: before the weight sees them.  ``data.smooth`` has the measurements and
+    #: the alternatives that were tried or set aside -- Rubin's ``DETECTED``
     #: footprints among them.
-    #:
-    #: The threshold is ``floor_sigma`` and nothing else, so with the floor
-    #: off there is nothing to smooth below and this does nothing, exactly as
-    #: the despeckler does.
     sky_smooth_pixels: float = 1.5
+    #: Where the weight is one half: the smoothed flux, in units of the
+    #: cutout's own pooled sky noise, at which a pixel is an even mix of
+    #: itself and its neighbourhood.  Lower keeps fainter compact sources and
+    #: lets more of the sky's noise through as itself.
+    sky_blend_sigma: float = 1.5
+    #: The sigmoid's scale, in the same units.  The weight is within 1% of
+    #: its ends five of these either side of ``sky_blend_sigma`` -- at zero
+    #: and at three sigma for the defaults -- so the pair decides where "sky"
+    #: stops and "the original image" starts.  Narrower is a harder edge.
+    sky_blend_width: float = 0.3
 
     #: Blobs of at most this many connected pixels above ``despeckle_sigma``
-    #: are pushed back down to the stamp's own sky level.  Zero disables it.
+    #: are pushed back down to the sky level.  Zero disables it.
     #:
-    #: **The floor is pointwise and this is not**, which is the whole reason
-    #: it exists: ``floor_sigma`` decides whether a pixel is believed, and
-    #: nothing in a pointwise map can tell the sky's positive tail from a
-    #: faint compact source.  Extent can.  Measured on pooled Rubin-like
-    #: stamps with the floor at 2 sigma, 98% of the blobs poking through are
-    #: four pixels or smaller and essentially no real source is; by 4 sigma
-    #: only 64% are, because by then what is left is mostly sources.  See
-    #: ``data.despeckle``.
-    #:
-    #: It removes marginal point sources along with the noise.  That is the
-    #: trade, not an oversight -- at four pixels the two are the same object.
-    despeckle_max_pixels: int = 4
+    #: **Off, because the blend does its job.**  It was written for a floor
+    #: that judged each pixel on its own, which let the sky's positive tail
+    #: through as isolated bright pixels; the weight now comes off the
+    #: smoothed image, which a lone pixel does not move.  It still does what
+    #: it says if switched on -- it writes each stamp's own sky level -- and
+    #: it removes marginal point sources along with the noise, because at
+    #: four pixels the two are the same object.  See ``data.despeckle``.
+    despeckle_max_pixels: int = 0
     #: How bright a pixel has to be before the size question is asked, in
-    #: units of the cutout's own pooled sky noise.  ``None`` means
-    #: ``floor_sigma``: exactly the pixels that poke above the floor, which is
-    #: the reading that needs no second number.  Raising it leaves the faint
-    #: speckle in place and takes only the bright ones; what each setting
-    #: costs, on synthetic stamps at the defaults:
-    #:
-    #:     cut     lit    blobs/stamp   <= 4 px   pixels removed
-    #:     2.0     3.7%        312         98.1%       2.47%
-    #:     2.5     1.6%        108         97.6%       0.76%
-    #:     3.0     0.9%         34         94.0%       0.22%
-    #:     4.0     0.5%          4         64.1%       0.02%
-    despeckle_sigma: float | None = None
+    #: units of the cutout's own pooled sky noise.
+    despeckle_sigma: float = 2.0
 
     def __post_init__(self) -> None:
-        if self.floor_sigma < 0:
-            raise ValueError(f"need floor_sigma >= 0, got {self.floor_sigma}")
         if self.sky_smooth_pixels < 0:
             raise ValueError(
                 f"need sky_smooth_pixels >= 0, got {self.sky_smooth_pixels}; "
                 f"it is a Gaussian width in pixels and 0 switches it off"
             )
+        if not self.sky_blend_width > 0:
+            raise ValueError(
+                f"need sky_blend_width > 0, got {self.sky_blend_width}; it is "
+                f"the sigmoid's scale in sky sigma. Set sky_smooth_pixels to 0 "
+                f"to switch the blend off"
+            )
+        if self.floor_sigma < 0:
+            raise ValueError(f"need floor_sigma >= 0, got {self.floor_sigma}")
         if self.despeckle_max_pixels < 0:
             raise ValueError(
                 f"need despeckle_max_pixels >= 0, got "
@@ -716,31 +607,24 @@ class TransformConfig:
             )
 
     @property
+    def smooths_sky(self) -> bool:
+        return self.sky_smooth_pixels > 0
+
+    @property
     def floors_enabled(self) -> bool:
         return self.floor_sigma > 0
 
     @property
     def predicted_sky_scatter(self) -> float:
-        """What ``PatchDataset.stats()["sky_scatter"]`` should come out at.
+        """The raw, unfloored sky's spread in x, ``0.721 / softening_sigma``.
 
-        One statement of it, because the transform figure, ``prepare_config``
-        and the smoke test all quote it and the floor/pedestal pair is easy to
-        drop on the way -- quoting the unfloored number for a floored dataset
-        is how the transform figure came to be wrong.  Falls back to the
-        closed form when there is no floor, or before ``softening`` has been
-        measured and there is no pooled noise to put the pedestal in units of.
+        An upper bound on ``PatchDataset.stats()["sky_scatter"]``, and equal
+        to it only with ``sky_smooth_pixels = 0`` and ``floor_sigma = 0`` --
+        see ``data.transform.expected_sky_scatter``.
         """
         from .data.transform import expected_sky_scatter
 
-        if not (self.floors_enabled and self.softening and self.softening_sigma):
-            return expected_sky_scatter(self.softening_sigma)
-        pooled_sigma = self.softening / self.softening_sigma
-        return expected_sky_scatter(
-            self.softening_sigma,
-            self.floor_sigma,
-            self.floor_pedestal / pooled_sigma,
-            self.restore_bright_end,
-        )
+        return expected_sky_scatter(self.softening_sigma)
 
 
 @dataclass
@@ -1019,45 +903,35 @@ class Config:
 
     @property
     def input_offset(self) -> float:
-        """The typical sky level in ``x``: ``log(soften(0))``.
+        """The typical sky level in ``x``: ``log(soften(0))`` at the typical floor.
 
         Subtracted from the scene before the first layer so the zeros the
-        convolutions pad with sit at the sky rather than 5-10 sigma below it.
+        convolutions pad with sit at the sky rather than well below it.
 
         ``c`` is the *typical* sky floor -- ``floor_sigma`` times the pooled
         sky noise -- because the actual floor varies from cutout to cutout with
         each one's own noise and the padding needs one number.  The pooled
         noise is recovered as ``softening / softening_sigma`` rather than
-        stored again, so there is no second copy to drift; at
-        ``floor_sigma = 0`` the whole term vanishes and this is the pre-floor
-        ``log(s * log 2)`` exactly.
+        stored again; at ``floor_sigma = 0`` this is ``log(s * log 2)``.  Zero
+        when the softening has not been measured, which is honest: there is no
+        sky level until there is a transform.
 
-        **The floor moves this, and by a lot.**  With a floor at 1.25 sigma and
-        ``s = sigma/3``, ``c + s*log2`` is about 1.5 sigma where it used to be
-        0.23 sigma -- six times higher in flux, 1.9 in x.  Leaving the old
-        expression here would put the padding well below the sky the model now
-        sees.  Zero when the softening has not been measured, which is honest:
-        there is no sky level until there is a transform.
+        ``standalone/host_prior/_prior.py`` restates this, in the same
+        arithmetic, because it is a static field on the module and the two
+        loaders have to agree on it to the bit.
         """
-        t = self.transform
-        if not t.softening:
-            return 0.0
-        from .data.transform import soften
-        import numpy as _np
+        import math
 
+        t = self.transform
+        s = t.softening
+        if not s:
+            return 0.0
         c = 0.0
-        pedestal = 0.0
         if t.floors_enabled and t.softening_sigma > 0:
-            pooled_sigma = t.softening / t.softening_sigma
-            c = t.floor_sigma * pooled_sigma
-            pedestal = t.floor_pedestal
-        # ``log(soften(0))`` with the typical floor, computed by *calling*
-        # ``soften`` rather than restating it.  It restated it until the
-        # restoration term landed and would have been the one place that did
-        # not know about it -- the same way it read ``log(c + s * log 2)``, the
-        # unfloored expression with the floor added on, for as long as the
-        # pedestal had been there.  One statement of the shape, in ``soften``.
-        return float(_np.log(soften(0.0, t.softening, _np, c, pedestal, t.restore_bright_end)))
+            c = t.floor_sigma * (s / t.softening_sigma)
+        u = -c / s
+        sp = math.log1p(math.exp(-abs(u))) + max(u, 0.0)   # softplus(u)
+        return math.log(c + s * sp)
 
     ARCHITECTURES = ("energy", "ncsnpp", "ncsnpp_energy", "ncsnpp_encoder")
 

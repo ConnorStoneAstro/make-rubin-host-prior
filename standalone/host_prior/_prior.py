@@ -437,23 +437,19 @@ def _floor_k(tr_cfg: dict) -> float:
 
 
 def _pedestal_of(tr_cfg: dict) -> float:
-    """What the soft floor bends over to, nJy, or 0 when there is no floor.
+    """What the soft floor bends over to, nJy; 0 when there is no floor and
+    ``None`` when it is the floor itself.
 
-    **Absent means an older checkpoint**, written before the pedestal existed,
-    whose floor bent over to the floor itself.  Guessing either way would be a
-    silent change to what ``exp(x)`` means, so this refuses instead.
+    **Absent means the floor itself.**  That is what the map was before the
+    pedestal was split off and what it is again now that the pedestal has
+    been removed, so only a checkpoint from the stretch in between carries the
+    key, and it always does.  This used to refuse an absent key instead, while
+    "absent" could only mean a config older than the split.
     """
     if _floor_k(tr_cfg) <= 0:
         return 0.0
     if "floor_pedestal" not in tr_cfg:
-        raise ValueError(
-            "this config has a sky floor but no transform.floor_pedestal, so "
-            "it was written before the floor and the pedestal were separated. "
-            "Its map bent over to the floor itself; add "
-            '"floor_pedestal": null to say so explicitly, or the value the '
-            "run used. Reading it either way without being told would change "
-            "what exp(x) means by about 6 nJy, silently."
-        )
+        return None
     got = tr_cfg["floor_pedestal"]
     if got is None:
         # Explicitly the old behaviour: pedestal == the per-stamp floor.
@@ -545,9 +541,11 @@ def load_prior(directory, which: str = "ema") -> Prior:
     input_offset = _input_offset(tr_cfg)
     pedestal = _pedestal_of(tr_cfg)
     if pedestal is None:
-        ss = float(tr_cfg.get("softening_sigma") or 0.0)
-        k = _floor_k(tr_cfg)
-        pedestal = k * (transform.softening / ss) if (k > 0 and ss) else 0.0
+        # The map bent over to the per-stamp floor itself.  ``to_x`` applies
+        # no floor -- a prior does not know which cutout it is handed, and the
+        # training package's ``Prior.to_x`` is the bare map for the same
+        # reason -- so there is nothing for it to bend over to here.
+        pedestal = 0.0
     common = dict(sigma_min=sde.sigma_min, sigma_max=sde.sigma_max,
                   input_offset=input_offset, key=jax.random.key(0))
     if architecture == "ncsnpp":

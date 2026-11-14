@@ -110,12 +110,10 @@ def test_the_two_flux_maps_are_different_and_both_right(prior):
     assert flux.min() < 0
     np.testing.assert_allclose(np.asarray(prior.to_flux_exact(x)), flux, atol=1e-9)
 
-    # the model map recovers the softened flux instead, exactly -- softened
-    # with the pedestal `to_x` applied, which is the prior's own, because
-    # `soften` on its own defaults to bending over to the floor.
+    # the model map recovers the softened flux instead, exactly
     np.testing.assert_allclose(
         np.asarray(prior.to_flux(x)),
-        np.asarray(prior.transform.soften(flux, pedestal=prior._pedestal)),
+        np.asarray(prior.transform.soften(flux)),
         atol=1e-9)
     # ... and they differ by more than round-off where the flux is faint
     assert np.abs(np.asarray(prior.to_flux(x)) - flux).max() > 1.0

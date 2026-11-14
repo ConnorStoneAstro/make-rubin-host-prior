@@ -335,20 +335,12 @@ class PatchDataset:
     def sky_floor(self, sky_noise: np.ndarray) -> np.ndarray | float:
         """The per-stamp floor in nJy: ``floor_sigma * that stamp's pooled sigma``.
 
-        ``sky_noise`` is the native-resolution number the shards carry, so it is
-        divided by ``pool_factor`` and corrected by the measured
-        ``pooled_noise_ratio`` -- coadd noise is correlated, so pooling reduces
-        it by less than ``pool_factor`` and the uncorrected figure would put the
-        floor too low.
-
         **No rng.**  ``floor_sigma`` is one number for the set; the per-stamp
         variation is each cutout's own sky noise, which is measured rather than
-        drawn, so this is deterministic and the same on every path.  It used to
-        take one, to jitter ``k`` within ``[lo, hi]`` as an augmentation, which
-        made the unaugmented and augmented paths floor differently.
+        drawn, so this is deterministic and the same on every path.
 
-        Returns ``0.0`` when floors are switched off, which is exactly the
-        pre-floor transform.
+        Returns ``0.0`` when the floor is switched off, which is exactly the
+        one-parameter softening.
         """
         t = self.config.transform
         if not t.floors_enabled:
@@ -358,17 +350,21 @@ class PatchDataset:
     def pooled_sky_noise(self, sky_noise: np.ndarray) -> np.ndarray:
         """Each stamp's sky noise on the *training* grid, ``(B, 1, 1)`` in nJy.
 
-        Split out of ``sky_floor`` because the floor is no longer the only
-        thing measured in these units: ``despeckle_sigma`` is too, and it has
-        to mean the same sigma or the two knobs are not comparable.
+        ``sky_noise`` is the native-resolution number the shards carry, so it is
+        divided by ``pool_factor`` and corrected by the measured
+        ``pooled_noise_ratio`` -- coadd noise is correlated, so pooling reduces
+        it by less than ``pool_factor`` and the uncorrected figure would put
+        every threshold too low.  One place, because ``floor_sigma``,
+        ``sky_blend_sigma`` and ``despeckle_sigma`` are all in these units and
+        have to mean the same sigma or they are not comparable.
         """
         ratio = self.config.transform.pooled_noise_ratio
         if ratio is None:
             raise ValueError(
                 "the config has no transform.pooled_noise_ratio, so a native "
-                "sky_noise cannot be turned into the pooled one the floor "
-                "needs. Run scripts/prepare_config.py on the shards; it "
-                "measures the pooled noise and the ratio together."
+                "sky_noise cannot be turned into the pooled one the sky blend "
+                "and the floor are set by. Run scripts/prepare_config.py on the "
+                "shards; it measures the pooled noise and the ratio together."
             )
         sigma = np.asarray(sky_noise, dtype=np.float64) / self.config.patch.pool_factor
         return (sigma * float(ratio))[:, None, None]
@@ -412,65 +408,59 @@ class PatchDataset:
         self,
         pooled: np.ndarray,
         sky_noise: np.ndarray | None,
-    ) -> tuple[np.ndarray, np.ndarray | float]:
-        """Pooled flux -> ``x``, and the floor that was used.  ``(x, floor)``.
+    ) -> np.ndarray:
+        """Pooled flux -> ``x``: blend the sky, then the floored log.
 
-        **The one place the floor is applied.**  Everything that needs to show
+        **The one place the chain is applied.**  Everything that needs to show
         or reproduce the training representation goes through here -- the
         loader and ``plots.plot_transform`` both -- because a figure that
-        reimplemented the chain is exactly how the transform figure came to be
-        drawing an unfloored map of a floored dataset.
+        reimplemented the chain is exactly how the transform figure once came
+        to be drawing a different map from the one the dataset used.
 
-        **Deterministic given the stamp.**  Each cutout floors at a fixed
-        multiple of its own measured sky noise, so the augmented and
-        unaugmented paths see the same floor for the same stamp.  It took an
-        rng and an ``augment`` flag while ``k`` was jittered per stamp.
+        **Deterministic given the stamp.**  The blend's weight and the floor
+        are both set by each cutout's own measured sky noise, so the augmented
+        and unaugmented paths treat the same stamp the same way.
+
+        Without ``sky_noise`` there is nothing to set either by, and this is
+        the bare one-parameter map.
         """
-        floor = 0.0 if sky_noise is None else self.sky_floor(sky_noise)
-        # The pedestal rides with the floor: both are off when floors are, so
-        # `floors_enabled = False` is still the original one-parameter map.
-        pedestal = (self.config.transform.floor_pedestal
-                    if self.config.transform.floors_enabled else 0.0)
-        # Before the map, because it is the map's input that is noisy: the
-        # knee turns a 1.5 sigma pixel into something five in x above the
-        # pedestal, and no cut in x afterwards can tell that from a source.
-        # The threshold is the floor itself, so with floors off (or no noise
-        # to set one from) there is nothing to smooth below.
-        if self.config.transform.floors_enabled and sky_noise is not None:
-            from .smooth import smooth_sky
+        t = self.config.transform
+        if sky_noise is None:
+            return self.transform.forward(pooled)
+        floor = self.sky_floor(sky_noise)
+        if t.smooths_sky:
+            from .smooth import blend_sky
 
-            pooled = smooth_sky(pooled, floor,
-                                self.config.transform.sky_smooth_pixels)
-        x = self.transform.forward(pooled, floor, pedestal)
-        return self.despeckled(x, floor, pedestal, sky_noise), floor
+            # Before the map, because it is the map's input that is noisy:
+            # the floor is pointwise, and a pointwise knee drawn through raw
+            # sky lets every pixel's own noise decide which side it falls on.
+            pooled, _ = blend_sky(pooled, self.pooled_sky_noise(sky_noise),
+                                  t.sky_smooth_pixels, t.sky_blend_sigma,
+                                  t.sky_blend_width)
+        x = self.transform.forward(pooled, floor)
+        return self.despeckled(x, floor, sky_noise)
 
-    def despeckled(self, x, floor, pedestal, sky_noise):
-        """``x`` with the sky's small bright blobs pushed back to the floor.
+    def despeckled(self, x, floor, sky_noise):
+        """``x`` with the sky's small bright blobs pushed back to the sky level.
 
-        Here rather than anywhere earlier because the threshold is a statement
-        about the *representation*: it is where ``despeckle_sigma`` of sky
-        noise lands after the map, so it moves when the map does and the two
-        cannot drift apart.  And here rather than anywhere later because
-        ``to_log_space`` is what every path goes through -- the loader and
-        ``plots.plot_transform`` alike -- so the figure shows the data the
-        network is actually handed.
-
-        A no-op without ``sky_noise``: the threshold is per stamp and there is
-        nothing to set it from.  The count of what it took goes to
-        ``_last_despeckle``, the way ``fill_no_data``'s does.
+        Off by default.  Here rather than anywhere earlier because the
+        threshold is a statement about the *representation*: it is where
+        ``despeckle_sigma`` of sky noise lands after the map, so it moves when
+        the map does.  A no-op without ``sky_noise``.  The count of what it
+        took goes to ``_last_despeckle``, the way ``fill_no_data``'s does.
         """
         from .despeckle import NOTHING_REMOVED, despeckle
 
         t = self.config.transform
         self._last_despeckle = dict(NOTHING_REMOVED, n_stamps=len(x),
                                     n_pixels=x.size)
-        k = t.floor_sigma if t.despeckle_sigma is None else t.despeckle_sigma
+        k = t.despeckle_sigma
         if t.despeckle_max_pixels <= 0 or sky_noise is None or k <= 0:
             return x
         threshold = self.transform.forward(
-            k * self.pooled_sky_noise(sky_noise), floor, pedestal)
+            k * self.pooled_sky_noise(sky_noise), floor)
         x, self._last_despeckle = despeckle(
-            x, threshold, self.transform.sky_level_at(floor, pedestal),
+            x, threshold, self.transform.sky_level_at(floor),
             t.despeckle_max_pixels)
         return x
 
@@ -498,7 +488,7 @@ class PatchDataset:
             scale_jitter=aug.scale_jitter if augment else 0.0,
             out_size=out_size,
         )
-        x, _ = self.to_log_space(x, sky_noise)
+        x = self.to_log_space(x, sky_noise)
         if augment and aug.dihedral:
             if rng is None:
                 raise ValueError("dihedral augmentation requires an rng")
@@ -751,17 +741,6 @@ class PatchDataset:
         # widths about that shared level, so what this gives is a typical one.
         p16, p84 = np.percentile(x, [16, 84])
         sky_scatter = float(0.5 * (p84 - p16))
-        # Fraction sitting on the pedestal, within 1% in flux.  With a sharp
-        # knee this is most of the frame, and then ``sky_scatter`` is no
-        # longer a sky width: the 16-84 range spans the gap between the
-        # pedestal and the sources rather than the spread of either.  The two
-        # numbers have to be read together, which is why this one is here.
-        tcfg = self.config.transform
-        floor_fraction = float("nan")
-        if tcfg.floors_enabled and tcfg.floor_pedestal > 0:
-            floor_fraction = float(
-                np.mean(x < np.log(tcfg.floor_pedestal) + np.log(1.01))
-            )
         deepest_sigma = np.nan
         flux = self._pool_stamps(self._native_stamps(idx), rng=None,
                                  translate=False, scale_jitter=0.0)
@@ -781,16 +760,11 @@ class PatchDataset:
             },
             "min": float(x.min()),
             "max": float(x.max()),
-            # Compare against transform.expected_sky_scatter(softening_sigma);
-            # a large disagreement means the per-band softening scales are
-            # wrong.  It is a check on the width -- the per-band sky *level*
-            # differs by design.
+            # Compare against transform.expected_sky_scatter(softening_sigma),
+            # which is the unsmoothed width: with sky_smooth_pixels on this
+            # should come out below it, and above it means the softening
+            # scale is wrong.
             "sky_scatter": sky_scatter,
-            # Share of pixels pinned to the pedestal.  Above about a half,
-            # read ``sky_scatter`` as the pedestal-to-source gap and compare
-            # ``transform.expected_sky_scatter`` against nothing -- it
-            # predicts the width of the sky peak, which is then a spike.
-            "floor_fraction": floor_fraction,
             # Per-patch spread is what sigma_max has to cover: the reverse
             # process starts from N(0, sigma_max^2) and must be able to reach
             # the brightest structure in a single patch.
@@ -805,9 +779,8 @@ class PatchDataset:
             # Informational only: softplus has no floor, so however deep this
             # goes the pixel is representable.
             "deepest_flux_sigma": deepest_sigma,
-            # One number: with a single softening scale every band's sky sits
-            # at the same log(s * log 2).
-            "sky_level": self.transform.sky_level,
+            # The typical one: each stamp floors at its own level.
+            "sky_level": self.config.input_offset,
         }
 
 

@@ -589,9 +589,20 @@ def test_calibration_flattens_the_energy_and_leaves_the_score_alone(encoder_conf
     # true is that almost all of it is gone, at *every* sigma and not on
     # average.  `after < before` was the old assertion and it passed happily
     # while the small-sigma end was out by a factor of a thousand.
+    #
+    # Over the batch it was fitted to, not one scene of it: an offset is a
+    # function of sigma alone, so the batch's typical energy is all it can
+    # take out, and how far one scene sits from that is the scene's business.
+    # Held on a single scene this passed only while the scenes sat five units
+    # from ``input_offset`` and the common part dwarfed the spread; it went
+    # from 0.8% to 5.6% when the sky level moved, with the fit unchanged.
     sigmas = np.asarray(sde.sigma(np.linspace(0.0, 1.0, 12)))
-    before = np.array([abs(float(model(x[0], jnp.float32(s)))) for s in sigmas])
-    after = np.array([abs(float(fitted(x[0], jnp.float32(s)))) for s in sigmas])
+
+    def typical(m):
+        return np.array([abs(np.mean([float(m(xx, jnp.float32(s))) for xx in x]))
+                         for s in sigmas])
+
+    before, after = typical(model), typical(fitted)
     assert (after < 0.02 * before).all(), dict(zip(sigmas.round(3), after / before))
 
     # Provably, not approximately: the score is untouched.

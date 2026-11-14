@@ -23,7 +23,7 @@ import numpy as np
 import pytest
 
 from rubin_host_prior.config import (Config, NCSNppConfig, PatchConfig,
-                                     SDEConfig)
+                                     SDEConfig, TransformConfig)
 from rubin_host_prior.inference import load_prior as load_full
 from rubin_host_prior.training.checkpoint import save_checkpoint
 
@@ -190,15 +190,17 @@ def test_an_unknown_config_field_does_not_stop_a_model_loading(standalone_loader
     assert prior.size == SIZE
 
 
-def test_the_restoration_term_is_absent_from_an_older_checkpoint(standalone_loader):
-    """``restore_bright_end`` arrived after checkpoints were already being
-    written.  A config without the key must mean the map it was trained with,
-    not whatever the default became -- a silent flip here would compute
-    different fluxes from the same weights with nothing to say so.
+def test_the_vendored_map_still_reads_a_floored_checkpoint(standalone_loader):
+    """The training package dropped the floor, the pedestal and the restoration
+    term; the vendored loader has to keep them, because checkpoints trained
+    with them exist and a prior is only its weights *and* its map.
 
-    And with the key set, the vendored map must match the training package's
-    exactly, which is the thing ``input_offset`` being a static field makes
-    easy to get wrong.
+    So the floored map is held here against the formula written out, since
+    there is no longer a second implementation to compare it with, and the
+    unfloored one against the training package, which is what every new
+    checkpoint means.  ``restore_bright_end`` arrived after checkpoints were
+    already being written, so a config without the key must mean the map it
+    was trained with and not whatever a default became.
     """
     sys.path.insert(0, str(STANDALONE))
     try:
@@ -216,22 +218,49 @@ def test_the_restoration_term_is_absent_from_an_older_checkpoint(standalone_load
                                                  "restore_bright_end": True})
 
     f = np.linspace(-30.0, 500.0, 2001)
+    s = 1.572
     for on in (False, True):
-        here = LogFluxTransform(softening=1.572, restore_bright_end=on)
-        there = Vendored(softening=1.572, restore_bright_end=on)
+        there = Vendored(softening=s, restore_bright_end=on)
         for floor, pedestal in ((13.1, 0.1), (0.0, 0.1), (4.0, None)):
-            np.testing.assert_allclose(there.soften(f, floor, pedestal),
-                                       here.soften(f, floor, pedestal),
+            p = floor if pedestal is None else pedestal
+            u = (f - floor) / s
+            want = p + s * np.logaddexp(0.0, u)
+            if on:
+                want = want + (floor - p) / (1.0 + np.exp(-u))
+            np.testing.assert_allclose(there.soften(f, floor, pedestal), want,
                                        rtol=1e-12, atol=1e-12)
+            x = there.forward(f, floor=floor, pedestal=pedestal)
+            np.testing.assert_allclose(x, np.log(want), rtol=1e-12, atol=1e-12)
             np.testing.assert_allclose(
-                there.forward(f, floor=floor, pedestal=pedestal),
-                here.forward(f, floor=floor, pedestal=pedestal),
-                rtol=1e-12, atol=1e-12)
-            x = here.forward(f, floor=floor, pedestal=pedestal)
-            np.testing.assert_allclose(
-                there.inverse_exact(x, floor=floor, pedestal=pedestal),
-                here.inverse_exact(x, floor=floor, pedestal=pedestal),
-                rtol=1e-10, atol=1e-10)
+                there.inverse_exact(x, floor=floor, pedestal=pedestal), f,
+                rtol=1e-8, atol=1e-8)
+
+    # A checkpoint written now has a floor and no pedestal or restoration
+    # key, and the vendored map with those left at their defaults is the
+    # training package's, bit for bit.
+    here, there = LogFluxTransform(softening=13.1), Vendored(softening=13.1)
+    for floor in (0.0, 13.1, 26.2):
+        np.testing.assert_array_equal(there.forward(f, floor=floor),
+                                      here.forward(f, floor))
+        np.testing.assert_array_equal(
+            there.inverse_exact(here.forward(f, floor), floor=floor),
+            here.inverse_exact(here.forward(f, floor), floor))
+    assert _input_offset({"softening": 13.1, "softening_sigma": 1.0}) == \
+        pytest.approx(here.sky_level)
+
+    # A floor with no pedestal key is the floor itself: what the map was
+    # before the two were split, and what the training package writes again.
+    # Held to the training package's own property, because this is a static
+    # field on the module and the two loaders computing it differently is a
+    # different score from the same weights.
+    for tr in (TransformConfig(softening=13.1),
+               TransformConfig(softening=13.1, floor_sigma=0.0),
+               TransformConfig(softening=4.3, softening_sigma=1 / 3,
+                               floor_sigma=1.5),
+               TransformConfig(softening=13.1, floor_sigma=2.0)):
+        c = Config()
+        c.transform = tr
+        assert _input_offset(dataclasses.asdict(tr)) == c.input_offset, tr
 
 
 def test_an_older_checkpoints_floor_bounds_still_read(standalone_loader, tmp_path):

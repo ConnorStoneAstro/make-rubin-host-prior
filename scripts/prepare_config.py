@@ -13,10 +13,12 @@ no flag for it.
 It writes a config and prints the diagnostics you should look at before
 training:
 
-* ``sky_scatter`` should match ``transform.predicted_sky_scatter``.  If it
-  does not, the softening scale is wrong.  It is a check on a *typical* width:
-  one scale serves every band, so a band deeper or shallower than the scale was
-  measured from scatters proportionally less or more.
+* ``sky_scatter`` should sit at or below ``transform.predicted_sky_scatter``,
+  which is the unsmoothed width: the sky smoothing brings it down, nothing
+  should take it above.  If it is above, the softening scale is wrong.  It is
+  a check on a *typical* width: one scale serves every band, so a band deeper
+  or shallower than the scale was measured from scatters proportionally less
+  or more.
 * the flux above which the exponential model map is accurate should sit below
   anything you care about photometrically.  The sky pedestal is *meant* to sit
   above one sigma -- suppressing the sky is the point of the softening, and the
@@ -197,6 +199,23 @@ def main() -> None:
     if config.transform.softening is None:
         config.transform.softening = measured["softening"]
     else:
+        # Two statements of one quantity, and only this script reads the
+        # second: the loader uses `softening` in nJy and never looks at
+        # `softening_sigma`.  A config edited to a new `softening_sigma` with
+        # the old `softening` still in it would go on producing the old data
+        # with nothing to say so, so a pair that disagree is refused.
+        implied = config.transform.softening / measured["softening"] * softening_sigma
+        if not 0.8 < implied / softening_sigma < 1.25:
+            raise SystemExit(
+                f"transform.softening = {config.transform.softening:g} nJy is "
+                f"{implied:.2f} x the measured pooled sky noise, but "
+                f"transform.softening_sigma says {softening_sigma:g}. The "
+                f"loader uses softening and ignores softening_sigma, so this "
+                f"config would not produce the data its softening_sigma "
+                f"describes. Set transform.softening to null to have it "
+                f"measured at {softening_sigma:g} sigma, or set "
+                f"softening_sigma to {implied:.2f} to keep the scale it has."
+            )
         kept.append(f"transform.softening = {config.transform.softening}")
     if config.transform.pooled_noise_ratio is None:
         config.transform.pooled_noise_ratio = round(
@@ -288,45 +307,26 @@ def main() -> None:
     ss = tc.softening_sigma
     # The *typical* floor: `floor_sigma` times the pooled sky noise, which
     # `softening / softening_sigma` recovers.  Typical and not exact because
-    # each cutout floors at a multiple of its own noise.  Every number below is
-    # quoted for that, because quoting the unfloored ones for a floored dataset
-    # is how the transform figure came to be wrong.
+    # each cutout floors at a multiple of its own noise.
     k = tc.floor_sigma if tc.floors_enabled else 0.0
     floor = k * (t.softening / ss) if (k and ss) else 0.0
-    pedestal = tc.floor_pedestal if tc.floors_enabled else 0.0
-    restored = bool(tc.restore_bright_end)
-    shape = ("p + s*softplus((f-c)/s) + (c-p)*sigmoid((f-c)/s)" if restored
-             else "p + s*softplus((f-c)/s)")
-    print(f"\nlog transform:  x = log({shape}),  model map f = exp(x)")
+    print(f"\nlog transform:  x = log(c + s*softplus((f-c)/s)),  model map f = exp(x)")
     print(f"  softening s = {t.softening:.1f} nJy ({ss:.2f} x pooled sky noise)"
           f" -- how sharp the knee is")
     if floor:
-        print(f"  sky floor   c = {floor:.1f} nJy (k = {tc.floor_sigma:.2f}"
-              f" x each cutout's own pooled sky noise) -- where the map bends")
-        print(f"  pedestal    p = {pedestal:g} nJy -- what it bends over to, "
-              f"the faintest flux the prior can represent")
-        if restored:
-            print(f"  bright flux is exact: the sigmoid term hands the "
-                  f"{floor - pedestal:.1f} nJy back above the knee, at a peak "
-                  f"gain of {0.5 + (floor - pedestal) / (4 * t.softening):.1f} "
-                  f"in a ring around c. Below the knee it changes nothing.")
-        else:
-            print(f"  bright flux therefore comes out {floor - pedestal:.1f} nJy "
-                  f"low: soften(f) -> f - (c - p), so exp(x) is not f. Use "
-                  f"to_flux_exact to recover a measurement. Setting "
-                  f"transform.restore_bright_end fixes it; see that field.")
+        print(f"  sky floor   c = {floor:.1f} nJy (k = {k:.2f} x each cutout's "
+              f"own pooled sky noise) -- where the map bends, and what it "
+              f"bends over to: the faintest flux the prior can represent")
     else:
-        print(f"  sky floor   none (floor_sigma = 0): the pre-floor transform")
+        print("  sky floor   none (floor_sigma = 0): the one-parameter softening")
     print(f"  bright flux passes through as log(f), the same x in every band")
-    print(f"  sky sits at log(soften(0)) = "
-          f"{float(t.sky_level_at(floor, pedestal)):.2f} "
-          f"for a typical cutout; each one floors at its own level")
+    zero = float(t.soften(0.0, floor))
+    print(f"  sky sits at log(soften(0)) = {float(t.sky_level_at(floor)):.2f} "
+          f"for a typical cutout: zero flux reads {zero:.1f} nJy"
+          + (f" ({zero / (t.softening / ss):.2f} sigma)" if ss else "")
+          + ("; each one floors at its own level" if floor else ""))
     print(
         f"  data mean x = {config.sde.data_mean:.3f}, which is where " f"prior_sample starts from"
-    )
-    print(
-        f"  sky pedestal: {t.sky_pedestal * ss:.2f} sigma -- pixels within "
-        f"the noise compress towards this, which is the point"
     )
     print(
         f"  exponential map accurate within 1% above "
@@ -338,23 +338,23 @@ def main() -> None:
         + ("-> floored, as anything below c is" if floor
            else "-> representable (softplus has no floor)")
     )
+    if tc.smooths_sky:
+        lo = tc.sky_blend_sigma - 5 * tc.sky_blend_width
+        hi = tc.sky_blend_sigma + 5 * tc.sky_blend_width
+        print(f"  sky blend: each pixel is mixed with a {tc.sky_smooth_pixels:g} "
+              f"px Gaussian mean of its neighbourhood, by a weight that goes "
+              f"from 1% to 99% as the smoothed flux goes from {lo:.1f} to "
+              f"{hi:.1f} sigma of its own cutout")
+    else:
+        print("  sky blend: off")
     predicted = tc.predicted_sky_scatter
-    pinned = stats.get("floor_fraction", float("nan"))
     print(
         f"  sky scatter in x: {stats['sky_scatter']:.3f} measured vs "
-        f"{predicted:.3f} predicted"
-        + (f" at k = {k:.2f}" if k else " (unfloored)")
+        f"{predicted:.3f} for raw, unfloored sky"
     )
-    # The prediction is the width of the *sky peak*; the measurement is the
-    # 16-84 range of every pixel.  Those are the same number only while the
-    # frame is mostly sky and the map is smooth across it.  Once the knee is
-    # sharp enough to pin the sky, the measurement spans the gap from the
-    # pedestal up to the sources instead, and a mismatch means nothing.
-    if pinned == pinned and floor:
-        print(f"  {pinned:.0%} of pixels are pinned to the pedestal")
     sp = stats.get("despeckled") or {}
     if sp.get("n_pixels_removed"):
-        cut = tc.despeckle_sigma if tc.despeckle_sigma is not None else tc.floor_sigma
+        cut = tc.despeckle_sigma
         print(
             f"  despeckler: {sp['n_blobs_removed']:,} of {sp['n_blobs']:,} "
             f"blobs above {cut:g} sigma were {tc.despeckle_max_pixels} px or "
@@ -368,39 +368,17 @@ def main() -> None:
         )
     elif tc.despeckle_max_pixels:
         print(f"  despeckler: on at {tc.despeckle_max_pixels} px, nothing to take")
-    if pinned == pinned and pinned > 0.5:
+    # The prediction is raw sky through the unfloored map; the measurement is
+    # the 16-84 range of every pixel after the blend and the floor.  So the
+    # measurement belongs below the prediction when either is on and near it
+    # when both are off, and above it either way means the scale is too
+    # small for this sky.
+    low = 0.0 if (tc.smooths_sky or floor) else 0.5 * predicted
+    if not low <= stats["sky_scatter"] < 2.0 * predicted:
         print(
-            "  past half, so the measured number is the pedestal-to-source "
-            "gap rather than a sky width; the prediction is the width of the "
-            "spike and the two are not comparable here."
+            "  WARNING: measured sky scatter is far from the prediction -- "
+            "the softening scale is probably wrong."
         )
-        print(
-            f"  sigma_min is set from the measured {stats['sky_scatter']:.3f}, "
-            "which is the conservative end: it keeps the smallest noise level "
-            "above the spike rather than asking the model to resolve it."
-        )
-    elif not 0.5 * predicted < stats["sky_scatter"] < 2.0 * predicted:
-        print(
-            "  WARNING: measured sky scatter is far from prediction -- the "
-            + ("floor or the softening scale is probably wrong." if floor
-               else "softening scale is probably wrong.")
-        )
-        if floor:
-            # Worth saying before anyone goes hunting: the two numbers are not
-            # measuring the same pixels.  The prediction integrates over sky
-            # alone; the measurement is every pixel in the frame, sources
-            # included, and everything above the knee rides the identity up.
-            # So the measurement sits above the prediction by design, and by
-            # more as `floor_sigma` rises.  A ratio a little past 2 on a field
-            # full of structure is that, not a broken scale.
-            print(
-                "  before changing anything: the prediction is sky only, the "
-                "measurement is every pixel, and sources above the knee pull "
-                "it up -- expect the measurement high, and higher at a higher "
-                "floor_sigma. Suspect the scale when the measurement is "
-                "*below* the prediction, or far above it with few pixels "
-                "pinned."
-            )
 
     # -- sigma_max, the standard way -------------------------------------
     #

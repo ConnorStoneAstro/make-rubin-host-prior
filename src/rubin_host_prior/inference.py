@@ -92,16 +92,6 @@ class Prior:
         return self.config.architecture
 
     @property
-    def _pedestal(self) -> float:
-        """What the soft floor bends over to, or 0 when there is no floor.
-
-        Read from the config rather than stored, so it cannot disagree with
-        what the loader used -- the same reason ``input_offset`` is derived.
-        """
-        t = self.config.transform
-        return t.floor_pedestal if t.floors_enabled else 0.0
-
-    @property
     def is_energy(self) -> bool:
         """Whether ``energy`` is available -- i.e. whether the score is an exact
         gradient.  False for ``architecture="ncsnpp"``, which predicts the score
@@ -119,33 +109,29 @@ class Prior:
     # -- the flux mapping --------------------------------------------------
 
     def to_x(self, flux):
-        """nJy -> the model's space, ``log(p + s * softplus(f / s))``.
+        """nJy -> the model's space, ``log(s * softplus(f / s))``.
 
         Takes no band: one softening scale serves every band, so a scene is a
         scene.  Defined and finite for any real input, negative sky included.
 
-        ``p`` is ``floor_pedestal``; the per-stamp *floor* the loader also
-        applied is not, because it is a multiple of that cutout's own sky
-        noise and a prior does not know which cutout it is being handed.  So
-        this is the training map only up to that shift -- see
-        ``data.transform.soften``.
-
-        Nor are ``sky_smooth_pixels`` and ``despeckle_max_pixels``, for the
-        same reason and one more: each is a statement about a *scene*, not
-        about a pixel, so there is nothing to apply to a flux handed over on
-        its own.  The prior was trained
-        without the sky's small bright blobs in it and will not put them in a
-        sample; a forward model that compares against unfiltered pixels is
-        comparing against something the prior does not claim to generate.
+        **Not the whole of what the loader does.**  The loader also blends
+        each stamp's sky into a smoothed copy of itself and floors it at
+        ``floor_sigma`` of that cutout's own sky noise.  Both are statements
+        about a *scene* -- they need a pixel's neighbours and its cutout's
+        noise -- and a prior does not know which cutout it is being handed, so
+        there is nothing to apply to a flux given on its own.  The prior was
+        trained on scenes whose empty sky sits at about the floor, and that is
+        what it will put in a sample: ``to_x`` of a raw sky pixel lands near
+        ``log(s * log 2)``, below where the prior's sky is.
         """
-        return self.transform.forward(flux, pedestal=self._pedestal)
+        return self.transform.forward(flux)
 
     def to_flux(self, x):
         """The model's space -> nJy: ``exp(x)``.  **This is what a forward model
         calls.**
 
         It is the *model map*, not the inverse of ``to_x``: ``to_flux(to_x(f))``
-        is ``soften(f) = p + s * softplus(f / s)`` exactly, at every flux.  That gap
+        is ``soften(f) = s * softplus(f / s)`` exactly, at every flux.  That gap
         is the whole discrepancy between the data and what the prior can
         express, and it is deliberate -- it is also why a scene drawn from the
         prior can never contain negative flux.  Above ~10 softening scales the
@@ -163,7 +149,7 @@ class Prior:
         For round trips and for recovering measurements.  Not what a forward
         model should use -- see ``to_flux``.
         """
-        return self.transform.inverse_exact(x, pedestal=self._pedestal)
+        return self.transform.inverse_exact(x)
 
     # -- what a sampler or an HMC needs ------------------------------------
 

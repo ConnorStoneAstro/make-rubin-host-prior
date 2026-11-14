@@ -1,70 +1,102 @@
-"""Smoothing the sky before the floor is drawn through it.
+"""Blending the sky into a smoothed copy of itself before the log is taken.
 
-The floor is pointwise and the sky is not flat under it.  At a 2 sigma floor
-with a sharp knee, a pixel at 1.5 sigma lands around 0.5 nJy and one at 1.9
-sigma around 9, against a pedestal of 0.1 -- so the 14% of sky pixels between
-one and two sigma come through as graded speckle, up to five in ``x`` above
-the floor, and the despeckler never looks at them because its threshold *is*
-the floor.  Measured on synthetic sky that left the standard deviation of
-``x`` at 0.70 where a flat sky has none.
+The map is pointwise, and pointwise it cannot tell sky from source: a floor
+drawn through raw pixels lets each one's own noise decide which side of the
+knee it falls on, and with no floor at all the map is steepest exactly where
+the sky is -- at zero flux ``dx/df`` is ``0.72 / s``.  Either way the sky's
+noise reaches ``x`` as texture, which the prior has to spend itself learning
+and will then put into its samples, and which is not a property of any galaxy.
 
-So below the floor a pixel is replaced by a Gaussian-weighted mean of its
-neighbourhood, and at or above it the pixel is left exactly alone:
+So the image handed to the map is a weighted sum of the pixels and a
+Gaussian-smoothed copy of them,
 
-    out = where(flux < threshold, gaussian(flux), flux)
+    out = lam * flux + (1 - lam) * smooth
+    lam = sigmoid((smooth / sky_noise - centre) / scale)
 
-A mean over ``n`` pixels of noise is ``sqrt(n)`` quieter, so sky that sat at
-1.5 sigma on its own sits at a few tenths once averaged and the knee carries
-it to the pedestal.  Real structure survives the same average, which is the
-difference: faint outskirts just under the threshold come through as their
-smoothed value rather than as holes wherever the noise dipped.  On the same
-synthetic sky, with the despeckler on behind it (per cent of pixels more than
-0.1 in ``x`` off the floor, white noise and noise with a neighbour correlation
-of 0.27)::
+with the weight decided by the *smoothed* flux in units of that cutout's own
+sky noise.  Where the neighbourhood is empty ``lam`` is zero and the pixel is
+the local mean; where it holds a source ``lam`` is one and the pixel is itself.
+At the defaults (centre 1.5, scale 0.3) ``lam`` is 0.7% at zero and 99.3% at
+three sigma.
 
-    width      white    correlated
-    off        12.2       12.4
-    0.7 px      0.18       1.4
-    1.0 px      0.01       0.26
-    1.5 px      0.00       0.03
+**Deciding on the smoothed image is the point.**  The first version switched
+on the pixel -- ``where(flux < 2 sigma, smooth, flux)`` -- and so kept the
+sky's own tail past two sigma at full height: 2.3% of Gaussian sky, each pixel
+standing about 1.1 in ``x`` above the smoothed sky around it, and a notch in
+the histogram where the switch was.  A lone bright pixel in a quiet
+neighbourhood does not move the smoothed flux, so here it is averaged away
+with the rest, and a sigmoid rather than a step means no pixel sits on an
+edge.  Measured on synthetic scenes -- a host and about eight neighbours,
+noise with a neighbour correlation of 0.27, ``softening_sigma = 1``, width 1.5
+px (std of ``x`` over empty sky; share of sky pixels more than 0.5 above the
+sky's median; half the mean squared difference in ``x`` between two noise
+realisations of one scene), all with no floor so that the blend is what is
+being measured::
 
-**It does not replace the despeckler, it hands it an easier job.**  A pixel
-above the threshold is kept whatever its neighbours say, so the 2.3% of sky
-that pokes through on its own is still there afterwards -- smoothing alone
-leaves the standard deviation at 0.83 -- and what removes it is still the cut
-on blob size.
+                                  sky std   speckle   noise variance
+    no smoothing                   0.71     22.4%        0.470
+    switch on the pixel at 2       0.28      2.7%        0.074
+    blend, centre 1.5 scale 0.3    0.21      0.7%        0.045
+    blend, centre 1.0 scale 0.2    0.21      1.1%        0.052
+
+and then the floor on top of the default blend, which is what the loader
+does (``TransformConfig`` has the flux each one costs)::
+
+    floor_sigma 1, softening 1     0.06      0.0%        0.007
+    floor_sigma 1, softening 1/3   0.02      0.0%        0.007
+
+**What it costs is faint compact sources**, because smoothing dilutes a point
+source about fourfold and it is the diluted peak the weight sees.  The flux
+the prior is shown at the peak of an isolated point source (Gaussian PSF of
+0.85 px), over the true softened peak::
+
+    peak, sky sigma               3      5      8     12     20
+    centre 1.5 scale 0.3        0.40   0.46   0.85   1.00   1.00
+    centre 1.0 scale 0.2        0.46   0.78   1.00   1.01   1.00
+
+(no floor; a floor on top takes whatever of the smoothed peak is under it.)
+So ``sky_blend_sigma`` trades those against the sky: lower keeps fainter
+sources and lets more of the noise through as itself.
+
+**The weight is returned as well**, for diagnostics.  It was used once more,
+to mix ``x`` towards a constant pedestal -- the sky at 1 or 0.1 nJy, with the
+same ``lam`` -- which made a smooth low sky and gave back the tall step
+around every object that a low sky always is.  Not done;
+``data.transform`` has the account.
 
 **The mean is taken over everything, bright pixels included**, and just
 outside a bright source that reads high: the core leaks one kernel width into
 pixels that were below the threshold.  For a profile with real wings it is
 small -- a factor of two in one or two pixels around a Moffat star, gone under
-the noise -- and for a Gaussian-cored source it is a ring (2 sigma true, 31
-after, at the contour of a 1000 sigma peak).  Masking bright pixels out of the
-mean removes the ring and undershoots by about as much instead, so it is not
-done.  Deciding on the *smoothed* image rather than the pixel was measured
-too and is worse under correlated noise (0.31% off the floor against 0.03%).
+the noise -- and for a Gaussian-cored source it is a ring.  Masking bright
+pixels out of the mean removes the ring and undershoots by about as much
+instead, so it is not done.
 
 **The other way to do this is Rubin's own footprints**: the coadd's
 ``DETECTED`` mask plane is "objects as present in the data" stated directly,
-and everything outside it could be set to the floor.  Not done, for two
-reasons: the detection is not yet accurate enough to trust as the definition
-of an object, and the shards do not carry masks, so it is a re-extraction.
+and everything outside it could be smoothed or set to one level.  Not done,
+for two reasons: the detection is not yet accurate enough to trust as the
+definition of an object, and the shards do not carry masks, so it is a
+re-extraction.
 """
 
 from __future__ import annotations
 
 import numpy as np
 
-__all__ = ["smooth_sky"]
+__all__ = ["blend_sky"]
 
 
-def smooth_sky(flux, threshold, width: float) -> np.ndarray:
-    """``flux`` with every pixel below ``threshold`` replaced by a local mean.
+def blend_sky(flux, sky_noise, width: float, centre: float,
+              scale: float) -> tuple[np.ndarray, np.ndarray]:
+    """``lam * flux + (1 - lam) * smooth``, and ``lam``.
 
-    ``flux`` is ``(B, S, S)`` in nJy, before the log.  ``threshold`` broadcasts
-    against it, so the usual call passes ``(B, 1, 1)`` and each cutout is cut
-    at its own sky noise.  ``width`` is the Gaussian's standard deviation in
-    pixels of this grid; zero returns the input.  Does not modify it.
+    ``flux`` is ``(B, S, S)`` in nJy, before the log.  ``sky_noise`` broadcasts
+    against it, so the usual call passes ``(B, 1, 1)`` and each cutout is
+    weighed against its own noise.  ``width`` is the Gaussian's standard
+    deviation in pixels of this grid.  ``centre`` and ``scale`` are in sky
+    sigma: ``lam = sigmoid((smooth / sky_noise - centre) / scale)``.  Does not
+    modify the input.
 
     **No pixel is invented at the border.**  The kernel is truncated at the
     edge of the stamp and renormalised by the weight that fell inside, so an
@@ -74,10 +106,16 @@ def smooth_sky(flux, threshold, width: float) -> np.ndarray:
     from scipy import ndimage
 
     flux = np.asarray(flux)
-    if width <= 0:
-        return flux
+    if not width > 0:
+        raise ValueError(f"need a smoothing width > 0, got {width}")
+    if not scale > 0:
+        raise ValueError(f"need a blend scale > 0, got {scale}")
     smooth = ndimage.gaussian_filter(flux, (0.0, width, width),
                                      mode="constant", cval=0.0)
     inside = ndimage.gaussian_filter(np.ones(flux.shape[-2:], flux.dtype),
                                      width, mode="constant", cval=0.0)
-    return np.where(flux < threshold, smooth / inside, flux)
+    smooth = smooth / inside
+    # tanh rather than the literal sigmoid: stable on both sides.
+    lam = 0.5 * (np.tanh(0.5 * (smooth / sky_noise - centre) / scale) + 1.0)
+    lam = lam.astype(flux.dtype, copy=False)
+    return lam * flux + (1.0 - lam) * smooth, lam
